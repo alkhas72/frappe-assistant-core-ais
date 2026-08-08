@@ -28,13 +28,13 @@
 | Этап | Владелец | Задачи | Запрещённые пересечения |
 |---|---|---|---|
 | Foundation | Codex | 1–2 | остальные исполнители не меняют policy contract и audit interface |
-| Execution path | Codex | 3–4 | только registry/base/MCP/adapter/endpoint |
+| Execution path | Codex | 3–4 | registry/base/MCP/adapter/endpoint и legacy adapter |
 | Migration/config | Kimi | 5 | не меняет registry, MCP и core tools |
-| Core-tool safety | Z | 6–7 | не меняет policy contract, migrations и MCP |
+| Core-tool safety | Z | 6–7 | document/search/metadata/report/workflow; не меняет legacy adapter, policy contract, migrations и MCP |
 | Verification/docs | Composer | 8 | не меняет production code без отдельного возврата Codex |
 | Integration | Codex | 9–10 | сведение, конфликт-анализ, итоговые проверки |
 
-Kimi, Z и Composer начинают только после зелёных Task 1–2 и отдельного сообщения Codex с зафиксированными signatures. Каждый работает в sibling worktree своей ветки; общий worktree не используется одновременно.
+Kimi и Z начинают после зелёных Task 1–2 и отдельного сообщения Codex с зафиксированными signatures. Composer получает карточку сразу, но исполняет black-box Task 8 только после integration review Tasks 3–7; до этого он может готовить только test fixture map и черновик документации без изменения production code. Каждый работает в sibling worktree своей ветки; общий worktree не используется одновременно.
 
 ---
 
@@ -45,16 +45,34 @@ Kimi, Z и Composer начинают только после зелёных Task
 - Create: `frappe_assistant_core/tests/test_security_policy.py`
 
 **Interfaces:**
-- Produces: `PolicyDecision`, `PolicyDenied`, `ToolContext`, `SecurityPolicy.authorize`, `SecurityPolicy.extract_context`, `HARD_DENY_TOOLS`, `CONFIGURABLE_TOOLS`, `RESTRICTED_DOCTYPES`.
+- Produces: `PolicyDecision`, `PolicyDenied`, `ToolContext`, `SecurityPolicy.authorize`, `SecurityPolicy.extract_context`, `discover_builtin_tool_names`, `HARD_DENY_TOOLS`, `CONFIGURABLE_TOOLS`, `RESTRICTED_DOCTYPES`.
 - `SecurityPolicy.authorize(actor: str, tool_name: str, arguments: dict | None, phase: str) -> PolicyDecision` never logs and never mutates state.
 - `PolicyDecision.require()` raises `PolicyDenied` carrying `reason_code` and the decision.
 
 - [ ] **Step 1: Write failing classification and fail-closed tests**
 
 ```python
+EXPECTED_24_TOOLS = {
+    "get_document", "list_documents", "search_documents", "search_doctype",
+    "search_link", "search", "fetch", "get_doctype_info", "report_list",
+    "report_requirements", "generate_report", "get_pending_approvals",
+    "create_document", "update_document", "submit_document", "run_workflow",
+    "delete_document", "run_python_code", "run_database_query",
+    "analyze_business_data", "extract_file_content", "create_dashboard",
+    "create_dashboard_chart", "list_user_dashboards",
+}
+ALLOW_SYSTEM_MANAGER = {
+    "enabled": True,
+    "role_access_mode": "Restrict to Listed Roles",
+    "roles": {"System Manager"},
+}
+ALLOW_ALL = {"enabled": True, "role_access_mode": "Allow All", "roles": set()}
+
 class TestSecurityPolicy(FrappeTestCase):
     def test_inventory_contains_exact_upstream_tools(self):
-        self.assertEqual(set(SecurityPolicy.inventory()), EXPECTED_24_TOOLS)
+        discovered = discover_builtin_tool_names()
+        self.assertEqual(discovered, EXPECTED_24_TOOLS)
+        self.assertEqual(set(SecurityPolicy.inventory()), discovered)
 
     def test_hard_deny_cannot_be_overridden_for_system_manager(self):
         with patch.object(SecurityPolicy, "_load_access_config", return_value=ALLOW_SYSTEM_MANAGER):
@@ -92,6 +110,7 @@ class ToolContext:
     target_doctype: Optional[str] = None
     target_name: Optional[str] = None
     fields: FrozenSet[str] = frozenset()
+    required_permissions: FrozenSet[str] = frozenset()
 
 @dataclass(frozen=True)
 class PolicyDecision:
@@ -105,7 +124,7 @@ class PolicyDecision:
             raise PolicyDenied(self)
 ```
 
-Define all 24 exact names from the design spec. Define hard deny as:
+Implement `discover_builtin_tool_names()` by calling `PluginDiscovery.discover_plugins()`, selecting exactly built-in plugin names `core`, `data_science` and `visualization`, importing every declared tool module, locating its `BaseTool` subclass and collecting the instantiated `.name`. Do not consult enabled plugin state and do not call dependency validation. Any import/class ambiguity fails the test. Define all 24 exact names from the design spec and assert them against this runtime source discovery. Define hard deny as the eight current names plus every known stale dangerous alias:
 
 ```python
 HARD_DENY_TOOLS = frozenset({
@@ -117,18 +136,38 @@ HARD_DENY_TOOLS = frozenset({
     "create_dashboard",
     "create_dashboard_chart",
     "list_user_dashboards",
+    "document_create",
+    "document_get",
+    "document_update",
+    "document_list",
+    "search_global",
+    "report_execute",
+    "report_columns",
+    "metadata_doctype",
+    "create_visualization",
+    "analyze_frappe_data",
+    "workflow_status",
+    "workflow_list",
     "execute_python_code",
     "query_and_analyze",
+    "metadata_permissions",
+    "metadata_workflow",
+    "tool_registry_list",
+    "tool_registry_toggle",
+    "audit_log_view",
+    "workflow_action",
 })
 ```
 
+Do not add current registered names such as `search_doctype`, `search_link` or `report_list` to the alias deny-set. A runtime-discovered name absent from the exact snapshot fails the inventory test and is denied until reviewed.
+
 - [ ] **Step 4: Implement deterministic context extraction**
 
-Use an explicit mapping, not name heuristics. `fetch.id` must split once on `/`; `create_document.submit=true` records both `create` and `submit` requirements; search wrappers use `read_many`; report tools use `report_name`; workflow tools carry `action`. Invalid shapes return `ARGUMENT_CONTEXT_INVALID`, not an exception.
+Use an explicit mapping, not name heuristics. `fetch.id` must split once on `/`; `create_document.submit=true` sets audit `operation="create"` and `required_permissions=frozenset({"create", "submit"})`; search wrappers use `read_many`; report tools use `report_name`; workflow tools carry `action`. Invalid shapes return `ARGUMENT_CONTEXT_INVALID`, not an exception.
 
 - [ ] **Step 5: Implement policy evaluation order**
 
-Implement exact order from design §4: actor → inventory → hard deny → plugin config → tool config → restricted roles → trusted external → context → restricted target/fields → native permission. Catch internal errors at the public boundary and return `POLICY_ERROR_FAIL_CLOSED`. Treat `Allow All`, empty restricted roles and unknown modes as deny. Do not special-case privileged Frappe roles.
+Implement exact order from design §4: actor → inventory → hard deny → plugin config → tool config → restricted roles → trusted external → context → restricted target/fields → native permission. Catch internal errors at the public boundary and return `POLICY_ERROR_FAIL_CLOSED`. Treat `Allow All`, empty restricted roles and unknown modes as deny. Do not special-case privileged Frappe roles. `_load_access_config(..., fresh=True)` must bypass the 60-second registry cache for `phase="execute"`; cache is permitted only for `phase="publish"`.
 
 - [ ] **Step 6: Run focused tests and confirm GREEN**
 
@@ -158,21 +197,39 @@ git commit -m "feat: add fail-closed tool policy"
 
 ```python
 def test_nested_secrets_are_redacted(self):
-    value = {"headers": {"Authorization": "Bearer secret"}, "rows": [{"api_secret": "x"}]}
+    value = {
+        "headers": {"Authorization": "Bearer secret"},
+        "rows": [{"api_secret": "x"}],
+        "nested_json": '{"password":"inside"}',
+    }
     self.assertEqual(
         sanitize_for_audit(value),
-        {"headers": {"Authorization": "***REDACTED***"}, "rows": [{"api_secret": "***REDACTED***"}]},
+        {
+            "headers": {"Authorization": "***REDACTED***"},
+            "rows": [{"api_secret": "***REDACTED***"}],
+            "nested_json": '{"password":"***REDACTED***"}',
+        },
     )
 
 def test_policy_denial_is_logged_once_before_dependencies(self):
-    tool = RecordingTool()
-    with patch.object(SecurityPolicy, "authorize", return_value=DENIED):
+    decision = PolicyDecision(
+        allowed=False,
+        reason_code="TOOL_HARD_DENY",
+        context=ToolContext(operation="execute"),
+    )
+    tool = _RecordingToolForAuditTest()
+    with patch.object(SecurityPolicy, "authorize", return_value=decision):
         result = tool._safe_execute({"password": {"token": "never-log"}})
     self.assertEqual(result["error_type"], "PolicyDenied")
-    self.assertEqual(audit_rows(tool.name), 1)
+    self.assertEqual(
+        frappe.db.count("Assistant Audit Log", {"tool_name": tool.name}),
+        1,
+    )
     self.assertFalse(tool.dependencies_checked)
     self.assertFalse(tool.executed)
 ```
+
+`_RecordingToolForAuditTest` is a local test double in `test_audit_log.py` with `name="recording_test_tool"`; its dependency and execute methods only flip the two booleans above and must never be added to production inventory.
 
 - [ ] **Step 2: Run audit tests and confirm RED**
 
@@ -182,11 +239,11 @@ Expected: nested values remain unredacted and policy is not called.
 
 - [ ] **Step 3: Replace top-level sanitizer with recursive sanitizer**
 
-Handle mappings, lists, tuples and sets; preserve JSON-compatible scalar values; redact by `_is_sensitive_key`. Sanitize `arguments`, `output_data`, `error_message` and traceback payloads before persistence. Do not log raw Authorization, code, query or file content for denied calls.
+Handle `Mapping`, lists, tuples and sets; preserve JSON-compatible scalar values; redact by `_is_sensitive_key`. For strings beginning with `{` or `[` and no larger than 65,536 bytes, attempt `json.loads`, recursively sanitize, then emit deterministic compact JSON; parsing failure leaves the scalar unchanged. Sanitize `arguments`, `output_data`, `error_message` and traceback payloads at the persistence sink. Do not log raw Authorization, code, query, file content or raw arguments through `frappe.log_error`/MCP debug logging.
 
 - [ ] **Step 4: Enforce policy as first operation in `_safe_execute`**
 
-Call `authorize(..., phase="execute").require()` before dependency validation. Catch `PolicyDenied` before `frappe.PermissionError`; write status `Permission Denied`, `error_type="PolicyDenied"`, and stable reason in sanitized output metadata. Existing success/error/timeout behavior remains unchanged.
+Call `authorize(..., phase="execute").require()` before dependency validation. Retain the returned `PolicyDecision` and derive audit `operation`, `target_doctype` and `target_name` only from `decision.context`. Catch `PolicyDenied` before `frappe.PermissionError`; write status `Permission Denied`, `error_type="PolicyDenied"`, and stable reason in sanitized output metadata. For allowed calls, pass the result through `SecurityPolicy.redact_output(decision.context, result)` before returning it and before audit persistence. Redaction always removes universal sensitive keys; it additionally applies target-specific keys from context and, for heterogeneous results, the `doctype` declared by each result row. Existing success/error/timeout behavior remains unchanged.
 
 - [ ] **Step 5: Run audit and existing tool tests**
 
@@ -221,6 +278,9 @@ git commit -m "feat: audit fail-closed policy decisions"
 - [ ] **Step 1: Write failing adapter and TOCTOU tests**
 
 ```python
+class DummyTool:
+    name = "dummy"
+
 def test_adapter_routes_through_registry_executor(self):
     executor = Mock(return_value={"ok": True})
     tool_dict = build_tool_dict(DummyTool(), executor=executor)
@@ -228,12 +288,18 @@ def test_adapter_routes_through_registry_executor(self):
     executor.assert_called_once_with("dummy", {"name": "A"})
 
 def test_disabled_after_publication_is_denied_at_call_time(self):
-    published = registry.get_available_tools(user=AGENT)
-    self.assertIn("get_document", names(published))
-    disable_tool("get_document")
+    registry = get_tool_registry()
+    actor = "fac-toctou@example.com"
+    published = registry.get_available_tools(user=actor)
+    self.assertIn("get_document", {tool.name for tool in published})
+    config = frappe.get_doc("FAC Tool Configuration", "get_document")
+    config.enabled = 0
+    config.save()
     with self.assertRaises(PolicyDenied):
         registry.execute_tool("get_document", {"doctype": "ToDo", "name": "TD-1"})
 ```
+
+Add a second TOCTOU case that resets the fixture, publishes the tool, then calls `frappe.db.set_value("FAC Tool Configuration", "get_document", "enabled", 0)` without controller hooks. Both cases must deny immediately; the execute phase may not wait for the cache TTL.
 
 - [ ] **Step 2: Run new tests and confirm RED**
 
@@ -247,7 +313,7 @@ In `get_available_tools`, call `SecurityPolicy.authorize(..., phase="publish")` 
 
 - [ ] **Step 4: Make execution canonical**
 
-`execute_tool` resolves the actual instance, calls its `_safe_execute`, and converts the structured result without a pre-policy bypass. Unknown names call `log_denied_tool_attempt(reason_code="TOOL_UNKNOWN")` and raise `PolicyDenied`. `get_tool` remains resolution-only and is never an authorization API.
+`execute_tool` resolves the actual instance, calls its `_safe_execute`, and converts the structured result without a pre-policy bypass. Delete the upstream `_is_tool_enabled` and `_check_role_access` checks/raises that currently precede `_safe_execute`; known-tool authorization belongs only to the fresh execute policy. Unknown names call `log_denied_tool_attempt(reason_code="TOOL_UNKNOWN")` and raise `PolicyDenied`. `get_tool` remains resolution-only and is never an authorization API.
 
 - [ ] **Step 5: Route adapter through executor**
 
@@ -283,7 +349,9 @@ git commit -m "refactor: route tools through policy executor"
 - Modify: `frappe_assistant_core/api/fac_endpoint.py`
 - Modify: `frappe_assistant_core/mcp/server.py`
 - Modify: `frappe_assistant_core/api/handlers/tools.py`
+- Modify: `frappe_assistant_core/assistant_core/tools.py`
 - Create: `frappe_assistant_core/tests/test_mcp_security_boundary.py`
+- Create: `frappe_assistant_core/tests/test_legacy_tool_registry.py`
 
 **Interfaces:**
 - Consumes: registry executor and audit helpers.
@@ -291,16 +359,22 @@ git commit -m "refactor: route tools through policy executor"
 
 - [ ] **Step 1: Add failing MCP boundary tests**
 
-Cover: missing auth = 401; Guest never builds registry; hidden name direct call = MCP `isError=true` plus one audit row; response does not list available tools; list writes one summary without arguments; disabled-after-list fails.
+Cover: missing auth = 401; Guest never builds registry; top-level `arguments` must be a dict; hidden name direct call = MCP `isError=true` plus one audit row; response does not list available tools; generic exceptions return `Tool execution failed` without traceback/`str(exception)`; list writes one summary without arguments; disabled-after-list fails; legacy adapter has no CRUD/search implementation and routes only through canonical registry.
 
 ```python
 def test_unknown_tool_is_audited_without_inventory_leak(self):
     result = server._handle_tools_call({"name": "hidden", "arguments": {"token": "x"}}, {})
     self.assertTrue(result["isError"])
     self.assertNotIn("Available tools", result["content"][0]["text"])
-    row = latest_audit("hidden")
-    self.assertEqual(row.status, "Permission Denied")
-    self.assertNotIn("x", row.input_data or "")
+    rows = frappe.get_all(
+        "Assistant Audit Log",
+        filters={"tool_name": "hidden"},
+        fields=["status", "input_data"],
+        order_by="creation desc",
+        limit=1,
+    )
+    self.assertEqual(rows[0].status, "Permission Denied")
+    self.assertNotIn("x", rows[0].input_data or "")
 ```
 
 - [ ] **Step 2: Run MCP boundary tests and confirm RED**
@@ -313,24 +387,29 @@ In `_build_tool_registry`, call `build_tool_dict(tool_instance, executor=registr
 
 - [ ] **Step 4: Audit MCP denials and list summaries**
 
-In `_handle_tools_call`, unknown/unpublished name calls the audit helper and returns the generic text `Tool is not available`. Authentication failures call `log_security_event` with actor `Guest`, reason only, and never include the Authorization header. `_handle_tools_list` records published/hidden counts only.
+In `_handle_tools_call`, require a dict/object `arguments`; unknown/unpublished name calls the audit helper and returns `Tool is not available`. The generic exception branch returns `Tool execution failed`, never traceback, available-tool names or `str(exception)`; sanitized diagnostic detail is internal only. Authentication failures call `log_security_event` with actor `Guest`, reason only, and never include the Authorization header. `_handle_tools_list` records published/hidden counts only. Every call path owns exactly one audit write.
 
 - [ ] **Step 5: Keep alternate handler on canonical registry**
 
 Verify `api/handlers/tools.py` uses only `registry.get_available_tools` and `registry.execute_tool`; replace exception formatting that exposes internal details with stable public error messages while retaining details in sanitized audit.
 
-- [ ] **Step 6: Run MCP/auth/concurrency suites**
+- [ ] **Step 6: Neutralize and test the legacy registry**
+
+Replace static CRUD/search implementations in `assistant_core/tools.py` with a thin deprecated adapter to canonical `get_tool_registry().get_available_tools/execute_tool`; no `frappe.get_all`, raw `get_doc`, insert or save remains. The test patches those Frappe functions to raise and verifies the canonical executor receives the tool name and unpacked dict.
+
+- [ ] **Step 7: Run MCP/auth/concurrency/legacy suites**
 
 ```bash
 bench --site "$FAC_TEST_SITE" run-tests --app frappe_assistant_core --module frappe_assistant_core.tests.test_mcp_security_boundary
 bench --site "$FAC_TEST_SITE" run-tests --app frappe_assistant_core --module frappe_assistant_core.tests.test_oauth_cors
 bench --site "$FAC_TEST_SITE" run-tests --app frappe_assistant_core --module frappe_assistant_core.tests.test_mcp_concurrency
+bench --site "$FAC_TEST_SITE" run-tests --app frappe_assistant_core --module frappe_assistant_core.tests.test_legacy_tool_registry
 ```
 
-- [ ] **Step 7: Commit MCP boundary**
+- [ ] **Step 8: Commit MCP boundary**
 
 ```bash
-git add frappe_assistant_core/api/fac_endpoint.py frappe_assistant_core/mcp/server.py frappe_assistant_core/api/handlers/tools.py frappe_assistant_core/tests/test_mcp_security_boundary.py
+git add frappe_assistant_core/api/fac_endpoint.py frappe_assistant_core/mcp/server.py frappe_assistant_core/api/handlers/tools.py frappe_assistant_core/assistant_core/tools.py frappe_assistant_core/tests/test_mcp_security_boundary.py frappe_assistant_core/tests/test_legacy_tool_registry.py
 git commit -m "feat: enforce and audit MCP tool boundary"
 ```
 
@@ -362,7 +441,7 @@ CASES = (
 )
 ```
 
-Assert a second patch execution performs zero semantic changes. Assert newly discovered plugin/tool/external configs are disabled and `Deny All`. Core plugin may be enabled, but its tools are not.
+Assert a second patch execution performs zero semantic changes. Assert newly discovered plugin/tool/external configs are disabled and `Deny All`. Disable a plugin, run sync, and assert its existing tool configs remain present and unchanged; re-enable it and assert no permissive config is recreated. Core plugin may be enabled, but its tools are not.
 
 - [ ] **Step 2: Run migration tests and confirm RED**
 
@@ -378,11 +457,11 @@ Set `enabled` default `0`; role modes become `Deny All\nRestrict to Listed Roles
 
 - [ ] **Step 5: Implement migration patch**
 
-For every existing config: force hard-deny to disabled/Deny All; convert `Allow All`, missing/unknown mode, or empty restricted rows to disabled/Deny All; preserve valid restricted rows for configurable tools. Do not auto-assign roles. Log aggregate counts. Do not commit inside each row; one patch transaction.
+For every existing config: force hard-deny to disabled/Deny All; convert `Allow All`, missing/unknown `role_access_mode`, or empty restricted rows to disabled/Deny All; preserve valid restricted rows for configurable tools. Update exact fields with `frappe.db.set_value("FAC Tool Configuration", name, {"enabled": 0, "role_access_mode": "Deny All"})`; remove invalid child rows with `frappe.db.delete`, not `doc.save()` or raw SQL. Do not auto-assign roles. Log aggregate counts, clear registry/config cache once after the batch, and do not commit inside each row; one patch transaction. Run the same test module on Frappe 15 and 16 test sites.
 
 - [ ] **Step 6: Harden sync defaults**
 
-New non-core plugins disabled. New tools and external tools disabled/Deny All. Existing explicit restricted configs remain unchanged. Re-running sync never restores `Allow All`.
+New non-core plugins disabled. New tools and external tools disabled/Deny All. Existing explicit restricted configs remain unchanged. Remove automatic orphan deletion from `_sync_tool_configurations`: discovery includes only enabled plugins, so absence cannot prove a config is obsolete. Re-running sync never restores `Allow All`. Replace the broken `core.enhanced_tool_registry` import in `after_install`/migration hooks with the canonical registry import and cover it in the migration test.
 
 - [ ] **Step 7: Run migration and admin permission tests**
 
@@ -416,7 +495,7 @@ git commit -m "feat: migrate FAC access to deny by default"
 
 - [ ] **Step 1: Add failing restricted-target and row-permission tests**
 
-Cover `User`, `DocType`, child metadata, `search`, `fetch`, nested secret fields and a document lacking user-level read permission. Patch `frappe.get_all` in search paths to raise, proving it is not used for business records.
+Cover the exact ratified `RESTRICTED_DOCTYPES` baseline, direct child DocType targets, `User`, `File`, FAC configuration DocTypes, `DocType`, child metadata, `search`, `fetch`, nested secret fields and a document lacking user-level read permission. Patch `frappe.get_all` in search paths to raise, proving it is not used for business records. For document/list/search/metadata/fetch outputs, include sensitive keys nested in dict/list and assert they are redacted for both Assistant User and System Manager.
 
 - [ ] **Step 2: Run document/search/metadata suites and confirm RED**
 
@@ -436,7 +515,7 @@ Before querying each common DocType, authorize that target. Use only `frappe.get
 
 - [ ] **Step 5: Harden metadata and fetch**
 
-Check parent and each child DocType before serializing schema. `metadata_permissions`-style arbitrary `user` inspection remains unregistered and is not exposed via `get_doctype_info`. `fetch` keeps secure ID parsing, target authorization and recursive output filtering.
+Check parent and each child DocType before serializing schema. `metadata_permissions`-style arbitrary `user` inspection remains unregistered and is not exposed via `get_doctype_info`. `fetch` keeps secure ID parsing and target authorization. All output paths use the central `SecurityPolicy.redact_output`; local filters may add restrictions but cannot provide a privileged-role bypass.
 
 - [ ] **Step 6: Run the three suites and confirm GREEN**
 
@@ -449,31 +528,28 @@ git add frappe_assistant_core/core/security_config.py frappe_assistant_core/plug
 git commit -m "fix: enforce document policy in search and metadata"
 ```
 
-### Task 7: Report, workflow and legacy-path safety
+### Task 7: Report and workflow safety
 
 **Files:**
 - Modify: `frappe_assistant_core/plugins/core/tools/report_tools.py`
 - Modify: `frappe_assistant_core/plugins/core/tools/run_workflow.py`
 - Modify: `frappe_assistant_core/plugins/core/tools/get_pending_approvals.py`
-- Modify: `frappe_assistant_core/assistant_core/tools.py`
 - Modify: `frappe_assistant_core/tests/test_report_tools.py`
 - Modify: `frappe_assistant_core/tests/test_workflow_tools.py`
-- Create: `frappe_assistant_core/tests/test_legacy_tool_registry.py`
 
 **Interfaces:**
-- Consumes: policy target checks and canonical registry.
-- Produces: permission-aware report/workflow results; no executable legacy CRUD implementation.
+- Consumes: policy target checks and central output redaction.
+- Produces: permission-aware, recursively redacted report/workflow results.
 
-- [ ] **Step 1: Add failing report/workflow/legacy tests**
+- [ ] **Step 1: Add failing report/workflow tests**
 
-Assert report discovery and filter suggestions cannot use `frappe.get_all` for linked business records; a report whose `ref_doctype` is restricted is denied; pending approvals omit unreadable references; workflow checks target before `get_doc`; legacy search cannot execute its own `frappe.get_all` implementation.
+Assert report discovery and filter suggestions cannot use `frappe.get_all` for linked business records; a report whose `ref_doctype` is restricted is denied; pending approvals omit unreadable references; workflow checks target before `get_doc`; report and workflow outputs redact nested sensitive keys for Assistant User and System Manager.
 
 - [ ] **Step 2: Run focused suites and confirm RED**
 
 ```bash
 bench --site "$FAC_TEST_SITE" run-tests --app frappe_assistant_core --module frappe_assistant_core.tests.test_report_tools
 bench --site "$FAC_TEST_SITE" run-tests --app frappe_assistant_core --module frappe_assistant_core.tests.test_workflow_tools
-bench --site "$FAC_TEST_SITE" run-tests --app frappe_assistant_core --module frappe_assistant_core.tests.test_legacy_tool_registry
 ```
 
 - [ ] **Step 3: Harden reports**
@@ -482,21 +558,17 @@ Use permission-aware Report discovery, validate `Report` plus `ref_doctype`, and
 
 - [ ] **Step 4: Harden workflow operations**
 
-Authorize target before `frappe.get_doc` or query. Preserve Frappe `get_transitions`/`apply_workflow` as mandatory second checks. Filter each pending approval by reference read permission before returning or loading transitions.
+Authorize target before `frappe.get_doc` or query. Preserve Frappe `get_transitions`/`apply_workflow` as mandatory second checks. Filter each pending approval by reference read permission before returning or loading transitions. Apply central output redaction before results leave `_safe_execute`.
 
-- [ ] **Step 5: Neutralize legacy registry**
+- [ ] **Step 5: Run suites and confirm GREEN**
 
-Replace static CRUD/search implementations in `assistant_core/tools.py` with a thin deprecated adapter to canonical `get_tool_registry().get_available_tools/execute_tool`; no `frappe.get_all`, raw `get_doc`, insert or save remains in the legacy module.
+Expected: reports/workflows preserve allowed behavior, deny restricted/unreadable targets and redact nested sensitive fields for every role.
 
-- [ ] **Step 6: Run suites and confirm GREEN**
-
-Expected: reports/workflows preserve allowed behavior and deny restricted/unreadable targets; legacy calls traverse canonical policy.
-
-- [ ] **Step 7: Commit report/workflow safety**
+- [ ] **Step 6: Commit report/workflow safety**
 
 ```bash
-git add frappe_assistant_core/plugins/core/tools/report_tools.py frappe_assistant_core/plugins/core/tools/run_workflow.py frappe_assistant_core/plugins/core/tools/get_pending_approvals.py frappe_assistant_core/assistant_core/tools.py frappe_assistant_core/tests/test_report_tools.py frappe_assistant_core/tests/test_workflow_tools.py frappe_assistant_core/tests/test_legacy_tool_registry.py
-git commit -m "fix: close report workflow and legacy bypasses"
+git add frappe_assistant_core/plugins/core/tools/report_tools.py frappe_assistant_core/plugins/core/tools/run_workflow.py frappe_assistant_core/plugins/core/tools/get_pending_approvals.py frappe_assistant_core/tests/test_report_tools.py frappe_assistant_core/tests/test_workflow_tools.py
+git commit -m "fix: close report and workflow bypasses"
 ```
 
 ### Task 8: Independent verification matrix and operator documentation
@@ -513,11 +585,11 @@ git commit -m "fix: close report workflow and legacy bypasses"
 
 - [ ] **Step 1: Write black-box actor/tool matrix tests**
 
-Use Assistant User, Assistant Admin and System Manager fixtures. For each, assert hard-deny always fails; missing/Deny All/Allow All fail; explicit restricted role can publish and execute only configurable tools; restricted DocTypes fail; an allowed `ToDo` read succeeds; every call maps to one audit row.
+Use Assistant User, Assistant Admin and System Manager fixtures. For each, assert hard-deny always fails; missing/Deny All/Allow All fail; explicit restricted role can publish and execute only configurable tools; every ratified restricted DocType and direct child target fails; an allowed `ToDo` read succeeds; every call maps to one audit row. Compare the explicit 24-name snapshot to `discover_builtin_tool_names()` and fail on extra, missing or ambiguous tool classes.
 
 - [ ] **Step 2: Add authentication and parallel request cases**
 
-Test invalid Bearer, invalid API key, Guest, config change between list/call, and two concurrent users with different roles. Assert no registry cross-contamination and no secret in audit/error output.
+Test invalid Bearer, invalid API key, Guest, `.save()` and `frappe.db.set_value` config changes between list/call, non-dict MCP arguments, and two concurrent users with different roles. Assert no registry cross-contamination; no secret in audit/error/Error Log; no traceback or `str(exception)` in 401/generic MCP bodies; JSON-looking nested strings are redacted; document/list/search/report/metadata/fetch outputs are recursively redacted for System Manager too.
 
 - [ ] **Step 3: Run security matrix**
 
@@ -556,7 +628,7 @@ For every commit, compare changed files with ownership boundaries, inspect tests
 
 - [ ] **Step 2: Integrate in dependency order**
 
-Order: Tasks 1–2 → Tasks 3–4 → Task 5 → Tasks 6–7 → Task 8. Resolve conflicts by preserving policy signatures; do not merge alternate definitions.
+Order: Tasks 1–2 → Tasks 3–4, Task 5 and Tasks 6–7 in parallel → integration review of 3–7 → Task 8 → final integration. Task 7 has no registry dependency because legacy adapter belongs to Task 4. Resolve conflicts by preserving policy signatures; do not merge alternate definitions.
 
 - [ ] **Step 3: Run formatting/static checks**
 
@@ -588,11 +660,10 @@ Expected: PASS. If bench/site is unavailable, record `verification-blocked`; do 
 - [ ] **Step 6: Commit reviewed integration-only fixes**
 
 ```bash
-git add <only-reviewed-conflict-files>
 git commit -m "fix: integrate FAC hardening workstreams"
 ```
 
-This command is used only when the reviewed file list is explicitly named in the integration log; no blanket `git add .`.
+Before this commit, run one explicit `git add` command per exact reviewed conflict file recorded in the integration log. If integration produced no conflict fix, skip the commit. No glob and no blanket `git add .`.
 
 ### Task 10: Final independent audit and delivery gate
 
@@ -639,9 +710,9 @@ Deliver branch/revision, tests, remaining risks and rollout runbook to Алха�
 
 ## Pre-implementation cross-audit gate
 
-До Task 1 этот plan получает два независимых заключения:
+Кросс-аудит завершён до Task 1:
 
-1. **Claude:** архитектурная полнота, threat model, единая точка enforcement, audit semantics, отсутствие противоречий с design spec.
-2. **Antigravity:** исполнимость TDD-задач, Frappe/MCP integration risks, migration/rollback, параллельные границы Kimi/Z/Composer.
+1. **Совместный Claude/Fable + Opus 4.8:** `PASS WITH REQUIRED CHANGES`; приняты fresh execute read, удаление registry prechecks, MCP error containment, central output redaction, ratified restricted set, audit-context/sanitizer/logging tests и сохранение disabled-plugin configs. Замечание о 25-м runtime tool отозвано самим аудитом; добавлен runtime-discovery contract test.
+2. **Antigravity:** `EXECUTABLE WITH REQUIRED CHANGES`; legacy adapter перенесён из Z Task 7 в Codex Task 4, migration использует точное поле `role_access_mode` и `frappe.db.set_value`, JSON-looking nested strings обрабатываются bounded sanitizer при обязательном dict-shape MCP arguments.
 
-Codex создаёт отдельные briefs, сводит только доказанные замечания, вносит исправления через новый commit и публикует Алхасу таблицу `finding → решение → изменение plan`. Реализация начинается только после явного утверждения исправленного плана Алхасом.
+Codex публикует Алхасу таблицу `finding → решение → изменение plan`. Реализация начинается только после явного утверждения этой исправленной версии Алхасом; утверждение одновременно ratifies точный baseline `RESTRICTED_DOCTYPES` из design spec.

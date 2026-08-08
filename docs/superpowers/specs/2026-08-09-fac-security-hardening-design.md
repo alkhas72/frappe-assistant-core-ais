@@ -44,7 +44,7 @@ branch: feat/security-hardening
 
 ## 3. Инвентарь зарегистрированных инструментов
 
-Источник истины — `get_tools()` трёх plugins в pinned commit. Всего зарегистрировано 24 имени.
+Источник истины — runtime source discovery built-in plugins: `PluginDiscovery.discover_plugins()` перечисляет модули core/data_science/visualization, после чего их `BaseTool` classes импортируются без зависимости от enabled-state и dependency validation. Контрактный snapshot содержит 24 имени ниже и в тесте сравнивается с фактически обнаруженным набором; `plugin_manager.get_all_tools()` для этого не подходит, потому что возвращает только tools включённых plugins. Handwritten snapshot не подменяет discovery. `migrate_visualization` из `plugins/visualization/plugin_registry.py` является методом неиспользуемого `BasePlugin`, не зарегистрирован как tool и в инвентарь не входит.
 
 | Класс | Точные tool names | Политика этого этапа |
 |---|---|---|
@@ -109,18 +109,31 @@ Hard-denied tools получают решение до разбора польз
 
 ### 4.2 Restricted DocTypes и поля
 
-Текущий список `RESTRICTED_DOCTYPES` переносится из role-dependent логики в неизменяемую базовую границу и нормализуется. Минимально блокируются:
+Авторитетная неизменяемая константа `RESTRICTED_DOCTYPES` этого этапа содержит ровно следующий ratified baseline:
 
-- `User`, `Role`, permission/role profile DocTypes;
-- `OAuth Bearer Token`, `OAuth Client`, `Connected App`, API/key/integration settings;
-- `Server Script`, `Client Script`, `Custom Script`;
-- `DocType`, `DocField`, `DocPerm`, `Custom Field`, `Property Setter`, Customize Form family;
-- `Data Import`, `Data Export`, `Bulk Update`, `Rename Tool`;
-- Workflow definition DocTypes;
-- Email/system settings and queues;
-- FAC configuration DocTypes, если вызов идёт через MCP tools.
+```python
+RESTRICTED_DOCTYPES = frozenset({
+    "User", "Role", "User Permission", "Role Permission", "Custom Role",
+    "Module Profile", "Role Profile", "Custom DocPerm", "DocShare",
+    "System Settings", "Print Settings", "Email Domain", "LDAP Settings",
+    "OAuth Settings", "Social Login Key", "Dropbox Settings", "Connected App",
+    "OAuth Bearer Token", "OAuth Client", "Error Log", "Activity Log",
+    "Access Log", "View Log", "Scheduler Log", "Integration Request",
+    "Server Script", "Client Script", "Custom Script", "Property Setter",
+    "Customize Form", "Customize Form Field", "DocType", "DocField",
+    "DocPerm", "Custom Field", "Package", "Package Release",
+    "Installed Application", "Data Import", "Data Export", "Bulk Update",
+    "Rename Tool", "Database Storage Usage By Tables", "Workflow",
+    "Workflow Action", "Workflow State", "Workflow Transition", "Email Queue",
+    "Email Queue Recipient", "Email Alert", "Auto Email Report", "File",
+    "Assistant Core Settings", "FAC Tool Configuration", "FAC Tool Role Access",
+    "FAC Plugin Configuration", "Assistant Audit Log",
+})
+```
 
-Список чувствительных полей применяется рекурсивно к input и output. Никакого bypass для System Manager. Точный итоговый список будет отдельной константой с unit tests; расширение безопасно, сужение требует review.
+Кроме списка выше, любой DocType с `meta.istable == 1` запрещён как прямой MCP target; child rows допустимы только внутри разрешённого parent document и проходят рекурсивную проверку полей. Уменьшение этого baseline требует нового review; расширение допускается только с тестом, фиксирующим причину.
+
+Список чувствительных полей — объединение существующего `SENSITIVE_FIELDS` и универсальных вариантов `token`, `password`, `secret`, `authorization`, `cookie`, `cookies`, `session`, `api_key`, `api_secret`, `encryption_key` с нормализацией регистра и разделителей. Он применяется рекурсивно к input и output без bypass для System Manager. Центральный `SecurityPolicy.redact_output(context, value)` вызывается для результата каждого tool до ответа клиенту и до audit sink; локальные фильтры tools могут только дополнительно скрывать данные.
 
 ## 5. Точки принудительного применения
 
@@ -141,11 +154,14 @@ flowchart LR
 - `mcp/tool_adapter.build_tool_dict` получает executor и вызывает `ToolRegistry.execute_tool`, а не `tool_instance._safe_execute` напрямую;
 - `fac_endpoint._build_tool_registry` передаёт registry executor в adapter;
 - `ToolRegistry.execute_tool` разрешает экземпляр, но окончательное решение выполняется внутри `_safe_execute` непосредственно перед tool code;
+- `ToolRegistry.execute_tool` не выполняет прежние `_is_tool_enabled`/`_check_role_access` prechecks и не выбрасывает отказ до `_safe_execute`; единственный policy gate известного tool находится в `_safe_execute`, чтобы каждый отказ имел ровно одну audit row;
 - `BaseTool._safe_execute` всегда вызывает `SecurityPolicy.authorize(..., phase="execute")`, поэтому прямой вызов `_safe_execute` внешним кодом также закрыт;
 - `api/handlers/tools.py` продолжает использовать `ToolRegistry.execute_tool`;
 - неизвестный/неопубликованный tool в `mcp/server.py` журналируется как отказ;
 - `assistant_core/tools.py` помечается внутренним deprecated path и делегирует canonical registry либо становится неисполняемым. Небезопасные реализации не остаются запасным API;
-- `tools/list` использует `phase="publish"`. Список не является authority: execute всегда принимает новое решение.
+- `tools/list` использует `phase="publish"` и может применять 60-секундный cache только как фильтр публикации. `phase="execute"` всегда читает plugin/tool configuration из БД без этого cache. Список не является authority: execute всегда принимает новое решение;
+- `_handle_tools_call` проверяет, что `arguments` является JSON object/dict, и отклоняет иной top-level shape до executor;
+- неизвестное имя и любое необработанное исключение MCP возвращают только стабильное `Tool is not available`/`Tool execution failed`; traceback и доступный inventory клиенту не передаются.
 
 Ошибки policy, cache, DocType extraction и permission lookup закрываются отказом. Отказ не включает список доступных инструментов в ответ атакующему.
 
@@ -160,7 +176,9 @@ flowchart LR
 
 `tools/list` не создаёт по строке на каждый скрытый tool. Создаётся одна summary security event с actor, количеством опубликованных/скрытых tools и без пользовательских аргументов.
 
-Audit sink рекурсивно санирует dict/list/tuple; ключи `token`, `password`, `secret`, `authorization`, cookies, API credentials и их варианты редактируются на любой глубине. Ответ об отказе и audit row не содержат исходный code, SQL, API secret или содержимое файла. Для разрешённых mutations сохраняются target, operation и безопасные before/after hashes; полные документы в журнал не копируются. Builder before/after не применим, так как Builder закрыт.
+Audit sink рекурсивно санирует `Mapping`, list, tuple и set; ключи `token`, `password`, `secret`, `authorization`, cookies, API credentials и их варианты редактируются на любой глубине. JSON-looking object/array strings размером до 64 KiB безопасно разбираются, рекурсивно санируются и сериализуются обратно; произвольные или большие строки не парсятся. Санитайзер применяется к arguments, output, error и traceback непосредственно в sink. Target и operation берутся только из проверенного `PolicyDecision.context`, а не из сырых top-level arguments.
+
+Ответ об отказе и audit row не содержат исходный code, SQL, API secret или содержимое файла. `BaseTool` и MCP logging не передают raw arguments в `frappe.log_error` или debug log: там остаются только tool name, reason code, проверенный context и correlation id. Для разрешённых mutations сохраняются target, operation и безопасные before/after hashes; полные документы в журнал не копируются. Builder before/after не применим, так как Builder закрыт.
 
 Отказы аутентификации MCP журналируются как security event для `Guest`/неопределённого actor без значения Authorization header.
 
@@ -174,7 +192,9 @@ Audit sink рекурсивно санирует dict/list/tuple; ключи `to
 2. `Allow All`, пустой/неизвестный mode или пустой restricted list → `enabled=0`, mode `Deny All`;
 3. корректный `Restrict to Listed Roles` сохраняется только для не hard-denied tool;
 4. plugin configuration не может сама открыть tools; для не-core plugin без доказанного назначения безопасный migration default — disabled;
-5. миграция пишет только агрегированные counts в лог и не назначает роли автоматически.
+5. миграция пишет только агрегированные counts в лог и не назначает роли автоматически;
+6. строки обновляются через `frappe.db.set_value` по точным полям `enabled` и `role_access_mode`, а child role rows удаляются через `frappe.db.delete`; это исключает зависимость patch от controller/schema validation во время перехода. Raw SQL не используется. Registry cache очищается один раз после batch;
+7. `_sync_tool_configurations` никогда автоматически не удаляет конфигурацию отсутствующего tool: disabled plugin может временно исключить tool из discovery, и его deny/restricted config должен сохраниться. Повторное включение plugin не создаёт permissive запись.
 
 ### Новые строки и fresh install
 
@@ -214,7 +234,11 @@ Audit sink рекурсивно санирует dict/list/tuple; ключи `to
 - restricted DocType и nested sensitive fields блокируются;
 - каждый denial path создаёт одну sanitized audit row;
 - nested secrets отсутствуют в input/output/error/traceback audit payload;
-- migration идемпотентна и не возвращает `Allow All`.
+- JSON-looking nested strings санируются в пределах 64 KiB, а MCP принимает только object arguments;
+- output redaction действует на document/list/search/report/metadata/fetch для обычного пользователя и System Manager;
+- реальные `.save()` и `frappe.db.set_value` изменения конфигурации между list/call блокируют execute без ожидания cache TTL;
+- Error Log и MCP 401/error bodies не содержат raw secret или `str(exception)`;
+- migration идемпотентна, не возвращает `Allow All`, не удаляет config disabled plugin и исправляет устаревший import `core.enhanced_tool_registry` в install/migration hook.
 
 ### Frappe integration tests
 
