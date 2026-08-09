@@ -46,35 +46,38 @@ class ReportTools:
         produce the SAME external answer so the response cannot be used to
         enumerate reports.
 
-        FAC v2.1: ``frappe.db.exists("Report", ...)`` is intentionally NOT
-        called before the permission check. ``frappe.has_permission`` with a
-        ``doc`` argument returns False both for missing records and for
-        records the caller cannot read, which is exactly the
-        hidden-vs-missing indistinguishability we need.
+        FAC v2.2: switches to the canonical
+        ``frappe.desk.query_report.get_report_doc()`` resolver inside a
+        catch-all. ``get_report_doc`` raises ``frappe.PermissionError`` for
+        both missing and role-hidden reports, which collapses those cases
+        into a single failure mode; we wrap every exception path (including
+        ``PermissionError``, ``DoesNotExistError`` and any internal Frappe
+        error) into the same stable public answer so existence cannot be
+        enumerated. Restricted ``ref_doctype`` is enforced AFTER resolution
+        by ``execute_report`` / ``get_report_columns`` so it shares the same
+        generic message.
         """
         if not report_name:
             return None, {"success": False, "error": "Report not available"}
 
-        # Step 1: DocType-level read permission (no doc lookup yet). Without
-        # this, do not even probe for the record's existence.
         try:
-            if not frappe.has_permission("Report", "read"):
+            from frappe.desk.query_report import get_report_doc
+
+            report_doc = get_report_doc(report_name)
+        except Exception:
+            # PermissionError, DoesNotExistError, ImportError on minimal
+            # Frappe installs, or any internal failure: identical answer.
+            return None, {"success": False, "error": "Report not available"}
+
+        if report_doc is None:
+            return None, {"success": False, "error": "Report not available"}
+
+        # ``disabled`` reports are not runnable but their existence is not a
+        # secret per se — we still collapse to the same message so a disabled
+        # report and a hidden one are indistinguishable to the caller.
+        try:
+            if getattr(report_doc, "disabled", 0):
                 return None, {"success": False, "error": "Report not available"}
-        except Exception:
-            return None, {"success": False, "error": "Report not available"}
-
-        # Step 2: row-level read on the specific report. Missing records and
-        # hidden records both yield a non-truthy result here.
-        try:
-            visible = frappe.has_permission("Report", "read", doc=report_name)
-        except Exception:
-            visible = False
-        if not visible:
-            return None, {"success": False, "error": "Report not available"}
-
-        # Step 3: only now is it safe to load the report document.
-        try:
-            report_doc = frappe.get_doc("Report", report_name)
         except Exception:
             return None, {"success": False, "error": "Report not available"}
 
@@ -151,6 +154,16 @@ class ReportTools:
 
             # Handle different result structures
             if isinstance(result, dict):
+                # FAC v2.2: a prepared-report helper can return
+                # ``{"success": False, ...}`` for owner/report mismatch or
+                # generation failure. Preserve that failure verbatim — the
+                # legacy branch below would have re-wrapped it as
+                # ``success: True`` and silently swallowed the error.
+                if result.get("success") is False:
+                    # Strip the internal ``prepared_report_name`` so we do not
+                    # echo the internal document id back to the caller.
+                    result.pop("prepared_report_name", None)
+                    return result
                 # Extract the final filters that were actually used
                 final_filters = result.pop("_final_filters", effective_filters)
 
@@ -390,6 +403,9 @@ class ReportTools:
                 report_name = report.get("name") if hasattr(report, "get") else None
                 if not report_name:
                     continue
+                # FAC v2.2: disabled reports are never discoverable.
+                if report.get("disabled"):
+                    continue
                 # Row-level permission on the Report document itself.
                 if not frappe.has_permission("Report", "read", report_name):
                     continue
@@ -397,10 +413,21 @@ class ReportTools:
                 ref_doctype = report.get("ref_doctype") if hasattr(report, "get") else None
                 if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
                     continue
-                # Native read permission on the report's reference DocType. A
-                # report against ``Customer`` must not be discoverable by an
-                # actor who cannot read ``Customer``.
-                if ref_doctype and not frappe.has_permission(ref_doctype, "read"):
+                # FAC v2.2: native ``report`` ptype on the reference DocType.
+                # Frappe roles carry a separate ``report`` permission bit; an
+                # actor without it has no business seeing the report surface.
+                if ref_doctype and not frappe.has_permission(ref_doctype, "report"):
+                    continue
+                # FAC v2.2: ``report.is_permitted()`` is Frappe's canonical
+                # role-line check (``Has Role`` match against the report's
+                # ``roles`` table). Skipping it was the gap that let
+                # role-hidden reports appear in the listing.
+                try:
+                    report_doc = frappe.get_doc("Report", report_name)
+                    if hasattr(report_doc, "is_permitted") and not report_doc.is_permitted():
+                        continue
+                except Exception:
+                    # If we cannot load/inspect the report, fail closed.
                     continue
                 accessible_reports.append(report)
 
@@ -542,6 +569,30 @@ class ReportTools:
                 # Found existing prepared report - retrieve cached data
                 result = get_prepared_report_result(report_doc, filters, dn=prepared_report_name)
 
+                # FAC v2.2: bind the cached result to the current caller AND
+                # the resolved report. ``get_completed_prepared_report`` is
+                # user-scoped in Frappe, but a tampered or stale row could
+                # surface another user's results; verify owner + report_name
+                # on the actual Prepared Report document before returning.
+                try:
+                    prepared_doc_check = frappe.get_doc("Prepared Report", prepared_report_name)
+                except Exception:
+                    prepared_doc_check = None
+                if (
+                    prepared_doc_check is None
+                    or getattr(prepared_doc_check, "owner", None) != frappe.session.user
+                    or getattr(prepared_doc_check, "report_name", None) != report_doc.name
+                ):
+                    # Owner/report mismatch: do NOT return another user's
+                    # prepared result. Stable public failure.
+                    return {
+                        "success": False,
+                        "result": [],
+                        "columns": [],
+                        "error": "Prepared report not available",
+                        "status": "error",
+                    }
+
                 if result and result.get("result"):
                     # Successfully retrieved cached data
                     prepared_doc = result.get("doc")
@@ -616,6 +667,20 @@ class ReportTools:
                     # Report is ready! Retrieve and return data
                     result = get_prepared_report_result(report_doc, filters, dn=prepared_report_name)
 
+                    # FAC v2.2: re-bind owner + report_name before returning
+                    # the background-job result too.
+                    if (
+                        getattr(prepared_doc, "owner", None) != frappe.session.user
+                        or getattr(prepared_doc, "report_name", None) != report_doc.name
+                    ):
+                        return {
+                            "success": False,
+                            "result": [],
+                            "columns": [],
+                            "error": "Prepared report not available",
+                            "status": "error",
+                        }
+
                     if result and result.get("result"):
                         return {
                             "result": result.get("result", []),
@@ -629,14 +694,16 @@ class ReportTools:
                         }
 
                 elif prepared_doc.status == "Error":
-                    # Report generation failed
-                    error_message = prepared_doc.error_message or "Unknown error during report generation"
+                    # Report generation failed. FAC v2.2: NEVER echo
+                    # ``prepared_doc.error_message`` — Frappe stores the full
+                    # traceback there, which can include query text, document
+                    # values, or stack frames with credentials. Return a
+                    # stable category.
                     return {
                         "success": False,
                         "result": [],
                         "columns": [],
-                        "error": f"Report generation failed: {error_message}",
-                        "prepared_report_name": prepared_report_name,
+                        "error": "Prepared report generation failed",
                         "status": "error",
                     }
 
