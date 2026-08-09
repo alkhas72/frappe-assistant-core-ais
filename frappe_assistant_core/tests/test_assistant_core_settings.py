@@ -1,7 +1,7 @@
 """Behavior tests for Assistant Core settings updates."""
 
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from frappe_assistant_core.assistant_core.doctype.assistant_core_settings.assistant_core_settings import (
