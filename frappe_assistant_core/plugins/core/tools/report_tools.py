@@ -456,36 +456,30 @@ class ReportTools:
 
             accessible_reports = []
             for report in reports:
-                # ``frappe.get_list`` returns dict-like rows; use ``.get`` so
-                # both frappe._dict and plain dict work without AttributeError.
-                report_name = report.get("name") if hasattr(report, "get") else None
-                if not report_name:
-                    continue
-                # FAC v2.2: disabled reports are never discoverable.
-                if report.get("disabled"):
-                    continue
-                # Row-level permission on the Report document itself.
-                if not frappe.has_permission("Report", "read", report_name):
-                    continue
-                # Restricted-target gate on the report's reference DocType.
-                ref_doctype = report.get("ref_doctype") if hasattr(report, "get") else None
-                if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
-                    continue
-                # FAC v2.2: native ``report`` ptype on the reference DocType.
-                # Frappe roles carry a separate ``report`` permission bit; an
-                # actor without it has no business seeing the report surface.
-                if ref_doctype and not frappe.has_permission(ref_doctype, "report"):
-                    continue
-                # FAC v2.2: ``report.is_permitted()`` is Frappe's canonical
-                # role-line check (``Has Role`` match against the report's
-                # ``roles`` table). Skipping it was the gap that let
-                # role-hidden reports appear in the listing.
                 try:
+                    # ``frappe.get_list`` normally returns dict-like rows, but
+                    # discovery must fail closed for any malformed row or
+                    # row-specific Frappe permission error.
+                    if not hasattr(report, "get"):
+                        continue
+                    report_name = report.get("name")
+                    if not report_name or report.get("disabled"):
+                        continue
+                    if not frappe.has_permission("Report", "read", report_name):
+                        continue
+                    ref_doctype = report.get("ref_doctype")
+                    if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
+                        continue
+                    if ref_doctype and not frappe.has_permission(ref_doctype, "report"):
+                        continue
+                    # ``report.is_permitted()`` is Frappe's canonical role-line
+                    # check (``Has Role`` match against the report's roles).
                     report_doc = frappe.get_doc("Report", report_name)
                     if hasattr(report_doc, "is_permitted") and not report_doc.is_permitted():
                         continue
                 except Exception:
-                    # If we cannot load/inspect the report, fail closed.
+                    # A single unreadable report must not disclose itself or
+                    # abort discovery of other authorized reports.
                     continue
                 accessible_reports.append(report)
 
@@ -496,10 +490,10 @@ class ReportTools:
                 "filters_applied": {"module": module, "report_type": report_type},
             }
 
-        except Exception:
+        except Exception as exc:
             # FAC v2.1: stable public category; technical log records only the
             # exception type and a safe context tag (no arguments, no rows).
-            _log_safe("list_reports failed")
+            _log_safe("list_reports failed", exc)
             return {"success": False, "error": "Report listing failed"}
 
     @staticmethod

@@ -47,11 +47,16 @@ from frappe_assistant_core.tests.test_security_migration import (
 )
 
 _module_security_snapshot = None
+_module_request_identity = None
 
 
 def setUpModule():
-    global _module_security_snapshot
+    global _module_request_identity, _module_security_snapshot
     _module_security_snapshot = _snapshot_security_rows()
+    _module_request_identity = (
+        getattr(frappe.local, "assistant_session_id", None),
+        getattr(frappe.local, "assistant_client_id", None),
+    )
 
 
 def tearDownModule():
@@ -71,6 +76,10 @@ def tearDownModule():
     finally:
         _restore_security_rows(_module_security_snapshot)
         frappe.db.commit()
+        (
+            frappe.local.assistant_session_id,
+            frappe.local.assistant_client_id,
+        ) = _module_request_identity
 
 # --- Literal acceptance snapshots (independent of production imports) ---------
 
@@ -253,19 +262,28 @@ class SecurityMatrixAcceptance(FrappeTestCase):
     secret_marker: str
 
     def setUp(self):
-        super().setUp()
-        frappe.flags.in_test = True
         frappe.set_user("Administrator")
-        self.fac_security_snapshot = _snapshot_security_rows()
         self.run_id = uuid.uuid4().hex[:12]
         self.session_id = f"fac-t8-matrix-{self.run_id}"
         self.secret_marker = f"fac-t8-secret-{self.run_id}"
+        self.original_request_identity = (
+            getattr(frappe.local, "assistant_session_id", None),
+            getattr(frappe.local, "assistant_client_id", None),
+        )
         self.created_users: list[str] = []
         self.created_todos: list[str] = []
         self.created_roles: list[str] = []
         self.config_snapshots: dict[str, dict] = {}
         self.plugin_snapshots: dict[str, bool] = {}
         self.deleted_tool_configs: dict[str, dict] = {}
+        self.fac_security_snapshot = _snapshot_security_rows()
+        # Register before Frappe's setup so this cleanup runs last (LIFO),
+        # after Frappe's transaction rollback cleanups.
+        self.addCleanup(self._persist_test_cleanup)
+
+        super().setUp()
+        frappe.flags.in_test = True
+        frappe.set_user("Administrator")
         self.probe_baseline = self._capture_tool_config(self.configurable_probe)
         self.core_plugin_baseline = bool(
             frappe.db.get_value("FAC Plugin Configuration", "core", "enabled")
@@ -283,28 +301,29 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         ).insert(ignore_permissions=True)
         self.created_roles.append(self.mismatch_role)
 
-    def tearDown(self):
-        try:
-            super().tearDown()
-        finally:
-            frappe.set_user("Administrator")
-            frappe.db.delete(
-                "Assistant Audit Log",
-                {"session_id": ("like", f"{self.session_id}%")},
-            )
-            for name in self.created_todos:
-                if frappe.db.exists("ToDo", name):
-                    frappe.delete_doc("ToDo", name, force=True)
-            for email in self.created_users:
-                if frappe.db.exists("User", email):
-                    frappe.delete_doc("User", email, force=True)
-            for role in self.created_roles:
-                if frappe.db.exists("Role", role):
-                    frappe.delete_doc("Role", role, force=True)
-            _restore_security_rows(self.fac_security_snapshot)
-            self.assertEqual(_snapshot_security_rows(), self.fac_security_snapshot)
-            frappe.db.commit()
-            ToolRegistry().clear_cache()
+    def _persist_test_cleanup(self):
+        frappe.set_user("Administrator")
+        frappe.db.delete(
+            "Assistant Audit Log",
+            {"session_id": ("like", f"{self.session_id}%")},
+        )
+        for name in self.created_todos:
+            if frappe.db.exists("ToDo", name):
+                frappe.delete_doc("ToDo", name, force=True)
+        for email in self.created_users:
+            if frappe.db.exists("User", email):
+                frappe.delete_doc("User", email, force=True)
+        for role in self.created_roles:
+            if frappe.db.exists("Role", role):
+                frappe.delete_doc("Role", role, force=True)
+        _restore_security_rows(self.fac_security_snapshot)
+        self.assertEqual(_snapshot_security_rows(), self.fac_security_snapshot)
+        frappe.db.commit()
+        (
+            frappe.local.assistant_session_id,
+            frappe.local.assistant_client_id,
+        ) = self.original_request_identity
+        ToolRegistry().clear_cache()
 
     # --- helpers ------------------------------------------------------------
 
@@ -837,7 +856,11 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         for label, case in cases.items():
             with self.subTest(output_path=label):
                 before = self._audit_count(manager, case["tool"])
-                result = self._registry_execute(manager, case["tool"], case["arguments"])
+                result = self._registry_execute(
+                    manager,
+                    case["tool"],
+                    case["arguments"],
+                )
                 serialized = json.dumps(result, default=str)
                 self.assertNotIn(self.secret_marker, serialized)
                 if label in {"get_document", "list_documents", "fetch"}:
@@ -1162,3 +1185,87 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         self.assertNotIn(self.secret_marker, body)
         self.assertNotIn("Traceback", body)
         self._assert_exactly_one_audit(actor, "get_document", before)
+
+    def test_legacy_tool_wrappers_never_echo_raw_exception_text(self):
+        from frappe_assistant_core.core import security_config
+        from frappe_assistant_core.plugins.core.tools import report_tools, search_tools
+        from frappe_assistant_core.plugins.core.tools.generate_report import GenerateReport
+        from frappe_assistant_core.plugins.core.tools.list_documents import DocumentList
+        from frappe_assistant_core.plugins.core.tools.report_list import ReportList
+        from frappe_assistant_core.plugins.core.tools.report_requirements import (
+            ReportRequirements,
+        )
+        from frappe_assistant_core.plugins.core.tools.search_doctype import SearchDoctype
+        from frappe_assistant_core.plugins.core.tools.search_link import SearchLink
+
+        secret = self.secret_marker
+        cases = (
+            (
+                SearchLink(),
+                search_tools.SearchTools,
+                "search_link",
+                {"doctype": "Customer", "query": "x"},
+                "Link search failed",
+            ),
+            (
+                SearchDoctype(),
+                search_tools.SearchTools,
+                "search_doctype",
+                {"doctype": "Customer", "query": "x"},
+                "Document search failed",
+            ),
+            (
+                GenerateReport(),
+                report_tools.ReportTools,
+                "execute_report",
+                {"report_name": "Any"},
+                "Report execution failed",
+            ),
+            (
+                ReportList(),
+                report_tools.ReportTools,
+                "list_reports",
+                {},
+                "Report listing failed",
+            ),
+            (
+                ReportRequirements(),
+                report_tools.ReportTools,
+                "get_report_columns",
+                {"report_name": "Any"},
+                "Report requirements failed",
+            ),
+        )
+
+        for tool, owner, method, arguments, expected in cases:
+            with self.subTest(tool=tool.name):
+                logger = MagicMock()
+                with patch.object(
+                    owner,
+                    method,
+                    side_effect=RuntimeError(secret),
+                ), patch.object(frappe, "logger", return_value=logger):
+                    result = tool.execute(arguments)
+                serialized = json.dumps(result, default=str)
+                self.assertFalse(result.get("success"))
+                self.assertEqual(result.get("error"), expected)
+                self.assertNotIn(secret, serialized)
+                self.assertNotIn(secret, str(logger.method_calls))
+
+        logger = MagicMock()
+        with patch.object(
+            security_config,
+            "validate_document_access",
+            return_value={"success": True, "role": "System Manager"},
+        ), patch.object(
+            frappe,
+            "get_list",
+            side_effect=RuntimeError(secret),
+        ), patch.object(frappe, "logger", return_value=logger):
+            result = DocumentList().execute({"doctype": "Customer"})
+
+        serialized = json.dumps(result, default=str)
+        self.assertFalse(result.get("success"))
+        self.assertEqual(result.get("error"), "Document listing failed")
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(secret, str(logger.method_calls))

@@ -157,12 +157,11 @@ class ReportRequirements(BaseTool):
 
             return result
 
-        except Exception as e:
-            frappe.log_error(
-                title=_("Report Requirements Error"), message=f"Error analyzing report requirements: {str(e)}"
+        except Exception as exc:
+            frappe.logger("fac.report_requirements").warning(
+                f"report_requirements failed: {type(exc).__name__}"
             )
-
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": "Report requirements failed"}
 
     def _build_requirements_from_parsed_filters(self, parsed_filters: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -475,10 +474,12 @@ class ReportRequirements(BaseTool):
             self._last_discovery_diagnostics = diag
             return None
 
-        except Exception as e:
-            diag["error"] = f"{type(e).__name__}: {str(e)}"
+        except Exception as exc:
+            diag["error"] = type(exc).__name__
             self._last_discovery_diagnostics = diag
-            frappe.log_error(f"Error parsing Script Report filters for {report_name}: {str(e)}")
+            frappe.logger("fac.report_requirements").warning(
+                f"script filter discovery failed: {type(exc).__name__}"
+            )
             return None
 
     def _parse_js_filter_array(self, filters_text: str) -> Dict[str, Any]:
@@ -659,13 +660,15 @@ class ReportRequirements(BaseTool):
                                 metadata["advanced_filters"] = report_module.filters
                         except Exception:
                             pass
-            except Exception as e:
-                frappe.logger().debug(f"Error extracting filters for {report_name}: {str(e)}")
+            except Exception as exc:
+                frappe.logger("fac.report_requirements").debug(
+                    f"filter extraction failed: {type(exc).__name__}"
+                )
 
             return metadata
 
-        except Exception as e:
-            return {"error": f"Error getting metadata: {str(e)}"}
+        except Exception:
+            return {"error": "Report metadata unavailable"}
 
 
 # Make sure class name matches file name for discovery

@@ -66,10 +66,11 @@ class SearchDoctype(BaseTool):
                 limit=arguments.get("limit", 20),
             )
 
-        except Exception as e:
-            frappe.log_error(title=_("Search DocType Error"), message=f"Error searching DocType: {str(e)}")
-
-            return {"success": False, "error": str(e)}
+        except Exception as exc:
+            frappe.logger("fac.search_doctype").warning(
+                f"search_doctype failed: {type(exc).__name__}"
+            )
+            return {"success": False, "error": "Document search failed"}
 
 
 # Make sure class name matches file name for discovery

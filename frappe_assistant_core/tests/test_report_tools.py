@@ -176,6 +176,42 @@ class TestReportTools(BaseAssistantTest):
             "list_reports must pass ignore_permissions=False",
         )
 
+    def test_list_reports_ignores_malformed_permission_rows(self):
+        """A malformed row from the permission layer must fail closed without
+        aborting the complete report discovery response."""
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        with patch.object(report_tools.frappe, "get_list", return_value=[object()]):
+            result = report_tools.ReportTools.list_reports()
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(result.get("reports"), [])
+        self.assertEqual(result.get("count"), 0)
+
+    def test_list_reports_skips_row_when_native_permission_check_errors(self):
+        """A row-specific Frappe error fails closed for that report only."""
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        row = {
+            "name": "Broken Permission Report",
+            "disabled": 0,
+            "ref_doctype": "Customer",
+        }
+        with patch.object(report_tools.frappe, "get_list", return_value=[row]), patch.object(
+            report_tools.frappe,
+            "has_permission",
+            side_effect=AttributeError("test-only permission failure"),
+        ):
+            result = report_tools.ReportTools.list_reports()
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(result.get("reports"), [])
+        self.assertEqual(result.get("count"), 0)
+
     def test_execute_report_rejects_restricted_ref_doctype(self):
         """A report whose ``ref_doctype`` is restricted must be refused before
         any filter validation or execution runs. FAC v2.1: the external answer

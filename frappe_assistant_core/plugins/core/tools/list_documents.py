@@ -183,10 +183,15 @@ class DocumentList(BaseTool):
             # Log successful access
             return result
 
-        except Exception as e:
-            frappe.log_error(title=_("Document List Error"), message=f"Error listing {doctype}: {str(e)}")
-
-            return {"success": False, "error": str(e), "doctype": doctype}
+        except Exception as exc:
+            frappe.logger("fac.list_documents").warning(
+                f"list_documents failed: {type(exc).__name__}"
+            )
+            return {
+                "success": False,
+                "error": "Document listing failed",
+                "doctype": doctype,
+            }
 
 
 # Make sure class name matches file name for discovery

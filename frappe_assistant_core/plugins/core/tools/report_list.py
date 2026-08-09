@@ -70,10 +70,11 @@ class ReportList(BaseTool):
                 module=arguments.get("module"), report_type=arguments.get("report_type")
             )
 
-        except Exception as e:
-            frappe.log_error(title=_("Report List Error"), message=f"Error listing reports: {str(e)}")
-
-            return {"success": False, "error": str(e)}
+        except Exception as exc:
+            frappe.logger("fac.report_list").warning(
+                f"report_list failed: {type(exc).__name__}"
+            )
+            return {"success": False, "error": "Report listing failed"}
 
 
 # Make sure class name matches file name for discovery
