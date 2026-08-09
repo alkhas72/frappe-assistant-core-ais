@@ -78,7 +78,7 @@ def tearDownModule():
             raise AssertionError(f"FAC security snapshot changed: before={before_hash}, after={after_hash}")
     finally:
         _restore_security_rows(_module_security_snapshot)
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist module migration-fixture restore
 
 
 PATCH_MODULE = "frappe_assistant_core.patches.v2_5.harden_fac_tool_access_defaults"
@@ -227,7 +227,7 @@ class FACSecuritySnapshotTestCase(FrappeTestCase):
             # FrappeTestCase rolls back its class transaction after individual
             # tearDown calls. Commit the exact snapshot so that rollback cannot
             # resurrect a prior mutation (including `modified` metadata).
-            frappe.db.commit()
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — prevent test rollback from resurrecting mutation
         finally:
             super().tearDown()
 

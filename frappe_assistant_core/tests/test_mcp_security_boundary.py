@@ -32,7 +32,7 @@ def _tool(name, fn):
 def _delete_boundary_audit_rows(tool_name):
     """Remove only the real audit row created by this boundary test."""
     frappe.db.delete("Assistant Audit Log", {"tool_name": tool_name})
-    frappe.db.commit()
+    frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist boundary-test audit cleanup
 
 
 class _AdapterTool:

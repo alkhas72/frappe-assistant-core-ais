@@ -44,7 +44,7 @@ def tearDownModule():
             )
     finally:
         _restore_security_rows(_module_security_snapshot)
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist module execution-policy restore
 
 
 class _DummyTool:
@@ -226,7 +226,7 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
             _restore_security_rows(self._fac_security_snapshot)
             restored = _snapshot_security_rows()
             self.assertEqual(restored, self._fac_security_snapshot)
-            frappe.db.commit()
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist per-test policy restore before cache refresh
             self.plugin_manager.refresh_plugins()
             self.registry.clear_cache()
         finally:

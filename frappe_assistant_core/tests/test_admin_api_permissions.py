@@ -76,7 +76,7 @@ def tearDownModule():
             raise AssertionError(f"FAC security snapshot changed: before={before_hash}, after={after_hash}")
     finally:
         _restore_security_rows(_module_security_snapshot)
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist module security snapshot restore
 
 
 class TestAdminAPIPermissions(BaseAssistantTest):
@@ -101,7 +101,7 @@ class TestAdminAPIPermissions(BaseAssistantTest):
         restored = _snapshot_security_rows()
         if _security_snapshot_hash(restored) != _security_snapshot_hash(cls._fac_security_snapshot):
             raise AssertionError("FAC security snapshot restoration failed")
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist class security snapshot restore
 
     @classmethod
     def _create_non_admin_user(cls):

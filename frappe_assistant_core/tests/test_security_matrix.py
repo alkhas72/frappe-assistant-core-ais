@@ -73,7 +73,7 @@ def tearDownModule():
             raise AssertionError(f"FAC matrix snapshot changed: before={before_hash}, after={after_hash}")
     finally:
         _restore_security_rows(_module_security_snapshot)
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist module security snapshot restore
         (
             frappe.local.assistant_session_id,
             frappe.local.assistant_client_id,
@@ -315,7 +315,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                 frappe.delete_doc("Role", role, force=True)
         _restore_security_rows(self.fac_security_snapshot)
         self.assertEqual(_snapshot_security_rows(), self.fac_security_snapshot)
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist per-test security snapshot restore
         (
             frappe.local.assistant_session_id,
             frappe.local.assistant_client_id,
@@ -985,7 +985,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         self._configure_tool("list_documents", roles=("Assistant Admin",))
         site = frappe.local.site
         sites_path = frappe.local.sites_path
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — commit configuration before concurrency worker starts
 
         barrier = threading.Barrier(2)
         results: dict[str, Any] = {}

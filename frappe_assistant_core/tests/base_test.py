@@ -201,7 +201,7 @@ class BaseAssistantTest(unittest.TestCase):
                 "Assistant Audit Log",
                 {"name": ("in", tuple(created))},
             )
-            frappe.db.commit()
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist isolated audit-log cleanup
 
     def setup_mocks(self):
         """Set up common mocks for testing"""
