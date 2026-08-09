@@ -1,6 +1,6 @@
 # FAC Security Policy
 
-Operator-facing summary of Frappe Assistant Core (FAC) security controls after Tasks 1–7 integration at commit `85c7906`. This document separates **verified guarantees** (covered by existing unit/integration tests and production policy code) from **acceptance requirements** validated by Task 8 (`test_security_matrix.py`).
+Operator-facing summary of Frappe Assistant Core (FAC) security controls after Tasks 1–8 integration. This document separates production controls from the acceptance evidence in `test_security_matrix.py`.
 
 ## Verified guarantees (Tasks 1–7)
 
@@ -15,9 +15,9 @@ These behaviors are enforced in production code and covered by the existing test
 - Per-request tool registries prevent cross-request registry corruption under concurrency.
 - OAuth/API authentication failures write sanitized security audit rows.
 
-## Pending Task 8 acceptance
+## Verified Task 8 acceptance
 
-The following are **requirements** exercised by `frappe_assistant_core/tests/test_security_matrix.py`. A production deployment should treat them as contractual only after Codex confirms:
+Codex verified the following command on isolated `fac-test` with Frappe 15.112.1 on 2026-08-09: 17 tests passed, with exact FAC configuration snapshots unchanged and no temporary Task 8 users, roles, or audit rows remaining.
 
 ```bash
 bench --site "$FAC_TEST_SITE" run-tests \
@@ -27,7 +27,7 @@ bench --site "$FAC_TEST_SITE" run-tests \
 
 Task 8 acceptance additionally proves:
 
-- Literal inventory snapshots (24 tools, 8 hard-deny built-ins, 56 restricted DocTypes) match production discovery/constants with no extra/missing/ambiguous entries.
+- Literal inventory snapshots (24 tools, 8 hard-deny built-ins, 57 restricted DocTypes) match production discovery/constants with no extra/missing/ambiguous entries.
 - Full actor × configuration × phase matrix through **ToolRegistry** and **MCPServer** (not direct `SecurityPolicy` calls).
 - Exactly one persisted `Assistant Audit Log` row per boundary call, scoped by unique session identity.
 - Real System Manager outputs for document/list/search/report/metadata/fetch paths (not direct `redact_output` stubs).

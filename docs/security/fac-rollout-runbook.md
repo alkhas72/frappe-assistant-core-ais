@@ -4,7 +4,7 @@ Production rollout and rollback procedures for FAC security hardening (Tasks 1�
 
 ## Preconditions
 
-- Target FAC revision pinned (example: `85c7906` or later merge containing Tasks 1–8).
+- Exact approved FAC Tasks 1–8 integration revision pinned.
 - Staging site migrated and Task 8 matrix green:
 
   ```bash
@@ -24,7 +24,7 @@ Production rollout and rollback procedures for FAC security hardening (Tasks 1�
 | `$BENCH_DIR` | `/home/frappe/frappe-bench` | Bench root |
 | `$FAC_APP_DIR` | `$BENCH_DIR/apps/frappe_assistant_core` | FAC app path |
 | `$SNAPSHOT_DIR` | `/var/backups/fac-hardening-YYYYMMDD-HHMM` | Backup destination |
-| `$FAC_REVISION` | `85c7906e38b6a33d668c9046cb8ada1e35cb6cc0` | Git commit SHA |
+| `$FAC_REVISION` | `<approved-task8-integration-sha>` | Exact Git commit SHA approved for rollout |
 | `$FRAPPE_API_SH` | `/path/to/frappe_api.sh` | External helper (not in FAC repo) |
 
 ---
@@ -265,6 +265,7 @@ When moving LLM clients to the hardened MCP endpoint:
 
 | Section | Verified by Task 8 matrix | Requires bench run |
 |---------|---------------------------|-------------------|
-| Inventory / hard-deny / restricted DocTypes | Yes (when matrix green) | Codex on `$FAC_TEST_SITE` |
-| Actor × config × phase matrix | Yes (when matrix green) | Codex on `$FAC_TEST_SITE` |
+| Inventory / hard-deny / restricted DocTypes | Yes | Completed on `fac-test`, Frappe 15.112.1, 2026-08-09 |
+| Actor × config × phase matrix | Yes | Completed on `fac-test`, Frappe 15.112.1, 2026-08-09 |
+| Frappe 16 compatibility | No | Verification blocked: no Frappe 16 test site is available |
 | Rollout commands | Operational guidance only | Manual staging drill |

@@ -25,8 +25,14 @@ from werkzeug.wrappers import Response
 
 from frappe_assistant_core.core.security_policy import (
     CONFIGURABLE_TOOLS as PROD_CONFIGURABLE,
+)
+from frappe_assistant_core.core.security_policy import (
     HARD_DENY_TOOLS as PROD_HARD_DENY,
+)
+from frappe_assistant_core.core.security_policy import (
     RESTRICTED_DOCTYPES as PROD_RESTRICTED,
+)
+from frappe_assistant_core.core.security_policy import (
     PolicyDenied,
     SecurityPolicy,
     discover_builtin_tool_names,
@@ -34,7 +40,37 @@ from frappe_assistant_core.core.security_policy import (
 from frappe_assistant_core.core.tool_registry import ToolRegistry
 from frappe_assistant_core.mcp.server import MCPServer
 from frappe_assistant_core.mcp.tool_adapter import build_tool_dict
-from frappe_assistant_core.plugins.core.tools.get_document import DocumentGet
+from frappe_assistant_core.tests.test_security_migration import (
+    _restore_security_rows,
+    _security_snapshot_hash,
+    _snapshot_security_rows,
+)
+
+_module_security_snapshot = None
+
+
+def setUpModule():
+    global _module_security_snapshot
+    _module_security_snapshot = _snapshot_security_rows()
+
+
+def tearDownModule():
+    frappe.set_user("Administrator")
+    frappe.db.delete(
+        "Assistant Audit Log",
+        {"session_id": ("like", "fac-t8-matrix-%")},
+    )
+    after = _snapshot_security_rows()
+    before_hash = _security_snapshot_hash(_module_security_snapshot)
+    after_hash = _security_snapshot_hash(after)
+    try:
+        if after_hash != before_hash:
+            raise AssertionError(
+                f"FAC matrix snapshot changed: before={before_hash}, after={after_hash}"
+            )
+    finally:
+        _restore_security_rows(_module_security_snapshot)
+        frappe.db.commit()
 
 # --- Literal acceptance snapshots (independent of production imports) ---------
 
@@ -196,9 +232,18 @@ def _result_of(response: Response) -> dict:
 @dataclass(frozen=True)
 class ConfigScenario:
     label: str
-    setup: Callable[["SecurityMatrixAcceptance"], None]
+    setup: Callable[[SecurityMatrixAcceptance], None]
     publish_allowed: bool
     execute_reason: str | None  # None => success path for Assistant User only
+
+
+class _RecordHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(self.format(record))
 
 
 class SecurityMatrixAcceptance(FrappeTestCase):
@@ -211,11 +256,13 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         super().setUp()
         frappe.flags.in_test = True
         frappe.set_user("Administrator")
+        self.fac_security_snapshot = _snapshot_security_rows()
         self.run_id = uuid.uuid4().hex[:12]
         self.session_id = f"fac-t8-matrix-{self.run_id}"
         self.secret_marker = f"fac-t8-secret-{self.run_id}"
         self.created_users: list[str] = []
         self.created_todos: list[str] = []
+        self.created_roles: list[str] = []
         self.config_snapshots: dict[str, dict] = {}
         self.plugin_snapshots: dict[str, bool] = {}
         self.deleted_tool_configs: dict[str, dict] = {}
@@ -226,42 +273,38 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         self.actors = {label: self._unique_email(label) for label in ACTOR_ROLES}
         for label, email in self.actors.items():
             self._ensure_actor(email, ACTOR_ROLES[label])
+        self.mismatch_role = f"FAC Matrix Mismatch {self.run_id}"
+        frappe.get_doc(
+            {
+                "doctype": "Role",
+                "role_name": self.mismatch_role,
+                "disabled": 0,
+            }
+        ).insert(ignore_permissions=True)
+        self.created_roles.append(self.mismatch_role)
 
     def tearDown(self):
-        frappe.set_user("Administrator")
-        for tool_name, payload in self.deleted_tool_configs.items():
-            if not frappe.db.exists("FAC Tool Configuration", tool_name):
-                doc = frappe.get_doc({"doctype": "FAC Tool Configuration", **payload})
-                doc.insert(ignore_permissions=True)
-        for tool_name, snapshot in self.config_snapshots.items():
-            if frappe.db.exists("FAC Tool Configuration", tool_name):
-                self._apply_tool_config(tool_name, snapshot)
-        for plugin_name, enabled in self.plugin_snapshots.items():
-            if frappe.db.exists("FAC Plugin Configuration", plugin_name):
-                frappe.db.set_value(
-                    "FAC Plugin Configuration",
-                    plugin_name,
-                    "enabled",
-                    int(enabled),
-                    update_modified=False,
-                )
-        if self.probe_baseline is not None:
-            self._apply_tool_config(self.configurable_probe, self.probe_baseline)
-        frappe.db.set_value(
-            "FAC Plugin Configuration",
-            "core",
-            "enabled",
-            int(self.core_plugin_baseline),
-            update_modified=False,
-        )
-        for name in self.created_todos:
-            if frappe.db.exists("ToDo", name):
-                frappe.delete_doc("ToDo", name, force=True)
-        for email in self.created_users:
-            if frappe.db.exists("User", email):
-                frappe.delete_doc("User", email, force=True)
-        ToolRegistry().clear_cache()
-        super().tearDown()
+        try:
+            super().tearDown()
+        finally:
+            frappe.set_user("Administrator")
+            frappe.db.delete(
+                "Assistant Audit Log",
+                {"session_id": ("like", f"{self.session_id}%")},
+            )
+            for name in self.created_todos:
+                if frappe.db.exists("ToDo", name):
+                    frappe.delete_doc("ToDo", name, force=True)
+            for email in self.created_users:
+                if frappe.db.exists("User", email):
+                    frappe.delete_doc("User", email, force=True)
+            for role in self.created_roles:
+                if frappe.db.exists("Role", role):
+                    frappe.delete_doc("Role", role, force=True)
+            _restore_security_rows(self.fac_security_snapshot)
+            self.assertEqual(_snapshot_security_rows(), self.fac_security_snapshot)
+            frappe.db.commit()
+            ToolRegistry().clear_cache()
 
     # --- helpers ------------------------------------------------------------
 
@@ -269,9 +312,10 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         slug = label.lower().replace(" ", "-")
         return f"fac-t8-{self.run_id}-{slug}@example.com"
 
-    def _ensure_actor(self, email: str, role: str) -> None:
+    def _ensure_actor(self, email: str, role: str | Iterable[str]) -> None:
         if frappe.db.exists("User", email):
             return
+        roles = (role,) if isinstance(role, str) else tuple(role)
         user = frappe.get_doc(
             {
                 "doctype": "User",
@@ -280,7 +324,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                 "enabled": 1,
                 "user_type": "System User",
                 "assistant_enabled": 1,
-                "roles": [{"role": role}],
+                "roles": [{"role": role_name} for role_name in roles],
             }
         )
         user.insert(ignore_permissions=True)
@@ -342,7 +386,11 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         ToolRegistry().clear_cache()
 
     def _reset_probe_configuration(self) -> None:
+        frappe.set_user("Administrator")
         if self.probe_baseline is not None:
+            if not frappe.db.exists("FAC Tool Configuration", self.configurable_probe):
+                payload = self.deleted_tool_configs[self.configurable_probe]
+                frappe.get_doc(payload).insert(ignore_permissions=True)
             self._apply_tool_config(self.configurable_probe, self.probe_baseline)
         frappe.db.set_value(
             "FAC Plugin Configuration",
@@ -375,8 +423,15 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         frappe.local.assistant_session_id = self.session_id
         frappe.local.assistant_client_id = f"matrix-client-{self.run_id}"
 
-    def _create_todo(self, description: str = "FAC Task8 matrix") -> str:
-        doc = frappe.get_doc({"doctype": "ToDo", "description": description})
+    def _create_todo(
+        self,
+        description: str = "FAC Task8 matrix",
+        allocated_to: str | None = None,
+    ) -> str:
+        payload = {"doctype": "ToDo", "description": description}
+        if allocated_to:
+            payload["allocated_to"] = allocated_to
+        doc = frappe.get_doc(payload)
         doc.insert(ignore_permissions=True)
         self.created_todos.append(doc.name)
         return doc.name
@@ -441,9 +496,12 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         server = MCPServer(f"fac-matrix-call-{self.run_id}")
         return server._handle_tools_call({"name": tool_name, "arguments": arguments}, tools)
 
-    def _todo_read_arguments(self) -> dict:
+    def _todo_read_arguments(self, actor: str | None = None) -> dict:
+        if actor:
+            self._bind_session(actor)
         todo_name = self._create_todo(
-            description=json.dumps({"authorization": f"Bearer {self.secret_marker}"})
+            description=json.dumps({"authorization": f"Bearer {self.secret_marker}"}),
+            allocated_to=actor,
         )
         return {"doctype": "ToDo", "name": todo_name}
 
@@ -471,20 +529,33 @@ class SecurityMatrixAcceptance(FrappeTestCase):
             matrix._configure_tool(
                 matrix.configurable_probe,
                 enabled=True,
-                mode="Allow All",
+                mode="Deny All",
+            )
+            frappe.db.set_value(
+                "FAC Tool Configuration",
+                matrix.configurable_probe,
+                "role_access_mode",
+                "Allow All",
+                update_modified=False,
             )
 
         def empty_restricted(matrix: SecurityMatrixAcceptance) -> None:
             matrix._configure_tool(
                 matrix.configurable_probe,
-                mode="Restrict to Listed Roles",
-                roles=(),
+                mode="Deny All",
+            )
+            frappe.db.set_value(
+                "FAC Tool Configuration",
+                matrix.configurable_probe,
+                "role_access_mode",
+                "Restrict to Listed Roles",
+                update_modified=False,
             )
 
         def role_mismatch(matrix: SecurityMatrixAcceptance) -> None:
             matrix._configure_tool(
                 matrix.configurable_probe,
-                roles=("Assistant Admin",),
+                roles=(matrix.mismatch_role,),
             )
 
         def unknown_mode(matrix: SecurityMatrixAcceptance) -> None:
@@ -582,7 +653,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                     ):
                         self._reset_probe_configuration()
                         scenario.setup(self)
-                        args = self._todo_read_arguments()
+                        args = self._todo_read_arguments(actor)
 
                         if phase == "publish":
                             published = self._published_names(actor)
@@ -632,7 +703,11 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         actor = self.actors["Assistant User"]
         self._configure_tool(self.configurable_probe, roles=("Assistant User",))
         before = self._audit_count(actor, self.configurable_probe)
-        result = self._registry_execute(actor, self.configurable_probe, self._todo_read_arguments())
+        result = self._registry_execute(
+            actor,
+            self.configurable_probe,
+            self._todo_read_arguments(actor),
+        )
         self.assertIsInstance(result, dict)
         self._assert_exactly_one_audit(actor, self.configurable_probe, before)
 
@@ -679,7 +754,11 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         config.save(ignore_permissions=True)
         before_save = self._audit_count(actor, self.configurable_probe)
         with self.assertRaises(PolicyDenied) as denied_save:
-            self._registry_execute(actor, self.configurable_probe, self._todo_read_arguments())
+            self._registry_execute(
+                actor,
+                self.configurable_probe,
+                self._todo_read_arguments(actor),
+            )
         self.assertEqual(denied_save.exception.reason_code, "TOOL_DISABLED")
         self._assert_exactly_one_audit(actor, self.configurable_probe, before_save)
 
@@ -693,7 +772,11 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         )
         before_db = self._audit_count(actor, self.configurable_probe)
         with self.assertRaises(PolicyDenied) as denied_db:
-            self._registry_execute(actor, self.configurable_probe, self._todo_read_arguments())
+            self._registry_execute(
+                actor,
+                self.configurable_probe,
+                self._todo_read_arguments(actor),
+            )
         self.assertEqual(denied_db.exception.reason_code, "TOOL_DISABLED")
         self._assert_exactly_one_audit(actor, self.configurable_probe, before_db)
 
@@ -730,7 +813,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                     "doctype": "ToDo",
                     "limit": 5,
                     "fields": ["name", "description"],
-                    "filters": [["name", "=", todo_name]],
+                    "filters": {"name": todo_name},
                 },
             },
             "search_documents": {
@@ -802,6 +885,13 @@ class SecurityMatrixAcceptance(FrappeTestCase):
             with self.subTest(case=label):
                 frappe.local.assistant_session_id = self.session_id
                 before = self._security_audit_count("Guest", "permission_denied")
+                original_get_doc = fac_endpoint.frappe.get_doc
+
+                def fail_oauth_lookup(*args, **kwargs):
+                    if args and args[0] == "OAuth Bearer Token":
+                        raise RuntimeError(self.secret_marker)
+                    return original_get_doc(*args, **kwargs)
+
                 with ExitStack() as stack:
                     stack.enter_context(patch.object(fac_endpoint.frappe, "request", request))
                     if label == "invalid_bearer":
@@ -809,7 +899,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                             patch.object(
                                 fac_endpoint.frappe,
                                 "get_doc",
-                                side_effect=RuntimeError(self.secret_marker),
+                                side_effect=fail_oauth_lookup,
                             )
                         )
                     response = fac_endpoint.mcp._entry_fn()
@@ -856,12 +946,17 @@ class SecurityMatrixAcceptance(FrappeTestCase):
 
     def test_parallel_users_isolated_tools_list_and_call(self):
         user_email = self._unique_email("parallel-user")
-        admin_email = self._unique_email("parallel-admin")
-        self._ensure_actor(user_email, "Assistant User")
-        self._ensure_actor(admin_email, "Assistant Admin")
+        manager_email = self._unique_email("parallel-manager")
+        self._ensure_actor(user_email, ("System Manager", "Assistant User"))
+        self._ensure_actor(manager_email, ("System Manager", "Assistant Admin"))
+        frappe.set_user(user_email)
         todo_name = self._create_todo(description=f"parallel-{self.run_id}")
+        frappe.set_user("Administrator")
         self._configure_tool("get_document", roles=("Assistant User",))
         self._configure_tool("list_documents", roles=("Assistant Admin",))
+        site = frappe.local.site
+        sites_path = frappe.local.sites_path
+        frappe.db.commit()
 
         barrier = threading.Barrier(2)
         results: dict[str, Any] = {}
@@ -869,6 +964,8 @@ class SecurityMatrixAcceptance(FrappeTestCase):
 
         def worker(key: str, email: str, tool_name: str, call_args: dict) -> None:
             try:
+                frappe.init(site=site, sites_path=sites_path, force=True)
+                frappe.connect()
                 barrier.wait(timeout=10)
                 frappe.set_user(email)
                 frappe.local.assistant_session_id = f"{self.session_id}-{key}"
@@ -935,6 +1032,8 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                 }
             except Exception as exc:  # pragma: no cover - surfaced below
                 errors.append(f"{key}: {type(exc).__name__}: {exc}")
+            finally:
+                frappe.destroy()
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(
@@ -948,14 +1047,14 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                             {"doctype": "ToDo", "name": todo_name},
                         ),
                         (
-                            "admin",
-                            admin_email,
+                            "manager",
+                            manager_email,
                             "list_documents",
                             {
                                 "doctype": "ToDo",
                                 "limit": 1,
                                 "fields": ["name"],
-                                "filters": [["name", "=", todo_name]],
+                                "filters": {"name": todo_name},
                             },
                         ),
                     ),
@@ -963,16 +1062,18 @@ class SecurityMatrixAcceptance(FrappeTestCase):
             )
 
         self.assertEqual(errors, [], f"worker failures: {errors}")
-        self.assertEqual(results["user"]["published"], {"get_document"})
-        self.assertEqual(results["admin"]["published"], {"list_documents"})
+        self.assertIn("get_document", results["user"]["published"])
+        self.assertNotIn("list_documents", results["user"]["published"])
+        self.assertIn("list_documents", results["manager"]["published"])
+        self.assertNotIn("get_document", results["manager"]["published"])
         self.assertFalse(results["user"]["list_error"])
-        self.assertFalse(results["admin"]["list_error"])
+        self.assertFalse(results["manager"]["list_error"])
         self.assertFalse(results["user"]["call_error"])
-        self.assertFalse(results["admin"]["call_error"])
+        self.assertFalse(results["manager"]["call_error"])
         self.assertEqual(results["user"]["list_audit_delta"], 1)
-        self.assertEqual(results["admin"]["list_audit_delta"], 1)
+        self.assertEqual(results["manager"]["list_audit_delta"], 1)
         self.assertEqual(results["user"]["call_audit_delta"], 1)
-        self.assertEqual(results["admin"]["call_audit_delta"], 1)
+        self.assertEqual(results["manager"]["call_audit_delta"], 1)
 
     # --- failure channels ---------------------------------------------------
 
@@ -984,16 +1085,18 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         error_before = frappe.db.count("Error Log")
         audit_before = self._audit_count(actor, hidden_tool)
 
-        with ExitStack() as stack:
-            logger = stack.enter_context(
-                self.assertLogs("frappe_assistant_core", level=logging.WARNING)
-            )
+        logger = logging.getLogger("frappe_assistant_core")
+        handler = _RecordHandler()
+        logger.addHandler(handler)
+        try:
             self._bind_session(actor)
             server = MCPServer(f"fac-matrix-secret-{self.run_id}")
             result = server._handle_tools_call(
                 {"name": hidden_tool, "arguments": secret_args},
                 {},
             )
+        finally:
+            logger.removeHandler(handler)
 
         self.assertTrue(result.get("isError"))
         body = result["content"][0]["text"]
@@ -1026,25 +1129,33 @@ class SecurityMatrixAcceptance(FrappeTestCase):
             )[0]
             self.assertNotIn(self.secret_marker, latest.get("error") or "")
 
-        joined_logs = "\n".join(logger.output)
+        joined_logs = "\n".join(handler.messages)
         self.assertNotIn(self.secret_marker, joined_logs)
 
     def test_mcp_execution_failure_never_echoes_secret_or_traceback(self):
         actor = self.actors["Assistant User"]
         self._configure_tool("get_document", roles=("Assistant User",))
 
-        def fail(**arguments):
-            raise RuntimeError(arguments.get("secret"))
-
-        tool = DocumentGet()
-        tools = {"get_document": build_tool_dict(tool, fail)}
+        registry = ToolRegistry()
+        tool = registry.get_tool("get_document")
+        self.assertIsNotNone(tool)
+        tools = {"get_document": build_tool_dict(tool, registry.execute_tool)}
         server = MCPServer(f"fac-matrix-fail-{self.run_id}")
         self._bind_session(actor)
+        arguments = self._todo_read_arguments(actor)
         before = self._audit_count(actor, "get_document")
-        result = server._handle_tools_call(
-            {"name": "get_document", "arguments": {"secret": self.secret_marker}},
-            tools,
-        )
+        with patch.object(
+            tool,
+            "execute",
+            side_effect=RuntimeError(self.secret_marker),
+        ):
+            result = server._handle_tools_call(
+                {
+                    "name": "get_document",
+                    "arguments": arguments,
+                },
+                tools,
+            )
         body = result["content"][0]["text"]
         self.assertTrue(result.get("isError"))
         self.assertEqual(body, "Tool execution failed")
