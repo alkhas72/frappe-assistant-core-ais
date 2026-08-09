@@ -63,8 +63,8 @@ class FACToolConfiguration(Document):
                     _("Please add at least one role when using 'Restrict to Listed Roles' mode")
                 )
             for row in valid_rows:
-                if not frappe.db.exists("Role", row.role):
-                    frappe.throw(_("Role '{0}' does not exist").format(row.role))
+                if not frappe.db.exists("Role", {"name": row.role, "disabled": 0}):
+                    frappe.throw(_("Role '{0}' does not exist or is disabled").format(row.role))
 
     def on_update(self):
         """Clear caches when tool configuration changes."""
@@ -109,9 +109,16 @@ class FACToolConfiguration(Document):
 
         # Check if any of user's roles are in the allowed list
         user_roles = set(frappe.get_roles(user))
-        for role_access in self.role_access:
-            if role_access.role in user_roles and role_access.allow_access:
-                return True
+        try:
+            for role_access in self.role_access:
+                if (
+                    role_access.role in user_roles
+                    and role_access.allow_access
+                    and frappe.db.exists("Role", {"name": role_access.role, "disabled": 0})
+                ):
+                    return True
+        except Exception:
+            return False
 
         return False
 

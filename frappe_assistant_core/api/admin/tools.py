@@ -470,9 +470,14 @@ def update_tool_role_access(tool_name: str, role_access_mode: str, roles: list |
                 if isinstance(role_entry, dict)
                 else 1
             )
-            if not role or not frappe.db.exists("Role", role):
+            if not role or not frappe.db.exists("Role", {"name": role, "disabled": 0}):
                 return {"success": False, "message": _(f"Invalid role: '{role}'")}
             normalized_roles.append({"role": role, "allow_access": allow_access})
+        if not any(role_entry["allow_access"] for role_entry in normalized_roles):
+            return {
+                "success": False,
+                "message": _("'Restrict to Listed Roles' requires at least one allowed active role"),
+            }
 
     try:
         # Validate tool exists

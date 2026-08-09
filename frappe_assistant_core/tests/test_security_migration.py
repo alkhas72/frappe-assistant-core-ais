@@ -728,6 +728,27 @@ class TestAdminEndpointHardening(FACSecuritySnapshotTestCase):
         self.assertFalse(unknown.get("success"))
         self.assertIn("Invalid role", unknown.get("message", ""))
 
+    def test_update_tool_role_access_rejects_disabled_role(self):
+        from frappe_assistant_core.api.admin.tools import update_tool_role_access
+
+        role_name = "__test_disabled_admin_role"
+        frappe.db.delete("Role", role_name)
+        frappe.get_doc(
+            {"doctype": "Role", "role_name": role_name, "disabled": 1}
+        ).insert(ignore_permissions=True)
+        self.addCleanup(frappe.db.delete, "Role", role_name)
+
+        pm, reg, cat = self._mock_tool_inventory("__test_role_tool")
+        with pm, reg, cat, _no_commit():
+            result = update_tool_role_access(
+                "__test_role_tool",
+                "Restrict to Listed Roles",
+                roles=[{"role": role_name, "allow_access": 1}],
+            )
+
+        self.assertFalse(result.get("success"))
+        self.assertIn("Invalid role", result.get("message", ""))
+
     def test_deny_all_clears_stale_role_rows_and_keeps_enabled_state(self):
         from frappe_assistant_core.api.admin.tools import update_tool_role_access
 
@@ -811,7 +832,19 @@ class TestAdminUIContract(FrappeTestCase):
         self.assertIn("Invalid mode", result.get("message", ""))
 
 
-class TestToolConfigurationAccess(FrappeTestCase):
+class TestToolConfigurationAccess(FACSecuritySnapshotTestCase):
+    RUNTIME_ROLE = "__test_runtime_disabled_role"
+    RUNTIME_USER = "Administrator"
+
+    def tearDown(self):
+        try:
+            _delete_config("__test_access_tool")
+            frappe.db.delete("Has Role", {"parent": self.RUNTIME_USER, "role": self.RUNTIME_ROLE})
+            frappe.db.delete("Role", self.RUNTIME_ROLE)
+            frappe.clear_cache(user=self.RUNTIME_USER)
+        finally:
+            super().tearDown()
+
     def _doc(self, enabled, mode, roles=()):
         doc = frappe.new_doc(TOOL_CONFIG_DOCTYPE)
         doc.tool_name = "__test_access_tool"
@@ -856,3 +889,36 @@ class TestToolConfigurationAccess(FrappeTestCase):
         doc = self._doc(1, "Restrict to Listed Roles", ["No Such Role TEST"])
         with self.assertRaises(frappe.ValidationError):
             doc.insert(ignore_permissions=True)
+
+        disabled_role = "__test_disabled_controller_role"
+        frappe.get_doc(
+            {"doctype": "Role", "role_name": disabled_role, "disabled": 1}
+        ).insert(ignore_permissions=True)
+        self.addCleanup(frappe.db.delete, "Role", disabled_role)
+        doc = self._doc(1, "Restrict to Listed Roles", [disabled_role])
+        with self.assertRaises(frappe.ValidationError):
+            doc.insert(ignore_permissions=True)
+
+    def test_disabled_role_cannot_grant_access_after_configuration_is_saved(self):
+        frappe.get_doc(
+            {"doctype": "Role", "role_name": self.RUNTIME_ROLE, "disabled": 0}
+        ).insert(ignore_permissions=True)
+        frappe.get_doc(
+            {
+                "doctype": "Has Role",
+                "parent": self.RUNTIME_USER,
+                "parenttype": "User",
+                "parentfield": "roles",
+                "role": self.RUNTIME_ROLE,
+            }
+        ).insert(ignore_permissions=True)
+        frappe.clear_cache(user=self.RUNTIME_USER)
+
+        config = self._doc(1, "Restrict to Listed Roles", [self.RUNTIME_ROLE])
+        config.insert(ignore_permissions=True)
+        self.assertTrue(config.user_has_access(self.RUNTIME_USER))
+
+        frappe.db.set_value("Role", self.RUNTIME_ROLE, "disabled", 1)
+        frappe.clear_cache(user=self.RUNTIME_USER)
+        self.assertIn(self.RUNTIME_ROLE, frappe.get_roles(self.RUNTIME_USER))
+        self.assertFalse(config.user_has_access(self.RUNTIME_USER))
