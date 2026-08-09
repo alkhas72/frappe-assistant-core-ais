@@ -80,10 +80,11 @@ class GenerateReport(BaseTool):
                 format=arguments.get("format", "json"),
             )
 
-        except Exception as e:
-            frappe.log_error(title=_("Generate Report Error"), message=f"Error generating report: {str(e)}")
-
-            return {"success": False, "error": str(e)}
+        except Exception as exc:
+            frappe.logger("fac.generate_report").warning(
+                f"generate_report failed: {type(exc).__name__}"
+            )
+            return {"success": False, "error": "Report execution failed"}
 
 
 # Make sure class name matches file name for discovery

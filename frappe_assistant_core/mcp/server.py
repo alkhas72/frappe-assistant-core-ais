@@ -24,17 +24,85 @@ with Frappe-specific optimizations.
 Key improvements over frappe-mcp:
 - Proper JSON serialization with `default=str` (handles datetime, Decimal, etc.)
 - No Pydantic dependency (simpler, faster)
-- Full error tracebacks for debugging
+- Stable public errors with internal type-only diagnostics
 - Optional Bearer token authentication
 - Frappe-native integration
 """
 
 import json
-import traceback
 from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from werkzeug.wrappers import Request, Response
+
+
+def audit_tools_list_summary(published_count: int, status: str = "Success") -> None:
+    """Write one argument-free tools/list summary without exposing inventory."""
+    import frappe
+
+    try:
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+        from frappe_assistant_core.utils.audit_trail import log_tool_execution
+
+        inventory_count = len(SecurityPolicy.inventory())
+        log_tool_execution(
+            tool_name="tools/list",
+            user=frappe.session.user,
+            arguments=None,
+            status=status,
+            execution_time=0.0,
+            source_app="frappe_assistant_core",
+            output_data={
+                "published_count": published_count,
+                "hidden_count": max(inventory_count - published_count, 0),
+            },
+            operation="publish",
+        )
+    except Exception as e:
+        frappe.logger().warning(
+            f"MCP tools/list audit failed: type={type(e).__name__}"
+        )
+
+
+def audit_unavailable_tool_call(
+    tool_name: Any,
+    arguments: Any,
+    reason_code: Optional[str] = None,
+) -> None:
+    """Write the single boundary-owned audit for an unavailable call."""
+    import frappe
+
+    from frappe_assistant_core.core.security_policy import SecurityPolicy
+    from frappe_assistant_core.utils.audit_trail import log_denied_tool_attempt
+
+    actor = getattr(frappe.session, "user", None) or "Guest"
+    if isinstance(tool_name, str) and tool_name.strip():
+        audit_tool_name = tool_name[:140]
+    else:
+        audit_tool_name = "<invalid-tool-name>"
+
+    context = None
+    if reason_code is None:
+        decision = SecurityPolicy.authorize(
+            actor=actor,
+            tool_name=tool_name,
+            arguments=arguments if isinstance(arguments, dict) else None,
+            phase="execute",
+        )
+        reason_code = (
+            decision.reason_code if not decision.allowed else "TOOL_UNPUBLISHED"
+        )
+        context = decision.context
+
+    log_denied_tool_attempt(
+        tool_name=audit_tool_name,
+        user=actor,
+        reason_code=reason_code,
+        arguments=arguments if isinstance(arguments, dict) else None,
+        target_doctype=context.target_doctype if context else None,
+        target_name=context.target_name if context else None,
+        operation=context.operation if context else "authorize",
+    )
 
 
 class MCPServer:
@@ -49,13 +117,15 @@ class MCPServer:
         from frappe_assistant_core.mcp.server import MCPServer
         from frappe_assistant_core.mcp.tool_adapter import register_base_tool
         from frappe_assistant_core.plugins.core.tools.list_documents import DocumentList
+        from frappe_assistant_core.core.tool_registry import get_tool_registry
 
         mcp = MCPServer("my-server")
+        registry = get_tool_registry()
 
         @mcp.register()
         def handle_mcp():
             # Import and register BaseTool instances
-            register_base_tool(mcp, DocumentList())
+            register_base_tool(mcp, DocumentList(), registry.execute_tool)
         ```
 
     Note:
@@ -174,13 +244,17 @@ class MCPServer:
         # Parse JSON request
         try:
             data = request.get_json(force=True)
-            # Log incoming request for debugging
-            frappe.logger().debug(f"MCP Request: method={data.get('method')}, id={data.get('id')}")
+            if not isinstance(data, dict):
+                return self._error_response(
+                    response,
+                    None,
+                    -32600,
+                    "Invalid Request",
+                )
+            frappe.logger().debug("MCP request received")
         except Exception as e:
-            frappe.logger().error(
-                f"MCP Parse Error: {str(e)}, Raw data: {request.get_data(as_text=True)[:500]}"
-            )
-            return self._error_response(response, None, -32700, f"Parse error: {str(e)}")
+            frappe.logger().error(f"MCP Parse Error: type={type(e).__name__}")
+            return self._error_response(response, None, -32700, "Parse error")
 
         # Populate correlation ids on frappe.local so downstream audit logging
         # can tag every tool execution with the MCP session and client. See
@@ -213,9 +287,7 @@ class MCPServer:
             elif method == "tools/list":
                 result = self._handle_tools_list(params, tool_registry)
             elif method == "tools/call":
-                frappe.logger().info(
-                    f"MCP tools/call: tool={params.get('name')}, args={json.dumps(params.get('arguments', {}), default=str)[:200]}"
-                )
+                frappe.logger().info("MCP tools/call received")
                 result = self._handle_tools_call(params, tool_registry)
             elif method == "resources/list":
                 result = self._handle_resources_list(params, request_id)
@@ -230,14 +302,13 @@ class MCPServer:
             elif method == "ping":
                 result = {}
             else:
-                frappe.logger().warning(f"MCP Unknown method: {method}")
-                return self._error_response(response, request_id, -32601, f"Method not found: {method}")
+                frappe.logger().warning("MCP unknown method")
+                return self._error_response(response, request_id, -32601, "Method not found")
         except Exception as e:
-            # Log unexpected errors
             frappe.logger().error(
-                f"MCP Handler Error for method '{method}': {str(e)}\n{traceback.format_exc()}"
+                f"MCP Handler Error: type={type(e).__name__}"
             )
-            return self._error_response(response, request_id, -32603, f"Internal error: {str(e)}")
+            return self._error_response(response, request_id, -32603, "Internal error")
 
         # Success response
         return self._success_response(response, request_id, result)
@@ -279,8 +350,12 @@ class MCPServer:
 
         client_id = request.headers.get("X-Assistant-Client-Id")
         if not client_id:
-            params = data.get("params") or {}
+            params = data.get("params")
+            if not isinstance(params, dict):
+                params = {}
             client_info = params.get("clientInfo") or {}
+            if not isinstance(client_info, dict):
+                client_info = {}
             client_id = client_info.get("name")
 
         frappe.local.assistant_session_id = session_id
@@ -333,25 +408,31 @@ class MCPServer:
         except Exception:
             pass
 
-        for tool in tool_registry.values():
-            description = tool["description"]
+        try:
+            for tool in tool_registry.values():
+                description = tool["description"]
 
-            # In replace mode, minimize descriptions for tools with linked skills
-            if skill_replace_map and tool["name"] in skill_replace_map:
-                skill_info = skill_replace_map[tool["name"]]
-                description = f"{tool['name']}: {skill_info['description']}. Detailed guidance: fac://skills/{skill_info['skill_id']}"
+                # In replace mode, minimize descriptions for tools with linked skills
+                if skill_replace_map and tool["name"] in skill_replace_map:
+                    skill_info = skill_replace_map[tool["name"]]
+                    description = f"{tool['name']}: {skill_info['description']}. Detailed guidance: fac://skills/{skill_info['skill_id']}"
 
-            tool_spec = {
-                "name": tool["name"],
-                "description": description,
-                "inputSchema": tool["inputSchema"],
-            }
+                tool_spec = {
+                    "name": tool["name"],
+                    "description": description,
+                    "inputSchema": tool["inputSchema"],
+                }
 
-            # Add annotations if present
-            if tool.get("annotations"):
-                tool_spec["annotations"] = tool["annotations"]
+                # Add annotations if present
+                if tool.get("annotations"):
+                    tool_spec["annotations"] = tool["annotations"]
 
-            tools_list.append(tool_spec)
+                tools_list.append(tool_spec)
+        except Exception:
+            audit_tools_list_summary(len(tools_list), status="Error")
+            raise
+
+        audit_tools_list_summary(len(tools_list))
 
         return {"tools": tools_list}
 
@@ -367,17 +448,31 @@ class MCPServer:
         if tool_registry is None:
             tool_registry = self._tool_registry
 
+        if not isinstance(params, dict):
+            audit_unavailable_tool_call(None, None, "ARGUMENTS_INVALID")
+            return {
+                "content": [{"type": "text", "text": "Invalid tool arguments"}],
+                "isError": True,
+            }
+
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
 
-        frappe.logger().debug(f"MCP _handle_tools_call: tool={tool_name}, args={arguments}")
-
-        # Check tool exists
-        if tool_name not in tool_registry:
-            error_msg = f"Tool '{tool_name}' not found. Available tools: {list(tool_registry.keys())}"
-            frappe.logger().error(f"MCP Tool Not Found: {error_msg}")
+        if not isinstance(arguments, dict):
+            audit_unavailable_tool_call(
+                tool_name,
+                None,
+                "ARGUMENTS_INVALID",
+            )
             return {
-                "content": [{"type": "text", "text": error_msg}],
+                "content": [{"type": "text", "text": "Invalid tool arguments"}],
+                "isError": True,
+            }
+
+        if not isinstance(tool_name, str) or tool_name not in tool_registry:
+            audit_unavailable_tool_call(tool_name, arguments)
+            return {
+                "content": [{"type": "text", "text": "Tool is not available"}],
                 "isError": True,
             }
 
@@ -433,12 +528,28 @@ class MCPServer:
 
             return {"content": content, "isError": False}
 
+        except PermissionError:
+            frappe.logger().warning("MCP tool execution denied")
+            return {
+                "content": [{"type": "text", "text": "Tool is not available"}],
+                "isError": True,
+            }
         except Exception as e:
-            # Full traceback for debugging
-            error_text = f"Error executing {tool_name}: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
-            frappe.logger().error(f"MCP Tool Execution Error: {error_text}")
+            frappe.logger().error(
+                f"MCP Tool Execution Error: type={type(e).__name__}"
+            )
+            return {
+                "content": [{"type": "text", "text": "Tool execution failed"}],
+                "isError": True,
+            }
 
-            return {"content": [{"type": "text", "text": error_text}], "isError": True}
+    @staticmethod
+    def _audit_unavailable_call(
+        tool_name: Any,
+        arguments: Any,
+        reason_code: Optional[str] = None,
+    ) -> None:
+        audit_unavailable_tool_call(tool_name, arguments, reason_code)
 
     def _success_response(self, response: Response, request_id: Any, result: Dict) -> Response:
         """Create JSON-RPC success response."""

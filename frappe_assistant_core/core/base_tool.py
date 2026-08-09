@@ -65,6 +65,12 @@ def _is_sensitive_key(key: Any) -> bool:
     return bool(_SENSITIVE_TOKEN_RE.search(lower))
 
 
+def _safe_traceback(exc: BaseException) -> str:
+    """Return frame locations and exception type without the raw message."""
+    frames = "".join(traceback.format_list(traceback.extract_tb(exc.__traceback__)))
+    return f"Traceback (most recent call last):\n{frames}{type(exc).__name__}\n"
+
+
 class BaseTool(ABC):
     """
     Base class for all Frappe Assistant Core tools.
@@ -180,13 +186,37 @@ class BaseTool(ABC):
         Returns:
             Execution result with success/error status
         """
-        start_time = time.time()
+        from frappe_assistant_core.core.security_policy import PolicyDenied, SecurityPolicy
 
+        start_time = time.time()
+        decision = None
         try:
+            decision = SecurityPolicy.authorize(
+                actor=frappe.session.user,
+                tool_name=self.name,
+                arguments=arguments,
+                phase="execute",
+            )
+            decision.require()
+
             # Check dependencies
             deps_valid, deps_error = self.validate_dependencies()
             if not deps_valid:
-                return {"success": False, "error": deps_error, "error_type": "DependencyError"}
+                execution_time = time.time() - start_time
+                response = {
+                    "success": False,
+                    "error": deps_error,
+                    "error_type": "DependencyError",
+                    "execution_time": execution_time,
+                }
+                self.log_execution(
+                    arguments,
+                    response,
+                    execution_time,
+                    status="Error",
+                    decision=decision,
+                )
+                return response
 
             # Check permissions
             self.check_permission()
@@ -196,6 +226,7 @@ class BaseTool(ABC):
 
             # Execute tool
             result = self.execute(arguments)
+            result = SecurityPolicy.redact_output(decision.context, result)
 
             # Calculate execution time
             execution_time = time.time() - start_time
@@ -214,44 +245,75 @@ class BaseTool(ABC):
                     "error_type": "ToolReportedError",
                     "execution_time": execution_time,
                 }
-                self.log_execution(arguments, response, execution_time, status="Error")
+                self.log_execution(
+                    arguments, response, execution_time, status="Error", decision=decision
+                )
                 self.logger.info(
-                    f"{self.name} reported failure in {execution_time:.3f}s: {response['error']}"
+                    f"{self.name} reported failure in {execution_time:.3f}s"
                 )
             else:
                 response = {"success": True, "result": result, "execution_time": execution_time}
-                self.log_execution(arguments, response, execution_time, status="Success")
+                self.log_execution(
+                    arguments, response, execution_time, status="Success", decision=decision
+                )
                 self.logger.info(f"Successfully executed {self.name} in {execution_time:.3f}s")
 
             return response
 
-        except frappe.PermissionError as e:
+        except PolicyDenied as e:
+            execution_time = time.time() - start_time
+            decision = e.decision
+            response = {
+                "success": False,
+                "error": "Tool execution denied",
+                "error_type": "PolicyDenied",
+                "reason_code": e.reason_code,
+                "execution_time": execution_time,
+            }
+            self.log_execution(
+                arguments,
+                response,
+                execution_time,
+                status="Permission Denied",
+                decision=decision,
+            )
+            return response
+
+        except frappe.PermissionError:
             execution_time = time.time() - start_time
             response = {
                 "success": False,
-                "error": str(e),
+                "error": "Permission denied",
                 "error_type": "PermissionError",
                 "execution_time": execution_time,
             }
 
-            self.log_execution(arguments, response, execution_time, status="Permission Denied")
+            self.log_execution(
+                arguments,
+                response,
+                execution_time,
+                status="Permission Denied",
+                decision=decision,
+            )
 
-            frappe.log_error(title=_("Permission Error"), message=f"{self.name}: {str(e)}")
+            frappe.log_error(title=_("Permission Error"), message=f"Tool: {self.name}")
 
             return response
 
-        except frappe.ValidationError as e:
+        except frappe.ValidationError:
             execution_time = time.time() - start_time
             response = {
                 "success": False,
-                "error": str(e),
+                "error": "Invalid tool arguments",
                 "error_type": "ValidationError",
                 "execution_time": execution_time,
             }
 
-            self.log_execution(arguments, response, execution_time, status="Error")
+            self.log_execution(
+                arguments, response, execution_time, status="Error", decision=decision
+            )
 
-            frappe.log_error(title=_("Validation Error"), message=f"{self.name}: {str(e)}")
+            frappe.log_error(title=_("Validation Error"), message=f"Tool: {self.name}")
 
             return response
 
@@ -259,7 +321,7 @@ class BaseTool(ABC):
             execution_time = time.time() - start_time
             response = {
                 "success": False,
-                "error": str(e),
+                "error": "Tool timed out",
                 "error_type": "Timeout",
                 "execution_time": execution_time,
             }
@@ -269,19 +331,20 @@ class BaseTool(ABC):
                 response,
                 execution_time,
                 status="Timeout",
-                traceback_str=traceback.format_exc(),
+                traceback_str=_safe_traceback(e),
+                decision=decision,
             )
 
-            frappe.log_error(title=_("Tool Timeout"), message=f"{self.name}: {str(e)}")
+            frappe.log_error(title=_("Tool Timeout"), message=f"Tool: {self.name}")
 
             return response
 
         except Exception as e:
             execution_time = time.time() - start_time
-            tb = traceback.format_exc()
+            tb = _safe_traceback(e)
             response = {
                 "success": False,
-                "error": str(e),
+                "error": "Tool execution failed",
                 "error_type": "ExecutionError",
                 "execution_time": execution_time,
             }
@@ -292,12 +355,15 @@ class BaseTool(ABC):
                 execution_time,
                 status="Error",
                 traceback_str=tb,
+                decision=decision,
             )
 
-            self.logger.error(f"Tool execution failed: {self.name} - {str(e)}", exc_info=True)
+            self.logger.error(
+                f"Tool execution failed: {self.name}; type={type(e).__name__}"
+            )
             frappe.log_error(
                 title=_("Tool Execution Error"),
-                message=f"Tool: {self.name}\nError: {str(e)}\nType: {type(e).__name__}\nArgs: {arguments}\n\nFull traceback:\n{tb}",
+                message=f"Tool: {self.name}\nType: {type(e).__name__}",
             )
 
             return response
@@ -401,6 +467,7 @@ class BaseTool(ABC):
         execution_time: float,
         status: str = "Success",
         traceback_str: Optional[str] = None,
+        decision=None,
     ):
         """
         Log tool execution for audit purposes.
@@ -423,11 +490,12 @@ class BaseTool(ABC):
                 actual_tool_output = result
 
             sanitized_output = self._sanitize_data(actual_tool_output)
+            context = decision.context if decision is not None else None
 
             log_tool_execution(
                 tool_name=self.name,
                 user=frappe.session.user,
-                arguments=self._sanitize_arguments(arguments),
+                arguments=arguments,
                 status=status,
                 execution_time=execution_time,
                 source_app=self.source_app,
@@ -435,10 +503,15 @@ class BaseTool(ABC):
                 error_type=result.get("error_type"),
                 traceback_str=traceback_str,
                 output_data=sanitized_output,
+                target_doctype=context.target_doctype if context else None,
+                target_name=context.target_name if context else None,
+                operation=context.operation if context else None,
             )
         except Exception as e:
             # Don't fail tool execution due to logging issues
-            self.logger.warning(f"Failed to log execution for {self.name}: {str(e)}")
+            self.logger.warning(
+                f"Failed to log execution for {self.name}; type={type(e).__name__}"
+            )
 
     def _sanitize_arguments(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Remove sensitive data from arguments for logging"""

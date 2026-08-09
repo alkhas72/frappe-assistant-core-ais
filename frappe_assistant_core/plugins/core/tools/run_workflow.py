@@ -27,6 +27,16 @@ from frappe import _
 from frappe_assistant_core.core.base_tool import BaseTool
 
 
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.run_workflow").warning(tag)
+        else:
+            frappe.logger("fac.run_workflow").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
+
 class RunWorkflow(BaseTool):
     """
     Comprehensive workflow tool that properly leverages Frappe's workflow system.
@@ -81,18 +91,51 @@ class RunWorkflow(BaseTool):
         }
 
     def execute(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute workflow action using Frappe's workflow system"""
+        """Execute workflow action using Frappe's workflow system.
+
+        FAC security hardening Task 7 (2026-08-09): the central policy in
+        ``BaseTool._safe_execute`` already authorized this call (restricted
+        DocType, role config, native permission). We defensively re-check the
+        target here so a direct call into ``RunWorkflow.execute`` from
+        non-MCP code cannot bypass that gate. Frappe's ``apply_workflow`` and
+        ``get_transitions`` remain the mandatory second locks for transitions.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             doctype = arguments.get("doctype")
             name = arguments.get("name")
             action = arguments.get("action")
             workflow_name = arguments.get("workflow")
 
-            # Validate document exists
-            if not frappe.db.exists(doctype, name):
-                return {"success": False, "error": f"Document {doctype} '{name}' not found"}
+            # Defensive restricted-target gate for direct calls. Central policy
+            # already enforces this for the MCP path; this covers any internal
+            # caller that invokes RunWorkflow.execute without going through
+            # ``_safe_execute``.
+            if SecurityPolicy._is_restricted_target(doctype):
+                return {
+                    "success": False,
+                    "error": "Workflow action not available",
+                }
 
-            # Get the document
+            # FAC v2.3: row-level permission BEFORE any ``db.exists`` or
+            # ``get_doc``. ``has_permission(..., doc=name)`` returns False
+            # both for hidden and for truly-missing records, which collapses
+            # those cases into a single stable refusal and prevents the
+            # workflow surface from being used to enumerate documents.
+            try:
+                row_visible = frappe.has_permission(doctype, "read", doc=name)
+            except Exception:
+                row_visible = False
+            if not row_visible:
+                return {
+                    "success": False,
+                    "error": "Workflow action not available",
+                }
+
+            # Get the document. Native Frappe ``get_doc`` is the second lock
+            # and re-checks row permission; we have already filtered hidden
+            # and missing records above.
             doc = frappe.get_doc(doctype, name)
             original_state = getattr(doc, "workflow_state", None)
 
@@ -170,7 +213,11 @@ class RunWorkflow(BaseTool):
                 ],
             }
 
-        except frappe.exceptions.WorkflowTransitionError as e:
+        except frappe.exceptions.WorkflowTransitionError:
+            # FAC v2.1: never echo raw exception text. The exception type is
+            # already exposed via ``error_type``; the public error is a stable
+            # category. The technical log records the exception type only.
+            _log_safe("workflow transition rejected")
             # Get helpful information for workflow errors
             try:
                 doc = frappe.get_doc(doctype, name)
@@ -178,31 +225,35 @@ class RunWorkflow(BaseTool):
 
                 return {
                     "success": False,
-                    "error": str(e),
+                    "error": "Workflow transition not allowed",
                     "error_type": "WorkflowTransitionError",
                     "current_state": getattr(doc, "workflow_state", None),
                     "available_actions": [t.get("action") for t in available_transitions],
                     "help": "Check available actions and try again with a valid action",
                 }
             except Exception:
-                return {"success": False, "error": str(e), "error_type": "WorkflowTransitionError"}
+                return {
+                    "success": False,
+                    "error": "Workflow transition not allowed",
+                    "error_type": "WorkflowTransitionError",
+                }
 
-        except frappe.exceptions.WorkflowPermissionError as e:
+        except frappe.exceptions.WorkflowPermissionError:
+            _log_safe("workflow permission denied")
             return {
                 "success": False,
-                "error": str(e),
+                "error": "Workflow permission denied",
                 "error_type": "WorkflowPermissionError",
                 "help": "You don't have permission to execute this workflow action",
             }
 
-        except Exception as e:
-            frappe.log_error(
-                title=_("Workflow Execution Error"), message=f"Error executing workflow action: {str(e)}"
-            )
+        except Exception:
+            # FAC v2.1: stable public category; safe technical log.
+            _log_safe("workflow execution failed")
 
             return {
                 "success": False,
-                "error": f"Workflow execution failed: {str(e)}",
+                "error": "Workflow execution failed",
                 "error_type": "ExecutionError",
             }
 
@@ -229,7 +280,8 @@ class RunWorkflow(BaseTool):
             return enhanced_transitions
 
         except Exception as e:
-            frappe.log_error(f"Error getting workflow transitions: {e}")
+            # FAC v2.2: safe logging — tag + type only.
+            _log_safe("get_available_transitions failed", e)
             return []
 
     def _get_workflow_info(self, doc, workflow_name):
@@ -258,7 +310,8 @@ class RunWorkflow(BaseTool):
             }
 
         except Exception as e:
-            frappe.log_error(f"Error getting workflow info: {e}")
+            # FAC v2.2: safe logging — tag + type only.
+            _log_safe("get_workflow_info failed", e)
             return {"workflow_name": workflow_name}
 
 

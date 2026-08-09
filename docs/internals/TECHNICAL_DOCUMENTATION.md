@@ -338,21 +338,21 @@ The tool adapter bridges our `BaseTool` classes with the MCP server:
 ```python
 # mcp/tool_adapter.py
 
-def register_base_tool(mcp_server, tool_instance):
+def register_base_tool(mcp_server, tool_instance, executor):
     """
     Register a BaseTool with the MCP server.
 
     This adapter:
     1. Extracts tool metadata (name, description, inputSchema)
-    2. Creates a wrapper that calls tool_instance._safe_execute()
+    2. Creates a wrapper that calls the canonical registry executor
     3. Registers with MCPServer using add_tool()
     4. All BaseTool features work automatically (validation, permissions, audit)
     """
 
     def tool_handler(arguments):
-        # Call the tool's safe execution wrapper
-        # This handles validation, permissions, audit logging, etc.
-        return tool_instance._safe_execute(arguments)
+        # The registry resolves the tool and BaseTool._safe_execute performs
+        # fresh policy, validation, permissions and audit logging.
+        return executor(tool_instance.name, arguments)
 
     # Register with MCP server
     mcp_server.add_tool(
@@ -368,18 +368,19 @@ def register_base_tool(mcp_server, tool_instance):
 ```python
 from frappe_assistant_core.mcp.server import MCPServer
 from frappe_assistant_core.mcp.tool_adapter import register_base_tool
-from frappe_assistant_core.core.tool_registry import ToolRegistry
+from frappe_assistant_core.core.tool_registry import get_tool_registry
 
 # Create MCP server
 mcp = MCPServer("frappe-assistant-core", "2.0.0")
 
 # Get all available tools from registry
-registry = ToolRegistry()
+registry = get_tool_registry()
 tools = registry.get_available_tools()
 
 # Register each tool with MCP server
-for tool in tools:
-    register_base_tool(mcp, tool)
+for metadata in tools:
+    tool = registry.get_tool(metadata["name"])
+    register_base_tool(mcp, tool, registry.execute_tool)
 ```
 
 ### OAuth 2.0 Integration Architecture

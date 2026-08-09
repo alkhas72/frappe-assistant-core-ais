@@ -27,6 +27,17 @@ from frappe.query_builder import DocType
 
 from frappe_assistant_core.core.base_tool import BaseTool
 
+
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.get_pending_approvals").warning(tag)
+        else:
+            frappe.logger("fac.get_pending_approvals").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
+
 MAX_TRANSITION_DOCS = 20
 
 
@@ -83,7 +94,27 @@ class GetPendingApprovals(BaseTool):
         include_actions = arguments.get("include_actions", True)
 
         user = frappe.session.user
-        roles = frappe.get_roles(user)
+        # FAC v2.2: intersect the user's roles ONLY with active roles. A
+        # disabled role (``Role.disabled == 1``) must not match Workflow
+        # Action Permitted Role rows and disclose actions the caller is no
+        # longer entitled to. ``frappe.get_roles`` returns names only; we
+        # filter at the DB layer to avoid loading every role document.
+        all_roles = frappe.get_roles(user)
+        try:
+            active_roles = (
+                frappe.db.get_list(
+                    "Role",
+                    filters={"name": ["in", list(all_roles)], "disabled": 0},
+                    pluck="name",
+                    ignore_permissions=False,
+                )
+                or []
+            )
+        except Exception:
+            # If we cannot prove which roles are active, fail closed: drop
+            # to the empty set so the role-subquery below cannot match.
+            active_roles = []
+        roles = list(active_roles)
 
         WA = DocType("Workflow Action")
         WAPR = DocType("Workflow Action Permitted Role")
@@ -122,12 +153,11 @@ class GetPendingApprovals(BaseTool):
 
         try:
             pending_actions = query.run(as_dict=True)
-        except Exception as e:
-            frappe.log_error(
-                title=_("Pending Approvals Query Error"),
-                message=str(e),
-            )
-            return {"success": False, "error": str(e)}
+        except Exception:
+            # FAC v2.1: stable public category; technical log records only
+            # the exception type and a safe context tag.
+            _log_safe("pending-approvals query failed")
+            return {"success": False, "error": "Pending approvals lookup failed"}
 
         if not pending_actions:
             return {
@@ -137,6 +167,35 @@ class GetPendingApprovals(BaseTool):
                 "pending_approvals": {},
                 "message": "No documents pending your approval",
             }
+
+        # FAC security hardening Task 7 (2026-08-09): the Workflow Action row
+        # existing does NOT prove the current user can read the underlying
+        # business document. Filter out (a) actions whose reference DocType is
+        # restricted and (b) actions whose reference document the user cannot
+        # read. Otherwise ``get_pending_approvals`` would disclose the
+        # existence, type and workflow state of records the user is not
+        # allowed to see, and ``get_transitions`` below would load them via
+        # ``frappe.get_doc`` (a row-level read).
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
+        visible_actions = []
+        for action in pending_actions:
+            ref_doctype = action.reference_doctype
+            ref_name = action.reference_name
+            if SecurityPolicy._is_restricted_target(ref_doctype):
+                continue
+            try:
+                if not frappe.has_permission(ref_doctype, "read", doc=ref_name):
+                    continue
+            except Exception:
+                # Permission check failed closed — drop the row rather than
+                # risk disclosure. Frappe's own row-level filter remains the
+                # authority; this guard covers cases where the role subquery
+                # matches but the row itself is user-private.
+                continue
+            visible_actions.append(action)
+
+        pending_actions = visible_actions
 
         # Batch-fetch permitted roles for all returned actions
         action_names = [a.name for a in pending_actions]

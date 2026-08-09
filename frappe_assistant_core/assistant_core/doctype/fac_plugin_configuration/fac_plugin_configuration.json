@@ -34,12 +34,12 @@
             "description": "Human-readable name shown in the UI"
         },
         {
-            "default": "1",
+            "default": "0",
             "fieldname": "enabled",
             "fieldtype": "Check",
             "in_list_view": 1,
             "label": "Enabled",
-            "description": "When disabled, all tools from this plugin will be hidden from MCP"
+            "description": "When disabled, all tools from this plugin will be hidden from MCP. New plugins are disabled by default."
         },
         {
             "fieldname": "column_break_basic",
@@ -74,7 +74,7 @@
     ],
     "index_web_pages_for_search": 0,
     "links": [],
-    "modified": "2025-01-14 12:00:00.000000",
+    "modified": "2026-08-09 00:00:00.000000",
     "modified_by": "Administrator",
     "module": "Assistant Core",
     "name": "FAC Plugin Configuration",

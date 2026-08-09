@@ -55,9 +55,9 @@ def get_tool_configurations() -> dict:
         for tool_name, tool_info in all_tools.items():
             plugin_enabled = tool_info.plugin_name in enabled_plugins
 
-            # Get configuration if exists
+            # Get configuration if exists; missing config means denied by default
             config = existing_configs.get(tool_name, {})
-            tool_enabled = config.get("enabled", 1) if config else 1
+            tool_enabled = config.get("enabled", 0) if config else 0
             category = config.get("tool_category", "read_write") if config else "read_write"
             # Normalize 'dangerous' to 'privileged' for UI consistency
             if category == "dangerous":
@@ -66,7 +66,10 @@ def get_tool_configurations() -> dict:
             if auto_category == "dangerous":
                 auto_category = "privileged"
             category_override = config.get("category_override", 0) if config else 0
-            role_access_mode = config.get("role_access_mode", "Allow All") if config else "Allow All"
+            role_access_mode = config.get("role_access_mode", "Deny All") if config else "Deny All"
+            if role_access_mode not in ("Deny All", "Restrict to Listed Roles"):
+                # Legacy modes (e.g. 'Allow All') are reported as denied
+                role_access_mode = "Deny All"
 
             # Get role access if configured
             role_access = []
@@ -128,6 +131,7 @@ def toggle_tool(tool_name: str, enabled: bool):
         Success status and message
     """
     frappe.only_for(["System Manager", "Assistant Admin"])
+    from frappe_assistant_core.core.security_policy import HARD_DENY_TOOLS
     from frappe_assistant_core.core.tool_registry import get_tool_registry
     from frappe_assistant_core.utils.plugin_manager import get_plugin_manager
     from frappe_assistant_core.utils.tool_category_detector import detect_tool_category
@@ -148,6 +152,13 @@ def toggle_tool(tool_name: str, enabled: bool):
         # Convert enabled to boolean
         enabled = frappe.utils.cint(enabled)
 
+        # Hard-denied tools can never be enabled
+        if enabled and tool_name in HARD_DENY_TOOLS:
+            return {
+                "success": False,
+                "message": _(f"Tool '{tool_name}' is hard-denied and cannot be enabled"),
+            }
+
         # Use savepoint for atomic operation
         frappe.db.savepoint("toggle_tool")
 
@@ -158,7 +169,9 @@ def toggle_tool(tool_name: str, enabled: bool):
                 config.enabled = enabled
                 config.save(ignore_permissions=True)
             else:
-                # Create new configuration
+                # Create new configuration deny-by-default: even when the
+                # caller asked to enable, a fresh config starts disabled and
+                # 'Deny All' until roles are explicitly configured.
                 tool_info = all_tools[tool_name]
                 category = detect_tool_category(tool_info.instance)
 
@@ -166,11 +179,32 @@ def toggle_tool(tool_name: str, enabled: bool):
                 config.tool_name = tool_name
                 config.plugin_name = tool_info.plugin_name
                 config.description = tool_info.description
-                config.enabled = enabled
+                config.enabled = 0
+                config.role_access_mode = "Deny All"
                 config.tool_category = category
                 config.auto_detected_category = category
                 config.source_app = getattr(tool_info.instance, "source_app", "frappe_assistant_core")
                 config.insert(ignore_permissions=True)
+
+                frappe.db.release_savepoint("toggle_tool")
+                frappe.db.commit()
+
+                # Clear caches
+                tool_registry = get_tool_registry()
+                tool_registry.clear_cache()
+
+                cache = frappe.cache()
+                cache.delete_keys("fac_tool_*")
+
+                return {
+                    "success": True,
+                    "enabled": False,
+                    "requires_configuration": True,
+                    "message": _(
+                        f"Tool '{tool_name}' configuration created disabled with 'Deny All'. "
+                        "Configure role access first, then enable the tool."
+                    ),
+                }
 
             frappe.db.release_savepoint("toggle_tool")
             frappe.db.commit()
@@ -359,7 +393,7 @@ def update_tool_category(tool_name: str, category: str, override: bool = True):
         if frappe.db.exists("FAC Tool Configuration", tool_name):
             config = frappe.get_doc("FAC Tool Configuration", tool_name)
         else:
-            # Create new configuration
+            # Create new configuration (disabled/Deny All until explicitly configured)
             tool_info = all_tools[tool_name]
             auto_category = detect_tool_category(tool_info.instance)
 
@@ -367,7 +401,8 @@ def update_tool_category(tool_name: str, category: str, override: bool = True):
             config.tool_name = tool_name
             config.plugin_name = tool_info.plugin_name
             config.description = tool_info.description
-            config.enabled = 1
+            config.enabled = 0
+            config.role_access_mode = "Deny All"
             config.auto_detected_category = auto_category
             config.source_app = getattr(tool_info.instance, "source_app", "frappe_assistant_core")
 
@@ -394,18 +429,24 @@ def update_tool_role_access(tool_name: str, role_access_mode: str, roles: list |
 
     Args:
         tool_name: The name of the tool
-        role_access_mode: "Allow All" or "Restrict to Listed Roles"
+        role_access_mode: "Deny All" or "Restrict to Listed Roles"
         roles: List of dicts with {role, allow_access} for restricted mode
 
     Returns:
         Success status and message
+
+    Notes:
+        - 'Allow All' is no longer accepted; access is deny-by-default.
+        - 'Restrict to Listed Roles' requires at least one valid existing role.
+        - Changing role access never implicitly enables a tool; newly created
+          configurations start disabled.
     """
     frappe.only_for(["System Manager", "Assistant Admin"])
     from frappe_assistant_core.core.tool_registry import get_tool_registry
     from frappe_assistant_core.utils.plugin_manager import get_plugin_manager
     from frappe_assistant_core.utils.tool_category_detector import detect_tool_category
 
-    valid_modes = ["Allow All", "Restrict to Listed Roles"]
+    valid_modes = ["Deny All", "Restrict to Listed Roles"]
     if role_access_mode not in valid_modes:
         return {"success": False, "message": _(f"Invalid mode. Must be one of: {valid_modes}")}
 
@@ -413,6 +454,30 @@ def update_tool_role_access(tool_name: str, role_access_mode: str, roles: list |
         import json
 
         roles = json.loads(roles)
+
+    # Restricted mode requires a non-empty list of valid, existing roles
+    normalized_roles = []
+    if role_access_mode == "Restrict to Listed Roles":
+        if not roles:
+            return {
+                "success": False,
+                "message": _("'Restrict to Listed Roles' requires at least one role"),
+            }
+        for role_entry in roles:
+            role = role_entry.get("role") if isinstance(role_entry, dict) else role_entry
+            allow_access = (
+                frappe.utils.cint(role_entry.get("allow_access", 1))
+                if isinstance(role_entry, dict)
+                else 1
+            )
+            if not role or not frappe.db.exists("Role", {"name": role, "disabled": 0}):
+                return {"success": False, "message": _(f"Invalid role: '{role}'")}
+            normalized_roles.append({"role": role, "allow_access": allow_access})
+        if not any(role_entry["allow_access"] for role_entry in normalized_roles):
+            return {
+                "success": False,
+                "message": _("'Restrict to Listed Roles' requires at least one allowed active role"),
+            }
 
     try:
         # Validate tool exists
@@ -431,7 +496,7 @@ def update_tool_role_access(tool_name: str, role_access_mode: str, roles: list |
         if frappe.db.exists("FAC Tool Configuration", tool_name):
             config = frappe.get_doc("FAC Tool Configuration", tool_name)
         else:
-            # Create new configuration
+            # Create new configuration; it stays disabled until explicitly enabled
             tool_info = all_tools[tool_name]
             category = detect_tool_category(tool_info.instance)
 
@@ -439,25 +504,17 @@ def update_tool_role_access(tool_name: str, role_access_mode: str, roles: list |
             config.tool_name = tool_name
             config.plugin_name = tool_info.plugin_name
             config.description = tool_info.description
-            config.enabled = 1
+            config.enabled = 0
             config.tool_category = category
             config.auto_detected_category = category
             config.source_app = getattr(tool_info.instance, "source_app", "frappe_assistant_core")
 
         config.role_access_mode = role_access_mode
 
-        # Update role access table if in restricted mode
-        if role_access_mode == "Restrict to Listed Roles" and roles:
-            # Clear existing role access
-            config.role_access = []
-
-            # Add new role access entries
-            for role_entry in roles:
-                if isinstance(role_entry, dict):
-                    config.append(
-                        "role_access",
-                        {"role": role_entry.get("role"), "allow_access": role_entry.get("allow_access", 1)},
-                    )
+        # Replace the role access table; 'Deny All' clears any stale rows
+        config.role_access = []
+        for role_entry in normalized_roles:
+            config.append("role_access", role_entry)
 
         config.save(ignore_permissions=True)
         frappe.db.commit()

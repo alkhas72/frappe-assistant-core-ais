@@ -45,6 +45,11 @@ class BaseAssistantTest(unittest.TestCase):
         """Set up test environment for each test"""
         # Clear any existing test data
         self.clear_test_data()
+        self._audit_log_names_before = self._current_audit_log_names()
+        # unittest cleanups run even when setUp or the test fails. Register
+        # this before the remaining setup so committed audit rows cannot leak
+        # from any BaseAssistantTest case into the shared test site.
+        self.addCleanup(self._delete_created_audit_rows)
 
         # Set test user
         self.test_user = "Administrator"
@@ -180,6 +185,23 @@ class BaseAssistantTest(unittest.TestCase):
         except Exception:
             # Ignore cleanup errors in tests
             pass
+
+    @staticmethod
+    def _current_audit_log_names():
+        if not frappe.db.exists("DocType", "Assistant Audit Log"):
+            return frozenset()
+        return frozenset(frappe.get_all("Assistant Audit Log", pluck="name"))
+
+    def _delete_created_audit_rows(self):
+        """Persistently remove audit rows created by the current test only."""
+        before = getattr(self, "_audit_log_names_before", frozenset())
+        created = self._current_audit_log_names() - before
+        if created:
+            frappe.db.delete(
+                "Assistant Audit Log",
+                {"name": ("in", tuple(created))},
+            )
+            frappe.db.commit()
 
     def setup_mocks(self):
         """Set up common mocks for testing"""

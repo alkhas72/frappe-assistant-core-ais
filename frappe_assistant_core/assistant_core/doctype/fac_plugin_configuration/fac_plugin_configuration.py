@@ -23,7 +23,7 @@ class FACPluginConfiguration(Document):
     Fields:
         plugin_name: Unique identifier for the plugin
         display_name: Human-readable name shown in the UI
-        enabled: Whether the plugin is enabled (default: 1)
+        enabled: Whether the plugin is enabled (default: 0, deny by default)
         description: Description of what this plugin provides
         discovered_at: When this plugin was first discovered
         last_toggled_at: When this plugin was last enabled or disabled
@@ -76,18 +76,18 @@ def get_plugin_enabled_status(plugin_name: str) -> dict:
                 "exists": True,
             }
         else:
-            # Plugin not configured yet - default to enabled
+            # Plugin not configured yet - denied by default
             return {
                 "plugin_name": plugin_name,
-                "enabled": True,
+                "enabled": False,
                 "exists": False,
-                "note": "No configuration exists - using default (enabled)",
+                "note": "No configuration exists - disabled by default",
             }
     except Exception as e:
         frappe.log_error(title=_("Plugin Status Error"), message=str(e))
         return {
             "plugin_name": plugin_name,
-            "enabled": True,  # Default to enabled on error
+            "enabled": False,  # Fail closed on error
             "error": str(e),
         }
 

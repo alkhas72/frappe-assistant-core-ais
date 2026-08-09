@@ -15,101 +15,169 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Security Configuration for Frappe Assistant Core
+Security configuration for Frappe Assistant Core.
 
-This module defines role-based access control, sensitive field filtering,
-and security policies following Frappe Framework standards.
+AUTHORITY MOVED (Task 6, FAC security hardening, 2026-08-09): the legacy
+``ROLE_TOOL_ACCESS`` matrix and ``BASIC_CORE_TOOLS`` list no longer authorize
+anything. Runtime authorization lives in
+:mod:`frappe_assistant_core.core.security_policy` (fail-closed ``SecurityPolicy``
+called from ``BaseTool._safe_execute``). The functions kept here are
+backwards-compatibility shims so existing tool implementations do not break at
+import time, but they cannot re-enable a hard-denied tool, open a restricted
+DocType, leak a sensitive field, or grant any System Manager / Administrator
+bypass. Every code path that previously granted elevated access now either
+delegates to ``SecurityPolicy`` or returns a fail-closed answer.
+
+Only the data constants ``SENSITIVE_FIELDS`` and ``ADMIN_ONLY_FIELDS`` remain
+authoritative here: they feed ``SecurityPolicy._contains_restricted_fields`` and
+must not be removed without a coordinated change to the policy contract
+(owned by the Foundation workstream).
 """
 
-from typing import Any, Dict, List, Optional, Set
+from __future__ import annotations
+
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any, Dict, List, Optional
 
 import frappe
 
-# Basic Core tools available to ALL users (document permissions will control access)
-BASIC_CORE_TOOLS = [
-    # Essential document operations
-    "document_create",
-    "document_get",
-    "document_update",
-    "document_list",
-    # Search and discovery
-    "search_global",
-    "search_doctype",
-    "search_link",
-    # Basic reporting
-    "report_execute",
-    "report_list",
-    "report_columns",
-    # Basic metadata
-    "metadata_doctype",
-    # Visualizations
-    "create_visualization",
-    # Basic analysis
-    "analyze_frappe_data",
-    # Basic workflow
-    "workflow_status",
-    "workflow_list",
-]
+# ---------------------------------------------------------------------------
+# Deprecated inert / fail-closed exports (kept for import compatibility)
+#
+# Older code paths imported ``BASIC_CORE_TOOLS``, ``ROLE_TOOL_ACCESS`` and the
+# dict-form ``RESTRICTED_DOCTYPES`` for role-matrix lookups. With Task 6 the
+# matrix retired from runtime authority.
+#
+# FAC v2.2: ``BASIC_CORE_TOOLS`` and ``ROLE_TOOL_ACCESS`` are now IMMUTABLE
+# empty containers (``tuple`` / ``MappingProxyType({})``) — legacy callers
+# cannot mutate them into an alternative allow system.
+#
+# ``RESTRICTED_DOCTYPES`` is intentionally NOT a plain empty dict: a legacy
+# caller doing ``doctype in RESTRICTED_DOCTYPES.get(role, [])`` would get
+# ``[]`` and conclude "not restricted" — that was fail-OPEN (caught by the
+# Frappe 15 review, v2.1). The export is now a read-only mapping that returns
+# the canonical restricted set for EVERY role key, derived lazily from
+# ``SecurityPolicy.RESTRICTED_DOCTYPES``. If the canonical import itself
+# fails, we return a deny-all membership object so that
+# ``doctype in legacy_list`` is always True — fail-closed rather than the
+# sentinel-string approach that did not match any real DocType.
+#
+# Removing these exports entirely is a separate breaking-change decision for
+# the Arbiter; until then they remain defined and fail-closed.
+# ---------------------------------------------------------------------------
 
-# Role-based tool access matrix
-ROLE_TOOL_ACCESS = {
-    "System Manager": {
-        # System Managers have access to ALL tools
-        "allowed_tools": "*",  # Wildcard for all tools
-        "restricted_tools": [],
-        "description": "Full access to all assistant tools including dangerous operations",
-    },
-    "Assistant Admin": {
-        "allowed_tools": [
-            # All basic tools (inherited)
-            *BASIC_CORE_TOOLS,
-            # Administrative tools
-            "metadata_permissions",
-            "metadata_workflow",
-            "tool_registry_list",
-            "tool_registry_toggle",
-            "audit_log_view",
-            "workflow_action",
-        ],
-        "restricted_tools": [
-            "execute_python_code",
-            "query_and_analyze",
-        ],
-        "description": "Administrative access without code execution capabilities",
-    },
-    "Assistant User": {
-        "allowed_tools": BASIC_CORE_TOOLS,
-        "restricted_tools": [
-            "execute_python_code",
-            "query_and_analyze",
-            "metadata_permissions",
-            "metadata_workflow",
-            "tool_registry_list",
-            "tool_registry_toggle",
-            "audit_log_view",
-            "workflow_action",
-        ],
-        "description": "Basic business user access with document-level permissions",
-    },
-    # All other users (any role) get access to basic core tools
-    "Default": {
-        "allowed_tools": BASIC_CORE_TOOLS,
-        "restricted_tools": [
-            "execute_python_code",
-            "query_and_analyze",
-            "metadata_permissions",
-            "metadata_workflow",
-            "tool_registry_list",
-            "tool_registry_toggle",
-            "audit_log_view",
-            "workflow_action",
-        ],
-        "description": "Basic tool access for all users - document permissions control actual access",
-    },
-}
+BASIC_CORE_TOOLS: tuple = ()
+ROLE_TOOL_ACCESS: Mapping = MappingProxyType({})
 
-# Sensitive fields that should be filtered based on user roles
-SENSITIVE_FIELDS = {
+
+class _DenyAll:
+    """Membership container that reports every DocType as restricted.
+
+    Used as the fail-closed fallback when the canonical restricted set
+    cannot be loaded. ``__contains__`` is True for any value so the legacy
+    pattern ``doctype in legacy_list`` cannot accidentally conclude "not
+    restricted"; ``__len__`` is non-zero so ``if not legacy_list`` also
+    fails closed.
+
+    FAC v2.3: ``__iter__`` RAISES instead of yielding nothing. A naive
+    ``for dt in legacy_list`` previously produced an empty iteration, which
+    looked like "no restrictions defined" — exactly the false sense of
+    safety that the v2.1/v2.2 rounds rejected at the membership-test level.
+    Iterating a deny-all container is a programming error during a
+    canonical-load failure; we surface it explicitly.
+    """
+
+    __slots__ = ()
+
+    def __contains__(self, _item: Any) -> bool:
+        return True
+
+    def __iter__(self):
+        raise RuntimeError(
+            "fac_deny_all: canonical restricted-Doctype set is unavailable; "
+            "iteration is not safe"
+        )
+
+    def __len__(self) -> int:
+        return 1
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __eq__(self, other: Any) -> bool:
+        # Two deny-all instances are equal; not equal to anything else.
+        return isinstance(other, _DenyAll)
+
+    def __hash__(self) -> int:
+        return hash("__fac_deny_all__")
+
+    def __repr__(self) -> str:
+        return "<fac deny-all restricted-doctypes>"
+
+
+_DENY_ALL = _DenyAll()
+
+
+class _LegacyRestrictedDoctypes(Mapping):
+    """Read-only dict view that derives the legacy ``{role: [doctypes]}``
+    shape from the canonical frozenset on every access.
+
+    Every role key resolves to the SAME canonical restricted list, so the old
+    lookup pattern ``RESTRICTED_DOCTYPES.get(role, []).__contains__(dt)``
+    cannot fail-open regardless of which role the caller supplies. If the
+    canonical policy import itself fails, the mapping returns ``_DenyAll``
+    so every membership test reports "restricted".
+    """
+
+    __slots__ = ()
+
+    @staticmethod
+    def _canonical() -> Any:
+        # Lazy import: security_policy imports security_config for
+        # SENSITIVE_FIELDS / ADMIN_ONLY_FIELDS, so we cannot import it at
+        # module load here without creating a cycle.
+        from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES
+
+        return sorted(RESTRICTED_DOCTYPES)
+
+    def _always_list(self) -> Any:
+        try:
+            return self._canonical()
+        except Exception:
+            # Canonical import failed. Fail closed: every membership test
+            # must report "restricted". The previous sentinel-string
+            # approach did not match any real DocType and was fail-OPEN.
+            return _DENY_ALL
+
+    def __getitem__(self, key: Any) -> Any:
+        # Every role gets the canonical set — never an empty list, never a
+        # wildcard. ``__getitem__`` (``d[key]``) covers ``.get(key)`` too.
+        del key  # role is irrelevant in the post-matrix world
+        return self._always_list()
+
+    def __iter__(self):
+        # Provide a stable iteration order based on the canonical set; the
+        # keys themselves are not meaningful, but ``list(d)`` should not raise.
+        return iter(("Assistant User", "Assistant Admin", "System Manager", "Default"))
+
+    def __len__(self) -> int:
+        return 4
+
+    def __contains__(self, key: Any) -> bool:
+        # ``"Assistant User" in RESTRICTED_DOCTYPES`` should behave like the
+        # legacy dict did (True for known role keys).
+        return key in ("Assistant User", "Assistant Admin", "System Manager", "Default")
+
+
+RESTRICTED_DOCTYPES: Mapping[str, Any] = _LegacyRestrictedDoctypes()
+
+
+# ---------------------------------------------------------------------------
+# Sensitive / admin-only field snapshots (still authoritative for policy)
+# ---------------------------------------------------------------------------
+
+SENSITIVE_FIELDS: Dict[str, Any] = {
     "all_doctypes": [
         "password",
         "new_password",
@@ -217,8 +285,7 @@ SENSITIVE_FIELDS = {
     ],
 }
 
-# Fields that should be hidden from Assistant Users but visible to admins
-ADMIN_ONLY_FIELDS = {
+ADMIN_ONLY_FIELDS: Dict[str, Any] = {
     "all_doctypes": [
         "owner",
         "creation",
@@ -273,219 +340,175 @@ ADMIN_ONLY_FIELDS = {
     "Dropbox Settings": "*",
 }
 
-# DocTypes that should be completely hidden from Assistant Users
-RESTRICTED_DOCTYPES = {
-    "Assistant User": [
-        # System administration
-        "System Settings",
-        "Print Settings",
-        "Email Domain",
-        "LDAP Settings",
-        "OAuth Settings",
-        "Social Login Key",
-        "Dropbox Settings",
-        "Connected App",
-        "OAuth Bearer Token",
-        # Security and permissions
-        "Role",
-        "User Permission",
-        "Role Permission",
-        "Custom Role",
-        "Module Profile",
-        "Role Profile",
-        "Custom DocPerm",
-        "DocShare",
-        # System logs and audit
-        "Error Log",
-        "Activity Log",
-        "Access Log",
-        "View Log",
-        "Scheduler Log",
-        "Integration Request",
-        # System customization
-        "Server Script",
-        "Client Script",
-        "Custom Script",
-        "Property Setter",
-        "Customize Form",
-        "Customize Form Field",
-        "DocType",
-        "DocField",
-        "DocPerm",
-        "Custom Field",
-        # Development tools
-        "Package",
-        "Package Release",
-        "Installed Application",
-        "Data Import",
-        "Data Export",
-        "Bulk Update",
-        "Rename Tool",
-        "Database Storage Usage By Tables",
-        # Workflows (admin level)
-        "Workflow",
-        "Workflow Action",
-        "Workflow State",
-        "Workflow Transition",
-        # Email system internals
-        "Email Queue",
-        "Email Queue Recipient",
-        "Email Alert",
-        "Auto Email Report",
-    ]
-}
+
+# ---------------------------------------------------------------------------
+# Backwards-compatibility shims (NO LONGER AUTHORITATIVE)
+#
+# The legacy ``ROLE_TOOL_ACCESS`` matrix and ``BASIC_CORE_TOOLS`` list are
+# intentionally gone. They leaked legacy aliases (``document_create``,
+# ``execute_python_code``, ``metadata_permissions`` ...) into "allowed" sets and
+# granted ``System Manager`` an implicit ``*`` wildcard that bypassed FAC's
+# central policy. Callers that still import these symbols get fail-closed
+# behaviour: the contract is "policy decides, not the matrix".
+# ---------------------------------------------------------------------------
+
+
+def _policy() -> Any:
+    """Lazy import keeps this module importable from contexts that run before
+    the policy contract is registered (e.g. early app boot)."""
+    from frappe_assistant_core.core.security_policy import SecurityPolicy
+
+    return SecurityPolicy
 
 
 def check_tool_access(user_role: str, tool_name: str) -> bool:
+    """Deprecated. Previously consulted ``ROLE_TOOL_ACCESS``; now fail-closed.
+
+    The legacy matrix granted ``System Manager`` an ``*`` wildcard and allowed
+    lists that included hard-denied legacy aliases (``execute_python_code``,
+    ``metadata_permissions`` ...). With the matrix retired, this function can
+    never authorize anything: it returns ``False`` unconditionally and exists
+    only so legacy imports do not break at module load. Runtime authorization is
+    owned by :func:`SecurityPolicy.authorize` and is invoked once per
+    ``BaseTool._safe_execute`` call.
     """
-    Check if a user role has access to a specific tool.
-
-    Args:
-        user_role: Role name (System Manager, Assistant Admin, Assistant User, or any other role)
-        tool_name: Name of the tool to check access for
-
-    Returns:
-        bool: True if access is allowed, False otherwise
-    """
-    # Check if user_role is in our defined access matrix
-    if user_role in ROLE_TOOL_ACCESS:
-        role_config = ROLE_TOOL_ACCESS[user_role]
-    else:
-        # Use Default configuration for all other roles
-        role_config = ROLE_TOOL_ACCESS["Default"]
-
-    # System Manager has access to all tools
-    if role_config["allowed_tools"] == "*":
-        return True
-
-    # Check if tool is explicitly restricted first
-    if tool_name in role_config["restricted_tools"]:
-        return False
-
-    # Check if tool is explicitly allowed
-    if tool_name in role_config["allowed_tools"]:
-        return True
-
+    del user_role, tool_name  # Fail-closed: matrix authority removed.
     return False
 
 
 def get_allowed_tools(user_role: str) -> List[str]:
+    """Deprecated. The matrix no longer exists; there is no static per-role
+    allowlist to return. Publication/execution authority lives in
+    :class:`SecurityPolicy` and the FAC Tool Configuration rows it consults.
     """
-    Get list of tools allowed for a specific user role.
+    del user_role
+    return []
 
-    Args:
-        user_role: Role name
 
-    Returns:
-        List of allowed tool names
+def is_doctype_accessible(doctype: str, user_role: str | None = None) -> bool:
+    """Deprecated role-based gate. Previously returned ``True`` for every
+    DocType when ``user_role == "System Manager"``.
+
+    Fail-closed replacement: delegates to
+    :meth:`SecurityPolicy._is_restricted_target`, which checks both the
+    ratified ``RESTRICTED_DOCTYPES`` baseline and ``meta.istable`` (child
+    tables are not directly accessible). ``user_role`` is accepted for
+    backwards compatibility but no longer creates a bypass — not even for
+    ``System Manager``.
     """
-    if user_role not in ROLE_TOOL_ACCESS:
-        return []
+    if not doctype:
+        return False
+    try:
+        policy = _policy()
+        # ``_is_restricted_target`` already covers RESTRICTED_DOCTYPES + child
+        # tables (``meta.istable == 1``) in one call; re-implementing it here
+        # would risk divergence from the central policy.
+        return not policy._is_restricted_target(doctype)
+    except Exception:
+        # If the policy lookup fails we cannot prove accessibility.
+        return False
 
-    role_config = ROLE_TOOL_ACCESS[user_role]
 
-    if role_config["allowed_tools"] == "*":
-        # Return all available tools for System Manager
-        return ["*"]
+def get_user_primary_role(user: str) -> str:
+    """Return the highest-privilege role for ``user``.
 
-    return role_config["allowed_tools"]
-
-
-def filter_sensitive_fields(doc_dict: Dict[str, Any], doctype: str, user_role: str) -> Dict[str, Any]:
+    The return value is still useful for audit/display logic and for callers
+    that need a label, but it must not be used as an authorization signal —
+    :func:`check_tool_access` now ignores it and always returns ``False``.
     """
-    Filter out sensitive fields from document data based on user role.
+    try:
+        user_roles = frappe.get_roles(user)
+    except Exception:
+        return "Default"
 
-    Args:
-        doc_dict: Document data as dictionary
-        doctype: DocType name
-        user_role: User role name
+    if "System Manager" in user_roles:
+        return "System Manager"
+    if "Assistant Admin" in user_roles:
+        return "Assistant Admin"
+    if "Assistant User" in user_roles:
+        return "Assistant User"
+    return "Default"
 
-    Returns:
-        Filtered document dictionary
+
+def filter_sensitive_fields(
+    doc_dict: Dict[str, Any], doctype: str, user_role: str | None = None
+) -> Dict[str, Any]:
+    """Redact sensitive/admin-only fields from ``doc_dict``.
+
+    Previously granted ``System Manager`` a full bypass (returned the dict
+    unchanged). That bypass was the root cause of credential leaks through
+    read paths that did not pass through central ``SecurityPolicy``. The
+    function now applies the union of ``SENSITIVE_FIELDS`` and
+    ``ADMIN_ONLY_FIELDS`` for every caller, regardless of role, mirroring the
+    universal redaction enforced by
+    :meth:`SecurityPolicy.redact_output`.
+
+    This local filter may ADD restrictions but cannot provide a privileged-role
+    bypass. Tools that need true output redaction should rely on the central
+    sink in ``BaseTool._safe_execute``; this helper exists for code paths that
+    serialize documents before the central sink runs (e.g. JSON-string payloads
+    produced inside a tool ``execute``).
     """
-    if user_role == "System Manager":
-        return doc_dict  # System Manager can see all fields
+    if not isinstance(doc_dict, dict):
+        return doc_dict
 
-    filtered_doc = doc_dict.copy()
+    filtered = dict(doc_dict)
 
-    # Get sensitive fields for this doctype
-    sensitive_fields = set()
+    # Universal sensitive fields (any doctype)
+    sensitive: set[str] = set(SENSITIVE_FIELDS.get("all_doctypes", []))
+    sensitive.update(SENSITIVE_FIELDS.get(doctype, []))
 
-    # Add global sensitive fields
-    sensitive_fields.update(SENSITIVE_FIELDS.get("all_doctypes", []))
+    # Admin-only fields are now applied universally — no System Manager bypass.
+    admin_all = ADMIN_ONLY_FIELDS.get("all_doctypes", [])
+    if isinstance(admin_all, list):
+        sensitive.update(admin_all)
 
-    # Add doctype-specific sensitive fields
-    sensitive_fields.update(SENSITIVE_FIELDS.get(doctype, []))
+    admin_for_doctype = ADMIN_ONLY_FIELDS.get(doctype, [])
+    if admin_for_doctype == "*":
+        # Whole DocType is admin-only; mirror the legacy "access restricted"
+        # contract so callers do not print anything from it.
+        return {"error": "Access to this document type is restricted"}
+    if isinstance(admin_for_doctype, list):
+        sensitive.update(admin_for_doctype)
 
-    # Add admin-only fields for Assistant Users
-    if user_role == "Assistant User":
-        admin_fields = ADMIN_ONLY_FIELDS.get("all_doctypes", [])
-        sensitive_fields.update(admin_fields)
+    for field in sensitive:
+        if field in filtered:
+            filtered[field] = "***RESTRICTED***"
 
-        doctype_admin_fields = ADMIN_ONLY_FIELDS.get(doctype, [])
-        if doctype_admin_fields == "*":
-            # Hide all fields for completely restricted doctypes
-            return {"error": "Access to this document type is restricted"}
-        else:
-            sensitive_fields.update(doctype_admin_fields)
-
-    # Filter out sensitive fields
-    for field in sensitive_fields:
-        if field in filtered_doc:
-            filtered_doc[field] = "***RESTRICTED***"
-
-    return filtered_doc
-
-
-def is_doctype_accessible(doctype: str, user_role: str) -> bool:
-    """
-    Check if a user role can access a specific DocType.
-
-    Args:
-        doctype: DocType name
-        user_role: User role name
-
-    Returns:
-        bool: True if access is allowed, False otherwise
-    """
-    if user_role == "System Manager":
-        return True  # System Manager can access all doctypes
-
-    # Default users follow the same DocType restrictions as Assistant User for safety
-    role_to_check = user_role if user_role in RESTRICTED_DOCTYPES else "Assistant User"
-
-    restricted_doctypes = RESTRICTED_DOCTYPES.get(role_to_check, [])
-    return doctype not in restricted_doctypes
+    return filtered
 
 
 def validate_document_access(
-    user: str, doctype: str, name: str, perm_type: str = "read", data: str = ""
+    user: str,
+    doctype: str,
+    name: str,
+    perm_type: str = "read",
+    data: str | Dict[str, Any] | None = "",
 ) -> Dict[str, Any]:
-    """
-    Validate if a user can access a specific document with proper Frappe permission checking.
+    """Backwards-compatible wrapper around the central policy decision plus a
+    native Frappe permission check.
 
-    Args:
-        user: User name
-        doctype: DocType name
-        name: Document name
-        perm_type: Permission type (read, write, create, delete, etc.)
-
-    Returns:
-        Dictionary with validation result
+    Previously called the legacy matrix (``is_doctype_accessible``) which let
+    ``System Manager`` read every DocType, then a Frappe ``has_permission``
+    call. The matrix step is gone; we now ask
+    :meth:`SecurityPolicy._is_restricted_target` and fall through to Frappe's
+    native permission check. There is no privileged-role bypass.
     """
     try:
-        # Get user's primary role (includes Default for non-assistant users)
-        primary_role = get_user_primary_role(user)
+        if not doctype:
+            return {"success": False, "error": "DocType is required"}
 
-        # Check if DocType is accessible for this role
-        if not is_doctype_accessible(doctype, primary_role):
-            return {"success": False, "error": f"Access to {doctype} is restricted for your role"}
+        # Restricted DocType set is the authoritative gate; role cannot override.
+        policy = _policy()
+        if policy._is_restricted_target(doctype):
+            return {
+                "success": False,
+                "error": f"Access to {doctype} is restricted",
+            }
 
-        # Check Frappe DocType-level permissions - this is the primary security control
         if not frappe.has_permission(doctype, perm_type, user=user):
             return {"success": False, "error": f"Insufficient {perm_type} permissions for {doctype}"}
 
-        # Check document-level permissions (if document exists)
         if name:
             if not frappe.has_permission(doctype, perm_type, doc=name, user=user):
                 return {
@@ -493,61 +516,34 @@ def validate_document_access(
                     "error": f"Insufficient {perm_type} permissions for {doctype} {name}",
                 }
 
-            # Check if document is submitted and operation is write/delete
-            if perm_type in ["write", "delete"]:
+            if perm_type in {"write", "delete"}:
                 try:
                     doc = frappe.get_doc(doctype, name)
                     if hasattr(doc, "docstatus") and doc.docstatus == 1:
-                        if perm_type == "write":
-                            meta = frappe.get_meta(doctype)
-                            non_allowed_fields = []
-                            for field in data.keys():
-                                field_meta = meta.get_field(field)
-                                if not field_meta or not field_meta.allow_on_submit:
-                                    non_allowed_fields.append(field)
-                            if non_allowed_fields:
-                                return {
-                                    "success": False,
-                                    "error": f"Cannot modify submitted document {doctype} {name}",
-                                }
-                        elif perm_type == "delete":
+                        if perm_type == "delete":
                             return {
                                 "success": False,
                                 "error": f"Cannot delete submitted document {doctype} {name}",
                             }
+                        if isinstance(data, dict):
+                            meta = frappe.get_meta(doctype)
+                            non_allowed = [
+                                field
+                                for field in data.keys()
+                                if not meta.get_field(field) or not meta.get_field(field).allow_on_submit
+                            ]
+                            if non_allowed:
+                                return {
+                                    "success": False,
+                                    "error": f"Cannot modify submitted document {doctype} {name}",
+                                }
                 except Exception:
-                    pass  # Document might not exist yet for create operations
+                    # Document may not exist yet for create-like flows; the
+                    # central policy and Frappe's own save() remain authoritative.
+                    pass
 
-        return {"success": True, "role": primary_role}
+        return {"success": True, "role": get_user_primary_role(user)}
 
-    except Exception as e:
-        frappe.log_error(f"Error in validate_document_access: {str(e)}")
+    except Exception:
+        # Never expose raw exception details to the caller.
         return {"success": False, "error": "Permission validation failed"}
-
-
-def get_user_primary_role(user: str) -> str:
-    """
-    Get the primary (highest privilege) role for a user.
-
-    Args:
-        user: User name
-
-    Returns:
-        Primary role name - specific assistant role or "Default" for all other users
-    """
-    user_roles = frappe.get_roles(user)
-
-    # Check for specific assistant roles first (highest to lowest privilege)
-    if "System Manager" in user_roles:
-        return "System Manager"
-    elif "Assistant Admin" in user_roles:
-        return "Assistant Admin"
-    elif "Assistant User" in user_roles:
-        return "Assistant User"
-    else:
-        # All other users get basic tool access via Default role
-        return "Default"
-
-
-# DEPRECATED: audit_log_tool_access function removed
-# Audit logging is now handled automatically by BaseTool._safe_execute

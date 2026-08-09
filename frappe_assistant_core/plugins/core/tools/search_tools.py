@@ -21,6 +21,17 @@ from frappe import _
 from frappe.desk.search import search_widget
 
 
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.search_tools").warning(tag)
+        else:
+            frappe.logger("fac.search_tools").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
+
+
 class SearchTools:
     """assistant tools for Frappe search operations"""
 
@@ -82,14 +93,25 @@ class SearchTools:
 
     @staticmethod
     def global_search(query: str, limit: int = 20) -> Dict[str, Any]:
-        """Global search across all accessible documents"""
-        try:
-            results = []
+        """Global search across all accessible documents.
 
-            # Search across common DocTypes that users typically have access to
+        Restricted DocTypes (``User``, ``DocType``, ``File``, FAC config types,
+        ...) and any child-table DocType are excluded before any query runs —
+        the legacy ``common_doctypes`` list shipped ``User`` and ``DocType``
+        unconditionally, which defeated the central policy for global search
+        (FAC security hardening Task 6, 2026-08-09). Each surviving DocType is
+        still gated by Frappe's native read permission and queried via
+        ``frappe.get_list(ignore_permissions=False)``.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
+        try:
+            results: List[Dict[str, Any]] = []
+
+            # Common business DocTypes. ``User`` and ``DocType`` were removed:
+            # both are in the ratified RESTRICTED_DOCTYPES baseline and must
+            # not be discoverable via global search regardless of role.
             common_doctypes = [
-                "User",
-                "DocType",
                 "Contact",
                 "Customer",
                 "Supplier",
@@ -100,9 +122,15 @@ class SearchTools:
                 "Project",
             ]
 
+            searched: List[str] = []
             for doctype in common_doctypes:
                 try:
-                    # Check if doctype exists and user has permission
+                    # DocType-level restricted/child-table gate. This is the
+                    # authoritative "is this even a searchable target" check;
+                    # role-based bypass (System Manager) is intentionally not
+                    # available here.
+                    if SecurityPolicy._is_restricted_target(doctype):
+                        continue
                     if not frappe.db.exists("DocType", doctype):
                         continue
                     if not frappe.has_permission(doctype, "read"):
@@ -125,6 +153,8 @@ class SearchTools:
                         result["doctype"] = doctype
                         results.append(result)
 
+                    searched.append(doctype)
+
                 except Exception:
                     # Skip doctype if there's an error
                     continue
@@ -138,23 +168,30 @@ class SearchTools:
                 "results": limited_results,
                 "count": len(limited_results),
                 "total_found": len(results),
-                "searched_doctypes": [
-                    dt
-                    for dt in common_doctypes
-                    if frappe.db.exists("DocType", dt) and frappe.has_permission(dt, "read")
-                ],
+                "searched_doctypes": searched,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Global Search Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            _log_safe("global search failed")
+            return {"success": False, "error": "Global Search failed"}
 
     @staticmethod
     def search_doctype(doctype: str, query: str, limit: int = 20) -> Dict[str, Any]:
-        """Search within a specific DocType"""
+        """Search within a specific DocType.
+
+        Restricted DocTypes and child tables are rejected up front, before any
+        metadata or query runs (FAC security hardening Task 6). Native Frappe
+        read permission and ``get_list(ignore_permissions=False)`` remain the
+        row-level gate.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             if not frappe.db.exists("DocType", doctype):
                 return {"success": False, "error": f"DocType '{doctype}' not found"}
+
+            if SecurityPolicy._is_restricted_target(doctype):
+                return {"success": False, "error": f"DocType '{doctype}' is restricted"}
 
             if not frappe.has_permission(doctype, "read"):
                 return {"success": False, "error": f"No read permission for DocType '{doctype}'"}
@@ -204,16 +241,27 @@ class SearchTools:
                 "search_fields": search_fields,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant DocType Search Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            _log_safe("doctype search failed")
+            return {"success": False, "error": "DocType Search failed"}
 
     @staticmethod
     def search_link(doctype: str, query: str, filters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Search for link field options"""
+        """Search for link field options.
+
+        Restricted DocTypes and child tables are rejected before delegating to
+        Frappe's ``search_link`` (FAC security hardening Task 6). Native
+        permission checks on the underlying ``search_link`` helper remain in
+        force.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             if not frappe.db.exists("DocType", doctype):
                 return {"success": False, "error": f"DocType '{doctype}' not found"}
+
+            if SecurityPolicy._is_restricted_target(doctype):
+                return {"success": False, "error": f"DocType '{doctype}' is restricted"}
 
             if not frappe.has_permission(doctype, "read"):
                 return {"success": False, "error": f"No read permission for DocType '{doctype}'"}
@@ -232,6 +280,6 @@ class SearchTools:
                 "filters_applied": filters or {},
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Link Search Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            _log_safe("link search failed")
+            return {"success": False, "error": "Link Search failed"}

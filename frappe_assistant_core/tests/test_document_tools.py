@@ -20,12 +20,14 @@ Tests document operations through the tool registry
 """
 
 import json
+import sys
 import unittest
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import frappe
 
+from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
 
@@ -84,8 +86,10 @@ class TestDocumentTools(BaseAssistantTest):
         if not self.registry.has_tool("get_document"):
             self.skipTest("get_document tool not available")
 
-        # Try to get Administrator user (should always exist)
-        arguments = {"doctype": "User", "name": "Administrator"}
+        test_doc = frappe.get_doc(
+            {"doctype": self.test_doctype, "description": "Safe get_document test"}
+        ).insert(ignore_permissions=True)
+        arguments = {"doctype": self.test_doctype, "name": test_doc.name}
 
         try:
             result = self.registry.execute_tool("get_document", arguments)
@@ -94,16 +98,22 @@ class TestDocumentTools(BaseAssistantTest):
             if "success" in result and result.get("success"):
                 # Document data is directly in result for successful gets
                 self.assertIn("name", result)
-                self.assertEqual(result["name"], "Administrator")
+                self.assertEqual(result["name"], test_doc.name)
         except Exception as e:
             self.fail(f"Tool execution raised exception: {str(e)}")
+        finally:
+            frappe.delete_doc(self.test_doctype, test_doc.name, force=True)
 
     def test_list_documents_via_execute_tool(self):
         """Test document listing"""
         if not self.registry.has_tool("list_documents"):
             self.skipTest("list_documents tool not available")
 
-        arguments = {"doctype": "User", "limit": 5, "fields": ["name", "full_name"]}
+        arguments = {
+            "doctype": self.test_doctype,
+            "limit": 5,
+            "fields": ["name", "description"],
+        }
 
         try:
             result = self.registry.execute_tool("list_documents", arguments)
@@ -283,14 +293,9 @@ class TestDocumentTools(BaseAssistantTest):
 
     def test_execute_tool_invalid_tool(self):
         """Test handling of invalid tool names"""
-        try:
-            result = self.registry.execute_tool("nonexistent_tool", {})
-            # Should return error, not raise exception
-            self.assertIsInstance(result, dict)
-            self.assertIn("error", result)
-        except Exception as e:
-            # If it raises exception, it should be a known type
-            self.assertIsInstance(e, (ValueError, KeyError, AttributeError))
+        with self.assertRaises(PolicyDenied) as raised:
+            self.registry.execute_tool("nonexistent_tool", {})
+        self.assertEqual(raised.exception.reason_code, "TOOL_UNKNOWN")
 
     def test_create_document_with_submit(self):
         """Test document creation with submission"""
@@ -555,6 +560,257 @@ class TestDocumentTools(BaseAssistantTest):
             self.assertIn("suggestion", result)
 
 
+class TestFetchToolRedaction(BaseAssistantTest):
+    """FAC security hardening Task 6 (2026-08-09).
+
+    The ChatGPT-compatible ``fetch`` tool used to call
+    ``security_config.validate_document_access`` + ``filter_sensitive_fields``,
+    both of which granted a ``System Manager`` bypass and superseded the
+    central policy. It now relies on the central decision (already taken in
+    ``BaseTool._safe_execute``) plus a native row-level read check, and runs
+    ``SecurityPolicy.redact_output`` locally before serialising the document to
+    a JSON-string ``text`` (which the central sink treats as opaque).
+
+    These guards prove:
+      * Sensitive keys nested inside the returned document are redacted for
+        every actor, including System Manager.
+      * The legacy ``security_config`` shims no longer carry a System Manager
+        wildcard (matrix retirement).
+    """
+
+    def test_filter_sensitive_fields_redacts_for_system_manager(self):
+        """``filter_sensitive_fields`` used to return the dict unchanged for
+        ``System Manager``. After retirement it must apply universal sensitive
+        fields to every caller."""
+        from frappe_assistant_core.core.security_config import filter_sensitive_fields
+
+        doc = {
+            "name": "USR-001",
+            "password": "hunter2",
+            "api_key": "sk-leak",
+            "email": "user@example.com",
+        }
+
+        redacted = filter_sensitive_fields(doc, "User", "System Manager")
+
+        self.assertEqual(redacted["name"], "USR-001")
+        self.assertEqual(redacted["email"], "user@example.com")
+        self.assertEqual(redacted["password"], "***RESTRICTED***")
+        self.assertEqual(redacted["api_key"], "***RESTRICTED***")
+
+    def test_validate_document_access_denies_restricted_doctype_for_system_manager(self):
+        """A System Manager must NOT pass ``validate_document_access`` for a
+        restricted DocType (e.g. ``User``). Previously the matrix let SM
+        through; the retired shim must fail-closed."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        from frappe_assistant_core.core.security_config import validate_document_access
+
+        with ExitStack() as stack:
+            # Pretend Frappe thinks the user has every permission. The
+            # restricted-target gate is what must deny, not the native check.
+            stack.enter_context(
+                patch(
+                    "frappe_assistant_core.core.security_config.frappe.has_permission",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "frappe_assistant_core.core.security_config.frappe.get_roles",
+                    return_value=["System Manager"],
+                )
+            )
+
+            result = validate_document_access(
+                user="admin@example.com",
+                doctype="User",
+                name="admin@example.com",
+                perm_type="read",
+            )
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("restricted", (result.get("error") or "").lower())
+
+    def test_check_tool_access_is_fail_closed_for_system_manager(self):
+        """``check_tool_access`` must never authorize anything post-retirement.
+
+        The legacy matrix granted ``System Manager`` an ``*`` wildcard and
+        allowed lists that included hard-denied legacy aliases. The function is
+        now a backwards-compat shim that returns ``False`` unconditionally.
+        """
+        from frappe_assistant_core.core.security_config import check_tool_access
+
+        # Even the most permissive sounding combinations must fail closed.
+        self.assertFalse(check_tool_access("System Manager", "get_document"))
+        self.assertFalse(check_tool_access("System Manager", "delete_document"))
+        self.assertFalse(check_tool_access("System Manager", "run_python_code"))
+        # Legacy aliases that used to be in the allowed list.
+        self.assertFalse(check_tool_access("System Manager", "execute_python_code"))
+        self.assertFalse(check_tool_access("System Manager", "metadata_permissions"))
+
+    def test_is_doctype_accessible_has_no_system_manager_bypass(self):
+        """``is_doctype_accessible("User", "System Manager")`` must return False.
+
+        Restricted DocType set is authoritative; role cannot override it.
+        """
+        from unittest.mock import patch
+
+        from frappe_assistant_core.core.security_config import is_doctype_accessible
+
+        with patch(
+            "frappe_assistant_core.core.security_config.frappe.get_meta"
+        ) as get_meta:
+            # Restricted parent (User) is checked before meta is consulted, so
+            # the meta mock is just defensive.
+            get_meta.return_value.istable = False
+
+            self.assertFalse(is_doctype_accessible("User", "System Manager"))
+            self.assertFalse(is_doctype_accessible("DocType", "System Manager"))
+            self.assertFalse(is_doctype_accessible("File", "System Manager"))
+            # Child tables (any istable=1 DocType) are also not "accessible".
+            get_meta.return_value.istable = True
+            self.assertFalse(is_doctype_accessible("Has Role", "System Manager"))
+
+
+class TestSecurityConfigLegacyCompat(BaseAssistantTest):
+    """FAC v2.1 (2026-08-09).
+
+    ``security_config`` keeps ``BASIC_CORE_TOOLS``, ``ROLE_TOOL_ACCESS`` and
+    the dict-form ``RESTRICTED_DOCTYPES`` for backwards-compatibility with
+    legacy imports. A naive empty dict for ``RESTRICTED_DOCTYPES`` is
+    fail-OPEN: a legacy caller doing
+    ``doctype in RESTRICTED_DOCTYPES.get(role, [])`` would get ``[]`` and
+    conclude "not restricted" for a DocType the canonical policy in fact
+    restricts. The export must remain fail-closed — every role key resolves
+    to the canonical restricted set, derived lazily from
+    ``SecurityPolicy.RESTRICTED_DOCTYPES``.
+    """
+
+    def test_legacy_restricted_doctypes_dict_proves_canonical(self):
+        """Every role key returns the canonical restricted set, not ``[]``."""
+        from frappe_assistant_core.core import security_config
+        from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES as canonical
+
+        for role in ("Assistant User", "Assistant Admin", "System Manager", "Default"):
+            legacy_list = security_config.RESTRICTED_DOCTYPES.get(role, [])
+            # Each known restricted DocType must appear in the legacy list.
+            self.assertIn("User", legacy_list, f"role={role}")
+            self.assertIn("DocType", legacy_list, f"role={role}")
+            self.assertIn("File", legacy_list, f"role={role}")
+            # And the legacy list must equal the canonical set (as a sorted
+            # list), proving there is no second hand-maintained table.
+            self.assertEqual(set(legacy_list), set(canonical))
+
+    def test_legacy_restricted_doctypes_unknown_role_fails_closed(self):
+        """An unknown role key still returns the canonical restricted set,
+        never the empty default."""
+        from frappe_assistant_core.core import security_config
+
+        legacy_list = security_config.RESTRICTED_DOCTYPES.get("Unknown Role XYZ", [])
+        self.assertIn("User", legacy_list)
+
+    def test_legacy_basic_core_tools_and_role_tool_access_inert(self):
+        """``BASIC_CORE_TOOLS`` and ``ROLE_TOOL_ACCESS`` cannot authorize
+        anything — they are empty and cannot form an alternative allow
+        system."""
+        from frappe_assistant_core.core import security_config
+
+        self.assertEqual(security_config.BASIC_CORE_TOOLS, ())
+        self.assertEqual(dict(security_config.ROLE_TOOL_ACCESS), {})
+
+
+class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
+    """FAC Task 7 rev. 2 (2026-08-09).
+
+    Central policy closes the MCP path, but a direct call into
+    ``ChatGPTFetch.execute`` from privileged internal code could previously
+    pass ``frappe.has_permission`` (System Manager has read on restricted
+    DocTypes) and reach ``frappe.get_doc``. The restricted-target gate must
+    fire BEFORE ``has_permission`` / ``get_doc`` for every restricted DocType —
+    ``User``, ``File``, and FAC configuration DocTypes alike — and the
+    external response must not distinguish them from one another.
+    """
+
+    def _assert_restricted_refused(self, doctype, name):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.chatgpt_fetch import ChatGPTFetch
+
+        tool = ChatGPTFetch()
+        # If the gate fails, has_permission returns True (privileged) and
+        # get_doc would leak the restricted document.
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
+            return_value=True,
+        ), \
+         patch(
+             "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+             side_effect=AssertionError(
+                 f"restricted target {doctype} must not reach frappe.get_doc"
+             ),
+         ):
+            try:
+                tool.execute({"id": f"{doctype}/{name}"})
+                self.fail(
+                    f"ChatGPTFetch.execute for restricted DocType {doctype} did not raise"
+                )
+            except frappe.PermissionError:
+                # Expected: same "Permission denied" answer for every
+                # restricted target, regardless of which one was hit.
+                pass
+
+    def test_fetch_user_target_refused_directly(self):
+        self._assert_restricted_refused("User", "admin@example.com")
+
+    def test_fetch_file_target_refused_directly(self):
+        self._assert_restricted_refused("File", "FILE-LEAK")
+
+    def test_fetch_fac_tool_configuration_target_refused_directly(self):
+        self._assert_restricted_refused(
+            "FAC Tool Configuration", "get_document"
+        )
+
+    def test_fetch_fac_plugin_configuration_target_refused_directly(self):
+        self._assert_restricted_refused(
+            "FAC Plugin Configuration", "core"
+        )
+
+    def test_fetch_restricted_targets_indistinguishable(self):
+        """All restricted targets must yield the same external answer so the
+        response itself cannot be used to enumerate restricted DocTypes."""
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.chatgpt_fetch import ChatGPTFetch
+
+        tool = ChatGPTFetch()
+        messages = []
+        for doctype, name in [
+            ("User", "admin@example.com"),
+            ("File", "FILE-LEAK"),
+            ("FAC Tool Configuration", "get_document"),
+        ]:
+            with patch(
+                "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
+                return_value=True,
+            ), \
+             patch(
+                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+                 side_effect=AssertionError("must not be reached"),
+             ):
+                try:
+                    tool.execute({"id": f"{doctype}/{name}"})
+                    msg = "no-exception"
+                except frappe.PermissionError as e:
+                    msg = str(e)
+            messages.append(msg)
+        # All three must produce identical external answers.
+        self.assertEqual(messages[0], messages[1])
+        self.assertEqual(messages[1], messages[2])
+        self.assertNotEqual(messages[0], "no-exception")
+
+
 class TestDocumentToolsIntegration(BaseAssistantTest):
     """Integration tests for document tools"""
 
@@ -815,3 +1071,163 @@ class TestApplyChildTableUpdate(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertFalse(err["success"])
         self.assertEqual(err["error_type"], "child_table_handling_error")
+
+
+# ---------------------------------------------------------------------------
+# FAC v2.3 committed regression tests for fetch parity and legacy
+# security_config fail-closed behaviour.
+# ---------------------------------------------------------------------------
+
+
+class TestFacV23FetchParity(BaseAssistantTest):
+    """Missing and unreadable records yield one constant public answer, with
+    no doctype/name/doc_id in the response or in logger arguments."""
+
+    def test_restricted_targets_indistinguishable(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.chatgpt_fetch import ChatGPTFetch
+
+        tool = ChatGPTFetch()
+        msgs = []
+        for doctype, name in [
+            ("User", "admin@example.com"),
+            ("File", "FILE-001"),
+            ("FAC Tool Configuration", "get_document"),
+            ("DocType", "User"),
+        ]:
+            with patch(
+                "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
+                return_value=True,
+            ), \
+             patch(
+                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+                 side_effect=AssertionError("restricted target must not reach get_doc"),
+             ):
+                try:
+                    tool.execute({"id": f"{doctype}/{name}"})
+                    msgs.append("no-exception")
+                except frappe.PermissionError as exc:
+                    msgs.append(str(exc))
+        self.assertEqual(len(set(msgs)), 1)
+        self.assertNotEqual(msgs[0], "no-exception")
+        self.assertEqual(msgs[0], "Permission denied")
+
+    def test_missing_and_unreadable_same_message(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import chatgpt_fetch
+
+        tool = chatgpt_fetch.ChatGPTFetch()
+        # Missing: get_doc raises DoesNotExistError.
+        def raise_missing(doctype, name):
+            raise frappe.DoesNotExistError("missing")
+
+        # Unreadable: has_permission returns False at the second gate.
+        with patch.object(chatgpt_fetch.frappe, "get_doc", side_effect=raise_missing):
+            try:
+                tool.execute({"id": "Customer/CUST-MISSING"})
+                missing_msg = "no-exception"
+            except frappe.PermissionError as exc:
+                missing_msg = str(exc)
+
+        with patch.object(chatgpt_fetch.frappe, "has_permission", return_value=False):
+            try:
+                tool.execute({"id": "Customer/CUST-PRIVATE"})
+                unreadable_msg = "no-exception"
+            except frappe.PermissionError as exc:
+                unreadable_msg = str(exc)
+
+        self.assertEqual(missing_msg, unreadable_msg)
+        self.assertEqual(missing_msg, "Permission denied")
+
+    def test_secret_bearing_doc_id_absent_from_response_and_log(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import chatgpt_fetch
+
+        tool = chatgpt_fetch.ChatGPTFetch()
+        secret_doc_id = "User/secret-token-in-doc-id-hunter2"
+
+        capturing_logger = MagicMock()
+        with patch.object(chatgpt_fetch.frappe, "has_permission", return_value=True), \
+             patch.object(chatgpt_fetch.frappe, "get_doc",
+                          side_effect=AssertionError("must not be reached")), \
+             patch.object(chatgpt_fetch.frappe, "logger",
+                          return_value=capturing_logger):
+            try:
+                tool.execute({"id": secret_doc_id})
+                response = {"no": "exception"}
+            except frappe.PermissionError as exc:
+                response = {"error": str(exc)}
+
+        rendered = repr(response)
+        self.assertNotIn("hunter2", rendered)
+        self.assertNotIn("secret-token-in-doc-id", rendered)
+        for call in capturing_logger.warning.call_args_list:
+            args, kwargs = call
+            joined = " ".join(str(a) for a in args)
+            self.assertNotIn("hunter2", joined)
+            self.assertNotIn("secret-token-in-doc-id", joined)
+            self.assertNotIn("exc_info", kwargs)
+
+
+class TestFacV23LegacyFailClosed(BaseAssistantTest):
+    """FAC v2.3: legacy ``security_config.RESTRICTED_DOCTYPES`` must be
+    fail-closed on every access pattern — membership, iteration, ``.get()``,
+    truthiness, mutation, and canonical-import failure."""
+
+    def test_membership_canonical_for_every_role(self):
+        from frappe_assistant_core.core import security_config
+        from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES as canonical
+        for role in ("Assistant User", "Assistant Admin", "System Manager", "Default"):
+            legacy = security_config.RESTRICTED_DOCTYPES.get(role, [])
+            self.assertIn("User", legacy, f"role={role}")
+            self.assertIn("DocType", legacy, f"role={role}")
+            self.assertEqual(set(legacy), set(canonical))
+
+    def test_unknown_role_returns_canonical_not_empty(self):
+        from frappe_assistant_core.core import security_config
+        legacy = security_config.RESTRICTED_DOCTYPES.get("Unknown Role XYZ", [])
+        self.assertIn("User", legacy)
+
+    def test_truthiness_non_empty(self):
+        from frappe_assistant_core.core import security_config
+        legacy = security_config.RESTRICTED_DOCTYPES.get("Assistant User", [])
+        self.assertTrue(legacy)
+
+    def test_mutation_rejected(self):
+        from frappe_assistant_core.core import security_config
+        with self.assertRaises((TypeError, NotImplementedError)):
+            security_config.RESTRICTED_DOCTYPES["Assistant User"] = ["Customer"]
+
+    def test_inert_basic_core_tools_immutable(self):
+        from collections.abc import Mapping
+
+        from frappe_assistant_core.core import security_config
+        # Tuple / frozenset / MappingProxyType — all immutable.
+        self.assertIsInstance(security_config.BASIC_CORE_TOOLS, (tuple, frozenset))
+        self.assertIsInstance(security_config.ROLE_TOOL_ACCESS, (tuple, frozenset, Mapping))
+        self.assertEqual(len(security_config.BASIC_CORE_TOOLS), 0)
+        self.assertEqual(len(security_config.ROLE_TOOL_ACCESS), 0)
+
+    def test_canonical_import_failure_fails_closed(self):
+        """If canonical SecurityPolicy cannot be loaded, every membership
+        test must report "restricted" (deny-all), and iteration must raise."""
+        from frappe_assistant_core.core import security_config
+
+        original = sys.modules.get("frappe_assistant_core.core.security_policy")
+        sys.modules["frappe_assistant_core.core.security_policy"] = None
+        try:
+            legacy = security_config.RESTRICTED_DOCTYPES.get("Any Role", [])
+            # Membership test: every doctype is restricted.
+            self.assertIn("Customer", legacy)
+            self.assertIn("AnythingElse", legacy)
+            # Iteration explicitly raises (FAC v2.3).
+            with self.assertRaises(RuntimeError):
+                list(legacy)
+        finally:
+            if original is not None:
+                sys.modules["frappe_assistant_core.core.security_policy"] = original
+            else:
+                sys.modules.pop("frappe_assistant_core.core.security_policy", None)

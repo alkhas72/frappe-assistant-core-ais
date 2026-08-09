@@ -66,10 +66,11 @@ class SearchLink(BaseTool):
                 filters=arguments.get("filters", {}),
             )
 
-        except Exception as e:
-            frappe.log_error(title=_("Search Link Error"), message=f"Error searching link options: {str(e)}")
-
-            return {"success": False, "error": str(e)}
+        except Exception as exc:
+            frappe.logger("fac.search_link").warning(
+                f"search_link failed: {type(exc).__name__}"
+            )
+            return {"success": False, "error": "Link search failed"}
 
 
 # Make sure class name matches file name for discovery

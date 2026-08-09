@@ -380,7 +380,8 @@
                     <div class="fac-tool-footer">
                         <span class="fac-tool-badge">${tool.plugin_display_name}</span>
                         ${pluginDisabled ? '<span class="fac-plugin-disabled-notice"><i class="fa fa-exclamation-circle"></i> Plugin disabled</span>' : ''}
-                        ${tool.role_access_mode !== 'Allow All' ? '<span class="fac-tool-badge" style="background: var(--blue-100); color: var(--blue-600);"><i class="fa fa-lock"></i> Role restricted</span>' : ''}
+                        ${tool.role_access_mode === 'Restrict to Listed Roles' ? '<span class="fac-tool-badge" style="background: var(--blue-100); color: var(--blue-600);"><i class="fa fa-lock"></i> Role restricted</span>' : ''}
+                        ${tool.role_access_mode === 'Deny All' ? '<span class="fac-tool-badge" style="background: var(--gray-100); color: var(--gray-600);"><i class="fa fa-ban"></i> Deny All</span>' : ''}
                     </div>
 
                     <!-- Configuration Panel -->
@@ -389,7 +390,7 @@
                             <div class="fac-config-group">
                                 <label class="fac-config-label">Role Access Mode</label>
                                 <select class="fac-config-select fac-role-mode-select" data-tool="${tool.name}">
-                                    <option value="Allow All" ${tool.role_access_mode === 'Allow All' ? 'selected' : ''}>Allow All Users</option>
+                                    <option value="Deny All" ${tool.role_access_mode === 'Deny All' ? 'selected' : ''}>Deny All</option>
                                     <option value="Restrict to Listed Roles" ${tool.role_access_mode === 'Restrict to Listed Roles' ? 'selected' : ''}>Restrict to Listed Roles</option>
                                 </select>
                             </div>
@@ -606,6 +607,16 @@
         const category = panel.find('.fac-category-select').val();
         const roles = tool.role_access || [];
 
+        // Client-side guard mirroring the API contract: restricted mode
+        // requires at least one role; 'Allow All' is not a valid mode.
+        if (roleAccessMode === 'Restrict to Listed Roles' && roles.length === 0) {
+            frappe.show_alert({
+                message: "Add at least one role for 'Restrict to Listed Roles' mode",
+                indicator: 'orange'
+            });
+            return;
+        }
+
         // Show saving state
         const saveBtn = panel.find('.fac-config-save');
         saveBtn.prop('disabled', true).html('<i class="fa fa-spinner fa-spin"></i> Saving...');
@@ -760,6 +771,18 @@
             },
             callback: function(response) {
                 if (response.message && response.message.success) {
+                    if (response.message.requires_configuration) {
+                        // Fresh config was created disabled/'Deny All': the
+                        // tool stays off until roles are configured and it is
+                        // enabled separately.
+                        checkbox.prop('checked', false);
+                        frappe.show_alert({
+                            message: response.message.message,
+                            indicator: 'orange'
+                        });
+                        ns.loadToolsView();
+                        return;
+                    }
                     frappe.show_alert({
                         message: response.message.message,
                         indicator: enabled ? 'green' : 'orange'

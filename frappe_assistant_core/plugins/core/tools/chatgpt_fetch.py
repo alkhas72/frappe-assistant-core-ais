@@ -77,9 +77,9 @@ class ChatGPTFetch(BaseTool):
             - url: URL for citation
             - metadata: Additional document metadata
         """
-        from frappe_assistant_core.core.security_config import (
-            filter_sensitive_fields,
-            validate_document_access,
+        from frappe_assistant_core.core.security_policy import (
+            SecurityPolicy,
+            ToolContext,
         )
 
         try:
@@ -94,20 +94,46 @@ class ChatGPTFetch(BaseTool):
 
             doctype, name = doc_id.split("/", 1)
 
-            # Layered permission check: role-based doctype gating + Frappe perms.
-            # Mirrors the get_document tool so the ChatGPT fetch path doesn't
-            # bypass FAC's standard auth pipeline.
-            validation_result = validate_document_access(
-                user=frappe.session.user, doctype=doctype, name=name, perm_type="read"
-            )
-            if not validation_result["success"]:
-                raise frappe.PermissionError(
-                    validation_result.get("error", f"Access denied for {doctype} {name}")
-                )
+            # FAC v2.2: stable, indistinguishable refusal message. The same
+            # constant string is used for restricted DocTypes and for
+            # unreadable business records — the message carries no doctype
+            # or name so it cannot be used to enumerate targets. (Direct
+            # Python callers receive this as ``frappe.PermissionError``;
+            # the MCP path sees the central-policy denial.)
+            _REFUSAL = "Permission denied"
 
-            user_role = validation_result["role"]
+            # FAC Task 7 (rev. 2): restricted-target gate MUST run before
+            # ``frappe.has_permission`` and ``frappe.get_doc``. The central
+            # policy closes the MCP path, but a direct call into
+            # ``ChatGPTFetch.execute`` from a privileged internal caller could
+            # otherwise pass ``has_permission`` (System Manager has read on
+            # restricted DocTypes) and reach ``get_doc``.
+            if SecurityPolicy._is_restricted_target(doctype):
+                raise frappe.PermissionError(_REFUSAL)
+
+            # Native Frappe row-level read permission. The central policy in
+            # ``BaseTool._safe_execute`` already authorized the tool call
+            # (restricted DocType, hard-deny set, role config, DocType-level
+            # permission); this is the row-level second lock. There is no
+            # System Manager bypass — the legacy ``validate_document_access``
+            # shim granted one and is no longer consulted here.
+            if not frappe.has_permission(doctype, "read", doc=name):
+                raise frappe.PermissionError(_REFUSAL)
+
             doc = frappe.get_doc(doctype, name)
-            doc_dict = filter_sensitive_fields(doc.as_dict(), doctype, user_role)
+            # Central redaction removes universal sensitive keys (password,
+            # token, ...) and DocType-specific sensitive/admin fields. Applied
+            # locally here because ``_format_document_as_text`` serializes the
+            # dict to a JSON string, which the central sink in
+            # ``_safe_execute`` treats as opaque. The sink still runs after as
+            # defence in depth. No role bypasses redaction.
+            read_context = ToolContext(
+                operation="read",
+                target_doctype=doctype,
+                target_name=name,
+                required_permissions=frozenset({"read"}),
+            )
+            doc_dict = SecurityPolicy.redact_output(read_context, doc.as_dict())
 
             # Create title from name field or document name
             title = doc_dict.get("title") or doc_dict.get("name") or name
@@ -130,14 +156,34 @@ class ChatGPTFetch(BaseTool):
             return {"id": doc_id, "title": title, "text": text_content, "url": url, "metadata": metadata}
 
         except frappe.DoesNotExistError:
-            error_msg = f"Document not found: {doc_id}"
-            frappe.log_error(title=_("ChatGPT Fetch Error"), message=error_msg)
-            raise ValueError(error_msg) from None
+            # FAC v2.3: missing record is INDISTINGUISHABLE from unreadable
+            # record. Both raise the same constant ``PermissionError`` with
+            # no doctype/name/doc_id in the message or in the log. The
+            # underlying exception text never reaches the public surface; the
+            # log keeps one safe record (constant tag + type only).
+            try:
+                frappe.logger("fac.chatgpt_fetch").warning(
+                    "fetch refused: DoesNotExistError"
+                )
+            except Exception:
+                pass
+            raise frappe.PermissionError("Permission denied") from None
 
         except frappe.PermissionError as e:
-            error_msg = f"Permission denied: {str(e)}"
-            frappe.log_error(title=_("ChatGPT Fetch Permission Error"), message=error_msg)
-            raise ValueError(error_msg) from e
+            # Do NOT echo the underlying exception text — it may include the
+            # sensitive value that triggered the permission failure. The
+            # sanitized audit row in ``_safe_execute`` retains the stable
+            # reason; we propagate a clean ``PermissionError`` with the SAME
+            # constant message as the gates above so a downstream caller
+            # cannot distinguish restricted-target from unreadable-record OR
+            # from a missing record by inspecting the exception text.
+            try:
+                frappe.logger("fac.chatgpt_fetch").warning(
+                    f"fetch refused: {type(e).__name__}"
+                )
+            except Exception:
+                pass
+            raise frappe.PermissionError("Permission denied") from e
 
         except ValueError:
             # Input validation errors raised above ("Document ID is required",

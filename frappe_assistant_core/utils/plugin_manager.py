@@ -178,11 +178,14 @@ class PluginPersistence:
         """Load enabled plugin names from database.
 
         Uses FAC Plugin Configuration DocType for atomic reads.
-        Falls back to legacy JSON field if DocType doesn't exist yet.
+        Fail closed: a missing table or any read error means no plugin is
+        enabled. Only the controlled sync in migration_hooks creates the
+        ``core`` record with ``enabled=1``.
         """
         try:
             # Check if the new DocType table exists
-            if frappe.db.table_exists("tabFAC Plugin Configuration"):
+            # (table_exists expects the DocType name; it adds the `tab` prefix itself)
+            if frappe.db.table_exists("FAC Plugin Configuration"):
                 # Use the new DocType-based approach (atomic, no JSON parsing)
                 enabled = frappe.get_all(
                     PluginConfig.PLUGIN_CONFIG_DOCTYPE,
@@ -190,17 +193,16 @@ class PluginPersistence:
                     pluck="plugin_name",
                 )
                 return set(enabled)
-            else:
-                # Fallback to legacy JSON field during migration
-                return self._load_from_legacy_json()
+
+            # No configuration table -> deny by default, nothing enabled
+            self.logger.warning(
+                "FAC Plugin Configuration table not found; treating all plugins as disabled"
+            )
+            return set()
 
         except Exception as e:
-            self.logger.error(f"Failed to load enabled plugins: {e}")
-            # Fallback to legacy on error
-            try:
-                return self._load_from_legacy_json()
-            except Exception:
-                return set()
+            self.logger.error(f"Failed to load enabled plugins, failing closed: {e}")
+            return set()
 
     def _load_from_legacy_json(self) -> Set[str]:
         """Load from legacy JSON field in Assistant Core Settings."""

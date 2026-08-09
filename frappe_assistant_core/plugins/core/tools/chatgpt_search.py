@@ -107,7 +107,15 @@ class ChatGPTSearch(BaseTool):
             return {"results": results}
 
         except Exception as e:
-            frappe.log_error(title=_("ChatGPT Search Error"), message=f"Error in ChatGPT search: {str(e)}")
+            # FAC v2.2: safe logging — tag + exception type only. Never log
+            # ``str(e)``: it may carry query text, document values, or other
+            # sensitive payloads from the underlying search.
+            try:
+                frappe.logger("fac.chatgpt_search").warning(
+                    f"chatgpt_search failed: {type(e).__name__}"
+                )
+            except Exception:
+                pass
 
             # Return empty results on error for ChatGPT compatibility
             return {"results": []}

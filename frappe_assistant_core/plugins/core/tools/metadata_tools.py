@@ -14,11 +14,21 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import frappe
 from frappe import _
 
+
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.metadata_tools").warning(tag)
+        else:
+            frappe.logger("fac.metadata_tools").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
 
 class MetadataTools:
     """assistant tools for Frappe metadata operations"""
@@ -89,41 +99,107 @@ class MetadataTools:
             raise Exception(f"Unknown metadata tool: {tool_name}")
 
     @staticmethod
-    def _serialize_field(field) -> Dict[str, Any]:
-        """Serialize a DocField row into the shape returned by get_doctype_metadata."""
-        return {
-            "fieldname": field.fieldname,
+    def _serialize_field(field, doctype: Optional[str] = None) -> Dict[str, Any]:
+        """Serialize a DocField row into the shape returned by get_doctype_metadata.
+
+        FAC v2.2: ``default`` is dropped when the field itself is a
+        sensitive/admin field name. The central redactor inspects mapping keys
+        (it sees ``"default"``, not the original ``fieldname``), so a sensitive
+        default value (e.g. ``password="hunter2"`` on a Custom Field, or
+        ``auth_method="Bearer xxx"`` on ``Email Account``) would otherwise
+        leak straight through the sink.
+
+        Sensitive-field check now uses the REAL parent/child DocType (via the
+        ``doctype`` argument) instead of ``None``. The previous ``None`` could
+        miss target-specific fields: ``Email Account.auth_method`` /
+        ``Email Account.connected_user`` are sensitive specifically for
+        ``Email Account`` and were not caught.
+        """
+        from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES, SecurityPolicy
+
+        fieldname = field.fieldname
+        # Drop ``default`` for sensitive/admin field names so the value cannot
+        # leak via the ``default`` key. The DocType context is mandatory:
+        # without it target-specific fields (Email Account.auth_method, etc.)
+        # are missed.
+        include_default = True
+        try:
+            if SecurityPolicy._contains_restricted_fields(
+                doctype, frozenset({fieldname})
+            ):
+                include_default = False
+        except Exception:
+            include_default = False
+
+        entry = {
+            "fieldname": fieldname,
             "label": field.label,
             "fieldtype": field.fieldtype,
             "options": field.options,
             "reqd": field.reqd,
             "read_only": field.read_only,
             "hidden": field.hidden,
-            "default": field.default,
             "description": field.description,
         }
+        if include_default:
+            entry["default"] = field.default
+        return entry
 
     @staticmethod
     def get_doctype_metadata(doctype: str) -> Dict[str, Any]:
-        """Get DocType metadata and field information"""
+        """Get DocType metadata and field information.
+
+        Restricted DocTypes (parent target) are rejected by the central policy
+        before this helper runs — but defensively we re-check here too so a
+        direct call from a non-MCP code path cannot leak schema. Direct
+        requests for a child DocType (``istable == 1``) are also refused: per
+        the design spec child rows are only ever surfaced inside an allowed
+        parent document. The nested structure of an *allowed parent's*
+        non-restricted child tables IS shown — only the ratified restricted
+        child types (``DocPerm``, ``DocShare``, ``Custom Field``, ...) have
+        their schema hidden (FAC Task 7 rev. 2, 2026-08-09).
+
+        The ``permissions`` list (role→perm matrix) is intentionally NOT
+        returned: it used to disclose role names and their permission bits to
+        any caller with read on the DocType, which is a privilege-escalation
+        primitive.
+        """
+        from frappe_assistant_core.core.security_policy import (
+            RESTRICTED_DOCTYPES,
+            SecurityPolicy,
+        )
+
         try:
             if not frappe.db.exists("DocType", doctype):
                 return {"success": False, "error": f"DocType '{doctype}' not found"}
+
+            # Defensive restricted-target gate. ``_is_restricted_target``
+            # covers both the ratified RESTRICTED_DOCTYPES baseline and
+            # ``meta.istable == 1`` (direct child DocType requests are not
+            # allowed — child rows surface only inside an allowed parent).
+            if SecurityPolicy._is_restricted_target(doctype):
+                return {"success": False, "error": f"DocType '{doctype}' is restricted"}
 
             if not frappe.has_permission(doctype, "read"):
                 return {"success": False, "error": f"No permission to access DocType '{doctype}'"}
 
             meta = frappe.get_meta(doctype)
 
-            fields = [MetadataTools._serialize_field(field) for field in meta.fields]
+            fields = [MetadataTools._serialize_field(field, doctype) for field in meta.fields]
 
             link_fields = [
                 {"fieldname": field.fieldname, "label": field.label, "options": field.options}
                 for field in meta.get_link_fields()
             ]
 
-            # Child tables: include the child DocType's own field metadata so the
-            # caller can build nested row objects without a second tool call (#192).
+            # Child tables: include the child DocType's own field metadata so
+            # the caller can build nested row objects without a second tool
+            # call (#192). Two scoping rules:
+            #   * Only the RATIFIED RESTRICTED_DOCTYPES set hides its schema
+            #     (NOT every istable DocType — otherwise every child schema
+            #     would be empty, breaking #192's contract).
+            #   * Sensitive fields inside an otherwise-readable child are
+            #     still stripped by ``_serialize_field``.
             child_tables = []
             for table_field in meta.get_table_fields():
                 child_doctype = table_field.options
@@ -135,9 +211,21 @@ class MetadataTools:
                     "reqd": table_field.reqd,
                     "fields": [],
                 }
-                if child_doctype and frappe.db.exists("DocType", child_doctype):
+                if (
+                    child_doctype
+                    and child_doctype not in RESTRICTED_DOCTYPES
+                    and frappe.db.exists("DocType", child_doctype)
+                ):
                     child_meta = frappe.get_meta(child_doctype)
-                    child_entry["fields"] = [MetadataTools._serialize_field(f) for f in child_meta.fields]
+                    child_entry["fields"] = [
+                        MetadataTools._serialize_field(f, child_doctype) for f in child_meta.fields
+                    ]
+                else:
+                    # Restricted child: keep the structural pointer so the
+                    # caller knows a child row exists, but do NOT serialise
+                    # the restricted child's own field schema.
+                    child_entry["fields"] = []
+                    child_entry["restricted"] = True
                 child_tables.append(child_entry)
 
             return {
@@ -153,12 +241,14 @@ class MetadataTools:
                 "fields": fields,
                 "link_fields": link_fields,
                 "child_tables": child_tables,
-                "permissions": [p.as_dict() for p in meta.permissions],
+                # NOTE: ``permissions`` (role→perm matrix) intentionally omitted.
+                # It used to disclose role names and permission bits to any
+                # reader of the DocType — a privilege-escalation primitive.
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Get DocType Metadata Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            _log_safe("get doctype metadata failed")
+            return {"success": False, "error": "Get DocType Metadata failed"}
 
     @staticmethod
     def list_doctypes(module: str = None, custom_only: bool = False) -> Dict[str, Any]:
@@ -190,9 +280,9 @@ class MetadataTools:
                 "filters_applied": {"module": module, "custom_only": custom_only},
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant List DocTypes Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            _log_safe("list doctypes failed")
+            return {"success": False, "error": "List DocTypes failed"}
 
     @staticmethod
     def get_permissions(doctype: str, user: str = None) -> Dict[str, Any]:
@@ -231,9 +321,9 @@ class MetadataTools:
                 "permission_rules": permission_rules,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Get Permissions Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            _log_safe("get permissions failed")
+            return {"success": False, "error": "Get Permissions failed"}
 
     @staticmethod
     def get_workflow(doctype: str) -> Dict[str, Any]:
@@ -291,6 +381,6 @@ class MetadataTools:
                 "transitions": transitions,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Get Workflow Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            _log_safe("get workflow failed")
+            return {"success": False, "error": "Get Workflow failed"}
