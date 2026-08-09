@@ -111,9 +111,7 @@ class ChatGPTSearch(BaseTool):
             # ``str(e)``: it may carry query text, document values, or other
             # sensitive payloads from the underlying search.
             try:
-                frappe.logger("fac.chatgpt_search").warning(
-                    f"chatgpt_search failed: {type(e).__name__}"
-                )
+                frappe.logger("fac.chatgpt_search").warning(f"chatgpt_search failed: {type(e).__name__}")
             except Exception:
                 pass
 

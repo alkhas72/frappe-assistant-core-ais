@@ -26,6 +26,7 @@ import frappe
 from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.tests.legacy_tool_test_support import legacy_tool_registry_access
 
 
 class TestReportTools(BaseAssistantTest):
@@ -37,14 +38,14 @@ class TestReportTools(BaseAssistantTest):
 
     def test_get_tools_structure(self):
         """Test that report tools are properly registered"""
-        tools = self.registry.get_available_tools()
-        tool_names = [tool["name"] for tool in tools]
+        with legacy_tool_registry_access(["generate_report"]):
+            tools = self.registry.get_available_tools()
+            tool_names = [tool["name"] for tool in tools]
 
-        # Check for core report tools
-        expected_tools = ["generate_report", "get_report_data"]
-        found_tools = [tool for tool in expected_tools if tool in tool_names]
+            expected_tools = ["generate_report", "get_report_data"]
+            found_tools = [tool for tool in expected_tools if tool in tool_names]
 
-        self.assertGreater(len(found_tools), 0, f"Should find report tools. Available: {tool_names}")
+            self.assertGreater(len(found_tools), 0, f"Should find report tools. Available: {tool_names}")
 
     def test_execute_tool_routing(self):
         """Test that tool routing works correctly"""
@@ -153,12 +154,8 @@ class TestReportTools(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools import report_tools
 
         with ExitStack() as stack:
-            stack.enter_context(
-                patch.object(report_tools.frappe.db, "exists", return_value=True)
-            )
-            stack.enter_context(
-                patch.object(report_tools.frappe, "has_permission", return_value=True)
-            )
+            stack.enter_context(patch.object(report_tools.frappe.db, "exists", return_value=True))
+            stack.enter_context(patch.object(report_tools.frappe, "has_permission", return_value=True))
             get_list = stack.enter_context(patch.object(report_tools.frappe, "get_list"))
             # ``list_reports`` now also reads ``ref_doctype`` so it can filter
             # restricted-target reports.
@@ -226,15 +223,13 @@ class TestReportTools(BaseAssistantTest):
         report_doc.report_type = "Query Report"
         report_doc.disabled = 0
 
-        with patch.object(report_tools.frappe, "has_permission", return_value=True), \
-             patch("frappe.desk.query_report.get_report_doc", return_value=report_doc), \
-             patch(
-                 "frappe.desk.query_report.run",
-                 side_effect=AssertionError("restricted-target report must not execute"),
-             ) as run:
-            result = report_tools.ReportTools.execute_report(
-                report_name="User Report", filters={}
-            )
+        with patch.object(report_tools.frappe, "has_permission", return_value=True), patch(
+            "frappe.desk.query_report.get_report_doc", return_value=report_doc
+        ), patch(
+            "frappe.desk.query_report.run",
+            side_effect=AssertionError("restricted-target report must not execute"),
+        ) as run:
+            result = report_tools.ReportTools.execute_report(report_name="User Report", filters={})
 
         self.assertFalse(result.get("success"), result)
         self.assertEqual(result.get("error"), "Report not available")
@@ -253,8 +248,9 @@ class TestReportTools(BaseAssistantTest):
         report_doc.report_type = "Query Report"
         report_doc.disabled = 0
 
-        with patch.object(report_tools.frappe, "has_permission", return_value=True), \
-             patch("frappe.desk.query_report.get_report_doc", return_value=report_doc):
+        with patch.object(report_tools.frappe, "has_permission", return_value=True), patch(
+            "frappe.desk.query_report.get_report_doc", return_value=report_doc
+        ):
             result = report_tools.ReportTools.get_report_columns(report_name="File Report")
 
         self.assertFalse(result.get("success"), result)
@@ -279,12 +275,10 @@ class TestReportTools(BaseAssistantTest):
         def missing_get_report_doc(name):
             raise frappe.DoesNotExistError("missing")
 
-        with patch("frappe.desk.query_report.get_report_doc",
-                   side_effect=hidden_get_report_doc):
+        with patch("frappe.desk.query_report.get_report_doc", side_effect=hidden_get_report_doc):
             hidden = report_tools.ReportTools.execute_report("Hidden", {})
 
-        with patch("frappe.desk.query_report.get_report_doc",
-                   side_effect=missing_get_report_doc):
+        with patch("frappe.desk.query_report.get_report_doc", side_effect=missing_get_report_doc):
             missing = report_tools.ReportTools.execute_report("Truly Missing", {})
 
         self.assertFalse(hidden.get("success"))
@@ -310,10 +304,11 @@ class TestReportTools(BaseAssistantTest):
         def boom(**kw):
             raise RuntimeError(sensitive_message)
 
-        with patch.object(report_tools.frappe, "has_permission", return_value=True), \
-             patch("frappe.desk.query_report.get_report_doc", return_value=report_doc), \
-             patch.object(report_tools.frappe, "logger"), \
-             patch("frappe.desk.query_report.run", side_effect=boom):
+        with patch.object(report_tools.frappe, "has_permission", return_value=True), patch(
+            "frappe.desk.query_report.get_report_doc", return_value=report_doc
+        ), patch.object(report_tools.frappe, "logger"), patch(
+            "frappe.desk.query_report.run", side_effect=boom
+        ):
             result = report_tools.ReportTools.execute_report("Sensitive Report", {})
 
         self.assertFalse(result.get("success"))
@@ -507,9 +502,9 @@ class TestFacV23ReportAuthorization(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools import report_tools
 
         rd = self._report_doc(ref_doctype="User")  # restricted
-        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), \
-             patch("frappe.desk.query_report.run",
-                   side_effect=AssertionError("must not execute")) as run:
+        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), patch(
+            "frappe.desk.query_report.run", side_effect=AssertionError("must not execute")
+        ) as run:
             result = report_tools.ReportTools.execute_report("R", {})
         self.assertFalse(result["success"])
         self.assertEqual(result["error"], "Report not available")
@@ -521,8 +516,7 @@ class TestFacV23PreparedBindingOrder(BaseAssistantTest):
     polling paths. ``get_prepared_report_result`` MUST NOT be called when
     owner or report_name does not match."""
 
-    def _setup_prepared(self, owner_mismatch=True, report_mismatch=False,
-                        status="Completed"):
+    def _setup_prepared(self, owner_mismatch=True, report_mismatch=False, status="Completed"):
         from unittest.mock import MagicMock
 
         from frappe_assistant_core.plugins.core.tools import report_tools
@@ -552,17 +546,13 @@ class TestFacV23PreparedBindingOrder(BaseAssistantTest):
 
         rd, prepared_doc = self._setup_prepared(owner_mismatch=True)
 
-        with patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc), \
-             patch(
-                 "frappe.core.doctype.prepared_report.prepared_report.get_completed_prepared_report",
-                 return_value="PR-001",
-             ), \
-             patch(
-                 "frappe.desk.query_report.get_prepared_report_result",
-                 side_effect=AssertionError(
-                     "get_prepared_report_result must NOT be called on owner mismatch"
-                 ),
-             ) as retrieval:
+        with patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc), patch(
+            "frappe.core.doctype.prepared_report.prepared_report.get_completed_prepared_report",
+            return_value="PR-001",
+        ), patch(
+            "frappe.desk.query_report.get_prepared_report_result",
+            side_effect=AssertionError("get_prepared_report_result must NOT be called on owner mismatch"),
+        ) as retrieval:
             result = report_tools.ReportTools._handle_prepared_report_execution(rd, {})
 
         self.assertFalse(result.get("success"))
@@ -588,16 +578,10 @@ class TestFacV23PreparedBindingOrder(BaseAssistantTest):
             return_value={"name": "PR-POLL"},
         ), patch(
             "frappe.desk.query_report.get_prepared_report_result",
-            side_effect=AssertionError(
-                "get_prepared_report_result must NOT be called on report mismatch"
-            ),
-        ) as retrieval, patch.object(
-            report_tools.frappe, "get_value", return_value=60
-        ), patch.object(
+            side_effect=AssertionError("get_prepared_report_result must NOT be called on report mismatch"),
+        ) as retrieval, patch.object(report_tools.frappe, "get_value", return_value=60), patch.object(
             report_tools.frappe, "get_doc", return_value=prepared_doc
-        ), patch(
-            "time.sleep", return_value=None
-        ):
+        ), patch("time.sleep", return_value=None):
             result = report_tools.ReportTools._handle_prepared_report_execution(rd, {})
 
         self.assertFalse(result.get("success"))
@@ -627,13 +611,14 @@ class TestFacV23PreparedBindingOrder(BaseAssistantTest):
             modified="2026-08-09",
         )
 
-        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), \
-             patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc):
+        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), patch.object(
+            report_tools.frappe, "get_doc", return_value=prepared_doc
+        ):
             # Force cached-path entry; prepared_report True routes through
             # the prepared handler.
             from frappe.core.doctype.prepared_report import prepared_report as pr_module
-            with patch.object(pr_module, "get_completed_prepared_report",
-                              return_value="PR-001"):
+
+            with patch.object(pr_module, "get_completed_prepared_report", return_value="PR-001"):
                 result = report_tools.ReportTools.execute_report("Allowed", {})
 
         self.assertFalse(result.get("success"))
@@ -667,16 +652,14 @@ class TestFacV23SingleSafeLogOnPreparedFailure(BaseAssistantTest):
 
         secret = "password='hunter2' in traceback"
         capturing_logger = MagicMock()
-        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), \
-             patch("frappe.desk.query_report.get_prepared_report_result",
-                   side_effect=RuntimeError(secret)), \
-             patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc), \
-             patch.object(report_tools.frappe, "has_permission", return_value=True), \
-             patch.object(report_tools.frappe, "logger",
-                          return_value=capturing_logger):
+        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), patch(
+            "frappe.desk.query_report.get_prepared_report_result", side_effect=RuntimeError(secret)
+        ), patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc), patch.object(
+            report_tools.frappe, "has_permission", return_value=True
+        ), patch.object(report_tools.frappe, "logger", return_value=capturing_logger):
             from frappe.core.doctype.prepared_report import prepared_report as pr_module
-            with patch.object(pr_module, "get_completed_prepared_report",
-                              return_value="PR-001"):
+
+            with patch.object(pr_module, "get_completed_prepared_report", return_value="PR-001"):
                 result = report_tools.ReportTools.execute_report("Allowed", {})
 
         self.assertFalse(result.get("success"))
@@ -694,6 +677,7 @@ class TestFacV23ColumnDescriptors(BaseAssistantTest):
 
     def _redact(self, columns, ref_doctype="Customer"):
         from frappe_assistant_core.plugins.core.tools.report_tools import ReportTools
+
         debug = {"data": [["x"]], "columns": columns}
         return ReportTools._redact_report_output(debug, ref_doctype)
 
@@ -730,6 +714,7 @@ class TestFacV23NestedPositionalDoctype(BaseAssistantTest):
 
     def test_list_cell_with_nested_doctype_stripped(self):
         from frappe_assistant_core.plugins.core.tools.report_tools import ReportTools
+
         debug = {
             "data": [
                 [
@@ -750,6 +735,7 @@ class TestFacV23NestedPositionalDoctype(BaseAssistantTest):
 
     def test_tuple_cell_with_nested_doctype_stripped(self):
         from frappe_assistant_core.plugins.core.tools.report_tools import ReportTools
+
         debug = {
             "data": [
                 (

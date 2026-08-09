@@ -30,6 +30,7 @@ def _log_safe(tag: str, exc=None) -> None:
     except Exception:
         pass
 
+
 class MetadataTools:
     """assistant tools for Frappe metadata operations"""
 
@@ -124,9 +125,7 @@ class MetadataTools:
         # are missed.
         include_default = True
         try:
-            if SecurityPolicy._contains_restricted_fields(
-                doctype, frozenset({fieldname})
-            ):
+            if SecurityPolicy._contains_restricted_fields(doctype, frozenset({fieldname})):
                 include_default = False
         except Exception:
             include_default = False

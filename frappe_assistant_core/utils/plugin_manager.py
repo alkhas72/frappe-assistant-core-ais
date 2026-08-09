@@ -195,9 +195,7 @@ class PluginPersistence:
                 return set(enabled)
 
             # No configuration table -> deny by default, nothing enabled
-            self.logger.warning(
-                "FAC Plugin Configuration table not found; treating all plugins as disabled"
-            )
+            self.logger.warning("FAC Plugin Configuration table not found; treating all plugins as disabled")
             return set()
 
         except Exception as e:

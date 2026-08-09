@@ -44,7 +44,7 @@ def tearDownModule():
             )
     finally:
         _restore_security_rows(_module_security_snapshot)
-        frappe.db.commit()
+        frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist module execution-policy restore
 
 
 class _DummyTool:
@@ -99,9 +99,7 @@ class TestPolicyDrivenRegistry(BaseAssistantTest):
                     return_value=manager,
                 )
             )
-            stack.enter_context(
-                patch.object(registry, "_get_external_tools", return_value={})
-            )
+            stack.enter_context(patch.object(registry, "_get_external_tools", return_value={}))
             stack.enter_context(
                 patch.object(
                     registry,
@@ -116,9 +114,7 @@ class TestPolicyDrivenRegistry(BaseAssistantTest):
                     side_effect=AssertionError("legacy permission path called"),
                 )
             )
-            authorize = stack.enter_context(
-                patch.object(SecurityPolicy, "authorize", side_effect=decide)
-            )
+            authorize = stack.enter_context(patch.object(SecurityPolicy, "authorize", side_effect=decide))
             published = registry.get_available_tools(user="actor@example.com")
 
         self.assertEqual(published, [{"name": "allowed"}])
@@ -146,23 +142,17 @@ class TestPolicyDrivenRegistry(BaseAssistantTest):
                     side_effect=AssertionError("legacy permission path called"),
                 )
             )
-            result = registry.execute_tool(
-                "get_document", {"doctype": "ToDo", "name": "TD-1"}
-            )
+            result = registry.execute_tool("get_document", {"doctype": "ToDo", "name": "TD-1"})
 
         self.assertEqual(result, {"ok": True})
-        tool._safe_execute.assert_called_once_with(
-            {"doctype": "ToDo", "name": "TD-1"}
-        )
+        tool._safe_execute.assert_called_once_with({"doctype": "ToDo", "name": "TD-1"})
 
     def test_unknown_tool_is_audited_and_raises_policy_denied(self):
         registry = ToolRegistry()
         with ExitStack() as stack:
             stack.enter_context(patch.object(registry, "get_tool", return_value=None))
             audit = stack.enter_context(
-                patch(
-                    "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-                )
+                patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt")
             )
             with self.assertRaises(PolicyDenied) as raised:
                 registry.execute_tool("unknown-tool", {"token": "never-log"})
@@ -173,9 +163,7 @@ class TestPolicyDrivenRegistry(BaseAssistantTest):
 
     def test_non_string_tool_name_is_audited_and_raises_policy_denied(self):
         registry = ToolRegistry()
-        with patch(
-            "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-        ) as audit:
+        with patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt") as audit:
             with self.assertRaises(PolicyDenied) as raised:
                 registry.execute_tool(["not", "a", "name"], {})
 
@@ -238,7 +226,7 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
             _restore_security_rows(self._fac_security_snapshot)
             restored = _snapshot_security_rows()
             self.assertEqual(restored, self._fac_security_snapshot)
-            frappe.db.commit()
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist per-test policy restore before cache refresh
             self.plugin_manager.refresh_plugins()
             self.registry.clear_cache()
         finally:
@@ -303,13 +291,9 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
         server = MCPServer("task4-toctou")
         with ExitStack() as stack:
             body = stack.enter_context(patch.object(tool, "execute"))
-            execution_audit = stack.enter_context(
-                patch.object(BaseTool, "log_execution")
-            )
+            execution_audit = stack.enter_context(patch.object(BaseTool, "log_execution"))
             boundary_audit = stack.enter_context(
-                patch(
-                    "frappe_assistant_core.mcp.server.audit_unavailable_tool_call"
-                )
+                patch("frappe_assistant_core.mcp.server.audit_unavailable_tool_call")
             )
             result = server._handle_tools_call(
                 {
@@ -349,13 +333,9 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
                 )
             )
             unknown_audit = stack.enter_context(
-                patch(
-                    "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-                )
+                patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt")
             )
-            execution_audit = stack.enter_context(
-                patch.object(BaseTool, "log_execution")
-            )
+            execution_audit = stack.enter_context(patch.object(BaseTool, "log_execution"))
             with self.assertRaises(PolicyDenied) as raised:
                 self.registry.execute_tool(
                     self.tool_name,
@@ -409,9 +389,9 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
         role_name = "FAC Integration Policy Role"
         self.assertFalse(frappe.db.exists("User", actor))
         self.assertFalse(frappe.db.exists("Role", role_name))
-        frappe.get_doc(
-            {"doctype": "Role", "role_name": role_name, "disabled": 0}
-        ).insert(ignore_permissions=True)
+        frappe.get_doc({"doctype": "Role", "role_name": role_name, "disabled": 0}).insert(
+            ignore_permissions=True
+        )
         frappe.get_doc(
             {
                 "doctype": "User",
@@ -449,9 +429,7 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
                     arguments=None,
                     phase="publish",
                 )
-                administrator_tools = self.registry.get_available_tools(
-                    user="Administrator"
-                )
+                administrator_tools = self.registry.get_available_tools(user="Administrator")
                 assigned_actor_tools = self.registry.get_available_tools(user=actor)
                 administrator_execute = SecurityPolicy.authorize(
                     actor="Administrator",
@@ -475,12 +453,8 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
 
             self.assertFalse(administrator_publish.allowed)
             self.assertEqual(administrator_publish.reason_code, "ROLE_NOT_ALLOWED")
-            self.assertNotIn(
-                self.tool_name, {tool["name"] for tool in administrator_tools}
-            )
-            self.assertIn(
-                self.tool_name, {tool["name"] for tool in assigned_actor_tools}
-            )
+            self.assertNotIn(self.tool_name, {tool["name"] for tool in administrator_tools})
+            self.assertIn(self.tool_name, {tool["name"] for tool in assigned_actor_tools})
             self.assertFalse(administrator_execute.allowed)
             self.assertEqual(administrator_execute.reason_code, "ROLE_NOT_ALLOWED")
             self.assertTrue(assigned_actor.allowed)
@@ -496,9 +470,9 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
         role_name = "FAC Task Disabled Role"
         self.assertFalse(frappe.db.exists("User", actor))
         self.assertFalse(frappe.db.exists("Role", role_name))
-        frappe.get_doc(
-            {"doctype": "Role", "role_name": role_name, "disabled": 0}
-        ).insert(ignore_permissions=True)
+        frappe.get_doc({"doctype": "Role", "role_name": role_name, "disabled": 0}).insert(
+            ignore_permissions=True
+        )
         frappe.get_doc(
             {
                 "doctype": "User",

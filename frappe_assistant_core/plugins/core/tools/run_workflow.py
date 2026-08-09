@@ -37,6 +37,7 @@ def _log_safe(tag: str, exc=None) -> None:
     except Exception:
         pass
 
+
 class RunWorkflow(BaseTool):
     """
     Comprehensive workflow tool that properly leverages Frappe's workflow system.

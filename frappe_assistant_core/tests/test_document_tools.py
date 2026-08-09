@@ -30,6 +30,7 @@ import frappe
 from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.tests.legacy_tool_test_support import legacy_tool_registry_access
 
 
 class TestDocumentTools(BaseAssistantTest):
@@ -42,97 +43,114 @@ class TestDocumentTools(BaseAssistantTest):
 
     def test_get_tools_structure(self):
         """Test that document tools are properly registered"""
-        tools = self.registry.get_available_tools()
-        tool_names = [tool["name"] for tool in tools]
-
-        # Check for core document tools
-        expected_tools = [
+        document_tools = [
             "create_document",
             "get_document",
             "update_document",
             "list_documents",
-            "delete_document",
         ]
-        found_tools = [tool for tool in expected_tools if tool in tool_names]
+        with legacy_tool_registry_access(document_tools):
+            tools = self.registry.get_available_tools()
+            tool_names = [tool["name"] for tool in tools]
 
-        self.assertGreater(len(found_tools), 0, f"Should find document tools. Available: {tool_names}")
+            expected_tools = [
+                "create_document",
+                "get_document",
+                "update_document",
+                "list_documents",
+                "delete_document",
+            ]
+            found_tools = [tool for tool in expected_tools if tool in tool_names]
+
+            self.assertGreater(len(found_tools), 0, f"Should find document tools. Available: {tool_names}")
 
     def test_create_document_basic(self):
         """Test basic document creation"""
-        if not self.registry.has_tool("create_document"):
-            self.skipTest("create_document tool not available")
+        with legacy_tool_registry_access(["create_document"]):
+            if not self.registry.has_tool("create_document"):
+                self.skipTest("create_document tool not available")
 
-        # Test with minimal valid data
-        arguments = {"doctype": self.test_doctype, "data": {"description": "Test ToDo created by test suite"}}
+            # Test with minimal valid data
+            arguments = {
+                "doctype": self.test_doctype,
+                "data": {"description": "Test ToDo created by test suite"},
+            }
 
-        try:
-            result = self.registry.execute_tool("create_document", arguments)
-            self.assertIsInstance(result, dict)
+            try:
+                result = self.registry.execute_tool("create_document", arguments)
+                self.assertIsInstance(result, dict)
 
-            # Should have success status
-            if "success" in result:
-                if result.get("success"):
-                    # New format: name is directly in result, not nested under "data"
-                    self.assertIn("name", result)
-                else:
-                    # Failed creation should have error message
-                    self.assertIn("error", result)
-        except Exception as e:
-            # Tool execution should not raise unhandled exceptions
-            self.fail(f"Tool execution raised exception: {str(e)}")
+                # Should have success status
+                if "success" in result:
+                    if result.get("success"):
+                        # New format: name is directly in result, not nested under "data"
+                        self.assertIn("name", result)
+                    else:
+                        # Failed creation should have error message
+                        self.assertIn("error", result)
+            except Exception as e:
+                # Tool execution should not raise unhandled exceptions
+                self.fail(f"Tool execution raised exception: {str(e)}")
 
     def test_get_document_basic(self):
         """Test basic document retrieval"""
-        if not self.registry.has_tool("get_document"):
-            self.skipTest("get_document tool not available")
+        with legacy_tool_registry_access(["get_document"]):
+            if not self.registry.has_tool("get_document"):
+                self.skipTest("get_document tool not available")
 
-        test_doc = frappe.get_doc(
-            {"doctype": self.test_doctype, "description": "Safe get_document test"}
-        ).insert(ignore_permissions=True)
-        arguments = {"doctype": self.test_doctype, "name": test_doc.name}
+            test_doc = frappe.get_doc(
+                {"doctype": self.test_doctype, "description": "Safe get_document test"}
+            ).insert(ignore_permissions=True)
+            arguments = {"doctype": self.test_doctype, "name": test_doc.name}
 
-        try:
-            result = self.registry.execute_tool("get_document", arguments)
-            self.assertIsInstance(result, dict)
+            try:
+                result = self.registry.execute_tool("get_document", arguments)
+                self.assertIsInstance(result, dict)
 
-            if "success" in result and result.get("success"):
-                # Document data is directly in result for successful gets
-                self.assertIn("name", result)
-                self.assertEqual(result["name"], test_doc.name)
-        except Exception as e:
-            self.fail(f"Tool execution raised exception: {str(e)}")
-        finally:
-            frappe.delete_doc(self.test_doctype, test_doc.name, force=True)
+                if "success" in result and result.get("success"):
+                    # Document data is directly in result for successful gets
+                    self.assertIn("name", result)
+                    self.assertEqual(result["name"], test_doc.name)
+            except Exception as e:
+                self.fail(f"Tool execution raised exception: {str(e)}")
+            finally:
+                frappe.delete_doc(
+                    self.test_doctype,
+                    test_doc.name,
+                    ignore_permissions=True,
+                    force=True,
+                )
 
     def test_list_documents_via_execute_tool(self):
         """Test document listing"""
-        if not self.registry.has_tool("list_documents"):
-            self.skipTest("list_documents tool not available")
+        with legacy_tool_registry_access(["list_documents"]):
+            if not self.registry.has_tool("list_documents"):
+                self.skipTest("list_documents tool not available")
 
-        arguments = {
-            "doctype": self.test_doctype,
-            "limit": 5,
-            "fields": ["name", "description"],
-        }
+            arguments = {
+                "doctype": self.test_doctype,
+                "limit": 5,
+                "fields": ["name", "description"],
+            }
 
-        try:
-            result = self.registry.execute_tool("list_documents", arguments)
-            self.assertIsInstance(result, dict)
+            try:
+                result = self.registry.execute_tool("list_documents", arguments)
+                self.assertIsInstance(result, dict)
 
-            if "success" in result and result.get("success"):
-                # For list_documents, check if we have documents or results key
-                if "documents" in result:
-                    self.assertIsInstance(result["documents"], list)
-                    if result["documents"]:
-                        for doc in result["documents"]:
-                            self.assertIn("name", doc)
-                elif "results" in result:
-                    self.assertIsInstance(result["results"], list)
-                    if result["results"]:
-                        for doc in result["results"]:
-                            self.assertIn("name", doc)
-        except Exception as e:
-            self.fail(f"Tool execution raised exception: {str(e)}")
+                if "success" in result and result.get("success"):
+                    # For list_documents, check if we have documents or results key
+                    if "documents" in result:
+                        self.assertIsInstance(result["documents"], list)
+                        if result["documents"]:
+                            for doc in result["documents"]:
+                                self.assertIn("name", doc)
+                    elif "results" in result:
+                        self.assertIsInstance(result["results"], list)
+                        if result["results"]:
+                            for doc in result["results"]:
+                                self.assertIn("name", doc)
+            except Exception as e:
+                self.fail(f"Tool execution raised exception: {str(e)}")
 
     def test_list_documents_uses_permission_aware_queries_for_data_and_count(self):
         """Regression guard for #189: list_documents must not use permission-bypassing APIs."""
@@ -258,29 +276,30 @@ class TestDocumentTools(BaseAssistantTest):
 
     def test_update_document_basic(self):
         """Test basic document update"""
-        if not self.registry.has_tool("update_document"):
-            self.skipTest("update_document tool not available")
+        with legacy_tool_registry_access(["create_document", "update_document"]):
+            if not self.registry.has_tool("update_document"):
+                self.skipTest("update_document tool not available")
 
-        # Create a test document first
-        if self.registry.has_tool("create_document"):
-            create_args = {"doctype": self.test_doctype, "data": {"description": "Test ToDo for update"}}
-            create_result = self.registry.execute_tool("create_document", create_args)
+            # Create a test document first
+            if self.registry.has_tool("create_document"):
+                create_args = {"doctype": self.test_doctype, "data": {"description": "Test ToDo for update"}}
+                create_result = self.registry.execute_tool("create_document", create_args)
 
-            if create_result.get("success") and "name" in create_result:
-                doc_name = create_result["name"]
+                if create_result.get("success") and "name" in create_result:
+                    doc_name = create_result["name"]
 
-                # Now update it
-                update_args = {
-                    "doctype": self.test_doctype,
-                    "name": doc_name,
-                    "data": {"description": "Updated description"},
-                }
+                    # Now update it
+                    update_args = {
+                        "doctype": self.test_doctype,
+                        "name": doc_name,
+                        "data": {"description": "Updated description"},
+                    }
 
-                try:
-                    result = self.registry.execute_tool("update_document", update_args)
-                    self.assertIsInstance(result, dict)
-                except Exception as e:
-                    self.fail(f"Update tool execution raised exception: {str(e)}")
+                    try:
+                        result = self.registry.execute_tool("update_document", update_args)
+                        self.assertIsInstance(result, dict)
+                    except Exception as e:
+                        self.fail(f"Update tool execution raised exception: {str(e)}")
 
     def test_execute_tool_routing(self):
         """Test that tool routing works correctly"""
@@ -299,21 +318,22 @@ class TestDocumentTools(BaseAssistantTest):
 
     def test_create_document_with_submit(self):
         """Test document creation with submission"""
-        if not self.registry.has_tool("create_document"):
-            self.skipTest("create_document tool not available")
+        with legacy_tool_registry_access(["create_document"]):
+            if not self.registry.has_tool("create_document"):
+                self.skipTest("create_document tool not available")
 
-        # Use a simple doctype for testing
-        arguments = {
-            "doctype": self.test_doctype,
-            "data": {"description": "Test ToDo with submit"},
-            "submit": False,  # Don't actually submit, just test the parameter
-        }
+            # Use a simple doctype for testing
+            arguments = {
+                "doctype": self.test_doctype,
+                "data": {"description": "Test ToDo with submit"},
+                "submit": False,  # Don't actually submit, just test the parameter
+            }
 
-        try:
-            result = self.registry.execute_tool("create_document", arguments)
-            self.assertIsInstance(result, dict)
-        except Exception as e:
-            self.fail(f"Tool execution with submit raised exception: {str(e)}")
+            try:
+                result = self.registry.execute_tool("create_document", arguments)
+                self.assertIsInstance(result, dict)
+            except Exception as e:
+                self.fail(f"Tool execution with submit raised exception: {str(e)}")
 
     def test_create_document_no_permission(self):
         """Test document creation without permission"""
@@ -659,9 +679,7 @@ class TestFetchToolRedaction(BaseAssistantTest):
 
         from frappe_assistant_core.core.security_config import is_doctype_accessible
 
-        with patch(
-            "frappe_assistant_core.core.security_config.frappe.get_meta"
-        ) as get_meta:
+        with patch("frappe_assistant_core.core.security_config.frappe.get_meta") as get_meta:
             # Restricted parent (User) is checked before meta is consulted, so
             # the meta mock is just defensive.
             get_meta.return_value.istable = False
@@ -744,18 +762,13 @@ class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
         with patch(
             "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
             return_value=True,
-        ), \
-         patch(
-             "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
-             side_effect=AssertionError(
-                 f"restricted target {doctype} must not reach frappe.get_doc"
-             ),
-         ):
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+            side_effect=AssertionError(f"restricted target {doctype} must not reach frappe.get_doc"),
+        ):
             try:
                 tool.execute({"id": f"{doctype}/{name}"})
-                self.fail(
-                    f"ChatGPTFetch.execute for restricted DocType {doctype} did not raise"
-                )
+                self.fail(f"ChatGPTFetch.execute for restricted DocType {doctype} did not raise")
             except frappe.PermissionError:
                 # Expected: same "Permission denied" answer for every
                 # restricted target, regardless of which one was hit.
@@ -768,14 +781,10 @@ class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
         self._assert_restricted_refused("File", "FILE-LEAK")
 
     def test_fetch_fac_tool_configuration_target_refused_directly(self):
-        self._assert_restricted_refused(
-            "FAC Tool Configuration", "get_document"
-        )
+        self._assert_restricted_refused("FAC Tool Configuration", "get_document")
 
     def test_fetch_fac_plugin_configuration_target_refused_directly(self):
-        self._assert_restricted_refused(
-            "FAC Plugin Configuration", "core"
-        )
+        self._assert_restricted_refused("FAC Plugin Configuration", "core")
 
     def test_fetch_restricted_targets_indistinguishable(self):
         """All restricted targets must yield the same external answer so the
@@ -794,11 +803,10 @@ class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
             with patch(
                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
                 return_value=True,
-            ), \
-             patch(
-                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
-                 side_effect=AssertionError("must not be reached"),
-             ):
+            ), patch(
+                "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+                side_effect=AssertionError("must not be reached"),
+            ):
                 try:
                     tool.execute({"id": f"{doctype}/{name}"})
                     msg = "no-exception"
@@ -820,42 +828,42 @@ class TestDocumentToolsIntegration(BaseAssistantTest):
 
     def test_document_lifecycle(self):
         """Test complete document lifecycle"""
-        if not all(
-            self.registry.has_tool(tool) for tool in ["create_document", "get_document", "update_document"]
-        ):
-            self.skipTest("Required document tools not available")
+        lifecycle_tools = ["create_document", "get_document", "update_document"]
+        with legacy_tool_registry_access(lifecycle_tools):
+            if not all(self.registry.has_tool(tool) for tool in lifecycle_tools):
+                self.skipTest("Required document tools not available")
 
-        doctype = "ToDo"
+            doctype = "ToDo"
 
-        # Create
-        create_args = {"doctype": doctype, "data": {"description": "Lifecycle test document"}}
+            # Create
+            create_args = {"doctype": doctype, "data": {"description": "Lifecycle test document"}}
 
-        try:
-            create_result = self.registry.execute_tool("create_document", create_args)
+            try:
+                create_result = self.registry.execute_tool("create_document", create_args)
 
-            if not (create_result.get("success") and "name" in create_result):
-                self.skipTest("Could not create test document")
+                if not (create_result.get("success") and "name" in create_result):
+                    self.skipTest("Could not create test document")
 
-            doc_name = create_result["name"]
+                doc_name = create_result["name"]
 
-            # Read
-            get_args = {"doctype": doctype, "name": doc_name}
-            get_result = self.registry.execute_tool("get_document", get_args)
+                # Read
+                get_args = {"doctype": doctype, "name": doc_name}
+                get_result = self.registry.execute_tool("get_document", get_args)
 
-            if get_result.get("success"):
-                self.assertEqual(get_result["name"], doc_name)
+                if get_result.get("success"):
+                    self.assertEqual(get_result["name"], doc_name)
 
-            # Update
-            update_args = {
-                "doctype": doctype,
-                "name": doc_name,
-                "data": {"description": "Updated description"},
-            }
-            update_result = self.registry.execute_tool("update_document", update_args)
-            self.assertIsInstance(update_result, dict)
+                # Update
+                update_args = {
+                    "doctype": doctype,
+                    "name": doc_name,
+                    "data": {"description": "Updated description"},
+                }
+                update_result = self.registry.execute_tool("update_document", update_args)
+                self.assertIsInstance(update_result, dict)
 
-        except Exception as e:
-            self.fail(f"Document lifecycle test failed: {str(e)}")
+            except Exception as e:
+                self.fail(f"Document lifecycle test failed: {str(e)}")
 
     def test_error_handling_scenarios(self):
         """Test various error scenarios"""
@@ -1099,11 +1107,10 @@ class TestFacV23FetchParity(BaseAssistantTest):
             with patch(
                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
                 return_value=True,
-            ), \
-             patch(
-                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
-                 side_effect=AssertionError("restricted target must not reach get_doc"),
-             ):
+            ), patch(
+                "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+                side_effect=AssertionError("restricted target must not reach get_doc"),
+            ):
                 try:
                     tool.execute({"id": f"{doctype}/{name}"})
                     msgs.append("no-exception")
@@ -1119,6 +1126,7 @@ class TestFacV23FetchParity(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools import chatgpt_fetch
 
         tool = chatgpt_fetch.ChatGPTFetch()
+
         # Missing: get_doc raises DoesNotExistError.
         def raise_missing(doctype, name):
             raise frappe.DoesNotExistError("missing")
@@ -1150,11 +1158,9 @@ class TestFacV23FetchParity(BaseAssistantTest):
         secret_doc_id = "User/secret-token-in-doc-id-hunter2"
 
         capturing_logger = MagicMock()
-        with patch.object(chatgpt_fetch.frappe, "has_permission", return_value=True), \
-             patch.object(chatgpt_fetch.frappe, "get_doc",
-                          side_effect=AssertionError("must not be reached")), \
-             patch.object(chatgpt_fetch.frappe, "logger",
-                          return_value=capturing_logger):
+        with patch.object(chatgpt_fetch.frappe, "has_permission", return_value=True), patch.object(
+            chatgpt_fetch.frappe, "get_doc", side_effect=AssertionError("must not be reached")
+        ), patch.object(chatgpt_fetch.frappe, "logger", return_value=capturing_logger):
             try:
                 tool.execute({"id": secret_doc_id})
                 response = {"no": "exception"}
@@ -1180,6 +1186,7 @@ class TestFacV23LegacyFailClosed(BaseAssistantTest):
     def test_membership_canonical_for_every_role(self):
         from frappe_assistant_core.core import security_config
         from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES as canonical
+
         for role in ("Assistant User", "Assistant Admin", "System Manager", "Default"):
             legacy = security_config.RESTRICTED_DOCTYPES.get(role, [])
             self.assertIn("User", legacy, f"role={role}")
@@ -1188,16 +1195,19 @@ class TestFacV23LegacyFailClosed(BaseAssistantTest):
 
     def test_unknown_role_returns_canonical_not_empty(self):
         from frappe_assistant_core.core import security_config
+
         legacy = security_config.RESTRICTED_DOCTYPES.get("Unknown Role XYZ", [])
         self.assertIn("User", legacy)
 
     def test_truthiness_non_empty(self):
         from frappe_assistant_core.core import security_config
+
         legacy = security_config.RESTRICTED_DOCTYPES.get("Assistant User", [])
         self.assertTrue(legacy)
 
     def test_mutation_rejected(self):
         from frappe_assistant_core.core import security_config
+
         with self.assertRaises((TypeError, NotImplementedError)):
             security_config.RESTRICTED_DOCTYPES["Assistant User"] = ["Customer"]
 
@@ -1205,6 +1215,7 @@ class TestFacV23LegacyFailClosed(BaseAssistantTest):
         from collections.abc import Mapping
 
         from frappe_assistant_core.core import security_config
+
         # Tuple / frozenset / MappingProxyType — all immutable.
         self.assertIsInstance(security_config.BASIC_CORE_TOOLS, (tuple, frozenset))
         self.assertIsInstance(security_config.ROLE_TOOL_ACCESS, (tuple, frozenset, Mapping))

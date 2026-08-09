@@ -184,9 +184,7 @@ class DocumentList(BaseTool):
             return result
 
         except Exception as exc:
-            frappe.logger("fac.list_documents").warning(
-                f"list_documents failed: {type(exc).__name__}"
-            )
+            frappe.logger("fac.list_documents").warning(f"list_documents failed: {type(exc).__name__}")
             return {
                 "success": False,
                 "error": "Document listing failed",

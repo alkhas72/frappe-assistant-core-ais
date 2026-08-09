@@ -148,9 +148,7 @@ def _resolve_tool_categories(tool_names: list, registry) -> dict:
             if row.get("tool_category"):
                 categories[row["tool_name"]] = row["tool_category"]
     except Exception as e:
-        frappe.logger().warning(
-            f"Could not batch-fetch tool categories: type={type(e).__name__}"
-        )
+        frappe.logger().warning(f"Could not batch-fetch tool categories: type={type(e).__name__}")
 
     # 2 & 3. Fill gaps via auto-detection, defaulting to read_write.
     for tool_name in tool_names:
@@ -190,12 +188,9 @@ def _denied_response(
     response.headers["Content-Type"] = "application/json"
     response.data = frappe.as_json({"error": error, "message": message})
     if status_code == 401:
-        metadata_url = (
-            f"{get_public_base_url()}/.well-known/oauth-protected-resource"
-        )
+        metadata_url = f"{get_public_base_url()}/.well-known/oauth-protected-resource"
         response.headers["WWW-Authenticate"] = (
-            f'Bearer realm="Frappe Assistant Core", '
-            f'resource_metadata="{metadata_url}"'
+            f'Bearer realm="Frappe Assistant Core", ' f'resource_metadata="{metadata_url}"'
         )
     return response
 
@@ -260,9 +255,7 @@ def _authenticate_mcp_request():
             )
 
         except Exception as e:
-            frappe.logger().error(
-                f"OAuth token validation error: type={type(e).__name__}"
-            )
+            frappe.logger().error(f"OAuth token validation error: type={type(e).__name__}")
             frappe.log_error(
                 title="OAuth Token Validation Error",
                 message=f"Type: {type(e).__name__}",
@@ -318,9 +311,7 @@ def _authenticate_mcp_request():
             )
 
         except Exception as e:
-            frappe.logger().error(
-                f"API key authentication error: type={type(e).__name__}"
-            )
+            frappe.logger().error(f"API key authentication error: type={type(e).__name__}")
             frappe.log_error(
                 title="API Key Authentication Error",
                 message=f"Type: {type(e).__name__}",

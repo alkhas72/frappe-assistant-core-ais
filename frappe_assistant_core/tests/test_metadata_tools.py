@@ -25,6 +25,7 @@ import frappe
 from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.tests.legacy_tool_test_support import legacy_tool_registry_access
 
 
 class TestMetadataTools(BaseAssistantTest):
@@ -36,14 +37,14 @@ class TestMetadataTools(BaseAssistantTest):
 
     def test_get_tools_structure(self):
         """Test that metadata tools are properly registered"""
-        tools = self.registry.get_available_tools()
-        tool_names = [tool["name"] for tool in tools]
+        with legacy_tool_registry_access(["get_doctype_info"]):
+            tools = self.registry.get_available_tools()
+            tool_names = [tool["name"] for tool in tools]
 
-        # Check for metadata tools
-        expected_tools = ["get_doctype_info"]
-        found_tools = [tool for tool in expected_tools if tool in tool_names]
+            expected_tools = ["get_doctype_info"]
+            found_tools = [tool for tool in expected_tools if tool in tool_names]
 
-        self.assertGreater(len(found_tools), 0, f"Should find metadata tools. Available: {tool_names}")
+            self.assertGreater(len(found_tools), 0, f"Should find metadata tools. Available: {tool_names}")
 
     def test_execute_tool_routing(self):
         """Test that tool routing works correctly"""
@@ -123,9 +124,7 @@ class TestMetadataTools(BaseAssistantTest):
 
         result = MetadataTools.get_doctype_metadata("Sales Order")
         if not result.get("success"):
-            self.skipTest(
-                f"Sales Order DocType not present in this site: {result.get('error')}"
-            )
+            self.skipTest(f"Sales Order DocType not present in this site: {result.get('error')}")
 
         self.assertIn("child_tables", result)
         child_tables = result["child_tables"]
@@ -136,9 +135,7 @@ class TestMetadataTools(BaseAssistantTest):
             None,
         )
         if items_entry is None:
-            self.skipTest(
-                f"Sales Order has no 'items' child table in this site: {child_tables}"
-            )
+            self.skipTest(f"Sales Order has no 'items' child table in this site: {child_tables}")
 
         self.assertEqual(items_entry["options"], "Sales Order Item")
         self.assertIn(items_entry["fieldtype"], ("Table", "Table MultiSelect"))
@@ -167,9 +164,7 @@ class TestMetadataTools(BaseAssistantTest):
         # Frappe install.
         parent_result = MetadataTools.get_doctype_metadata("Customer")
         if not parent_result.get("success"):
-            self.skipTest(
-                f"Customer DocType not present in this site: {parent_result.get('error')}"
-            )
+            self.skipTest(f"Customer DocType not present in this site: {parent_result.get('error')}")
         self.assertFalse(parent_result["is_single"])
         self.assertFalse(parent_result["is_child_table"])
 
@@ -231,9 +226,14 @@ class TestMetadataTools(BaseAssistantTest):
         parent_meta.naming_rule = ""
         parent_meta.title_field = None
 
-        with patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.db.exists", return_value=True), \
-             patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.has_permission", return_value=True), \
-             patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.get_meta", return_value=parent_meta):
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.db.exists", return_value=True
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.has_permission", return_value=True
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.get_meta",
+            return_value=parent_meta,
+        ):
             result = MetadataTools.get_doctype_metadata("Synthetic Parent")
 
         self.assertTrue(result.get("success"), result)

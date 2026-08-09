@@ -81,9 +81,7 @@ class GenerateReport(BaseTool):
             )
 
         except Exception as exc:
-            frappe.logger("fac.generate_report").warning(
-                f"generate_report failed: {type(exc).__name__}"
-            )
+            frappe.logger("fac.generate_report").warning(f"generate_report failed: {type(exc).__name__}")
             return {"success": False, "error": "Report execution failed"}
 
 

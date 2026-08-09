@@ -33,6 +33,7 @@ import frappe
 from werkzeug.wrappers import Request, Response
 
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.tests.legacy_tool_test_support import legacy_tool_registry_access
 from frappe_assistant_core.utils.tool_category_detector import category_to_annotations
 
 
@@ -166,20 +167,21 @@ class TestBuildToolRegistryAttachesAnnotations(BaseAssistantTest):
     def test_every_built_tool_has_annotations(self):
         from frappe_assistant_core.api.fac_endpoint import _build_tool_registry
 
-        registry = _build_tool_registry()
-        self.assertTrue(registry, "expected at least one available tool")
+        with legacy_tool_registry_access(["get_document", "create_document"]):
+            registry = _build_tool_registry()
+            self.assertTrue(registry, "expected at least one available tool")
 
-        unclassified = [name for name, td in registry.items() if not td.get("annotations")]
-        self.assertEqual(
-            unclassified,
-            [],
-            f"these tools reached the client with no annotation hints: {unclassified}",
-        )
+            unclassified = [name for name, td in registry.items() if not td.get("annotations")]
+            self.assertEqual(
+                unclassified,
+                [],
+                f"these tools reached the client with no annotation hints: {unclassified}",
+            )
 
-        # Spot-check known classifications.
-        if "get_document" in registry:
-            self.assertEqual(registry["get_document"]["annotations"].get("readOnlyHint"), True)
-        if "delete_document" in registry:
-            ann = registry["delete_document"]["annotations"]
-            self.assertEqual(ann.get("readOnlyHint"), False)
-            self.assertEqual(ann.get("destructiveHint"), True)
+            # Spot-check known classifications.
+            if "get_document" in registry:
+                self.assertEqual(registry["get_document"]["annotations"].get("readOnlyHint"), True)
+            if "delete_document" in registry:
+                ann = registry["delete_document"]["annotations"]
+                self.assertEqual(ann.get("readOnlyHint"), False)
+                self.assertEqual(ann.get("destructiveHint"), True)

@@ -59,9 +59,7 @@ def audit_tools_list_summary(published_count: int, status: str = "Success") -> N
             operation="publish",
         )
     except Exception as e:
-        frappe.logger().warning(
-            f"MCP tools/list audit failed: type={type(e).__name__}"
-        )
+        frappe.logger().warning(f"MCP tools/list audit failed: type={type(e).__name__}")
 
 
 def audit_unavailable_tool_call(
@@ -89,9 +87,7 @@ def audit_unavailable_tool_call(
             arguments=arguments if isinstance(arguments, dict) else None,
             phase="execute",
         )
-        reason_code = (
-            decision.reason_code if not decision.allowed else "TOOL_UNPUBLISHED"
-        )
+        reason_code = decision.reason_code if not decision.allowed else "TOOL_UNPUBLISHED"
         context = decision.context
 
     log_denied_tool_attempt(
@@ -305,9 +301,7 @@ class MCPServer:
                 frappe.logger().warning("MCP unknown method")
                 return self._error_response(response, request_id, -32601, "Method not found")
         except Exception as e:
-            frappe.logger().error(
-                f"MCP Handler Error: type={type(e).__name__}"
-            )
+            frappe.logger().error(f"MCP Handler Error: type={type(e).__name__}")
             return self._error_response(response, request_id, -32603, "Internal error")
 
         # Success response
@@ -535,9 +529,7 @@ class MCPServer:
                 "isError": True,
             }
         except Exception as e:
-            frappe.logger().error(
-                f"MCP Tool Execution Error: type={type(e).__name__}"
-            )
+            frappe.logger().error(f"MCP Tool Execution Error: type={type(e).__name__}")
             return {
                 "content": [{"type": "text", "text": "Tool execution failed"}],
                 "isError": True,

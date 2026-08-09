@@ -52,16 +52,12 @@ class FACToolConfiguration(Document):
     def _validate_role_access(self):
         """Validate role access configuration (fail closed)."""
         if self.role_access_mode not in VALID_ROLE_ACCESS_MODES:
-            frappe.throw(
-                _("Role Access Mode must be one of: {0}").format(", ".join(VALID_ROLE_ACCESS_MODES))
-            )
+            frappe.throw(_("Role Access Mode must be one of: {0}").format(", ".join(VALID_ROLE_ACCESS_MODES)))
 
         if self.role_access_mode == "Restrict to Listed Roles":
             valid_rows = [row for row in (self.role_access or []) if row.role and row.allow_access]
             if not valid_rows:
-                frappe.throw(
-                    _("Please add at least one role when using 'Restrict to Listed Roles' mode")
-                )
+                frappe.throw(_("Please add at least one role when using 'Restrict to Listed Roles' mode"))
             for row in valid_rows:
                 if not frappe.db.exists("Role", {"name": row.role, "disabled": 0}):
                     frappe.throw(_("Role '{0}' does not exist or is disabled").format(row.role))

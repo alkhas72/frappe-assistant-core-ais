@@ -29,9 +29,7 @@ class TestAlternateToolHandlerBoundary(BaseAssistantTest):
                     return_value=self.registry,
                 )
             )
-            list_audit = stack.enter_context(
-                patch.object(self.tools_handler, "audit_tools_list_summary")
-            )
+            list_audit = stack.enter_context(patch.object(self.tools_handler, "audit_tools_list_summary"))
             denial_audit = stack.enter_context(
                 patch.object(self.tools_handler, "audit_unavailable_tool_call")
             )
@@ -45,9 +43,7 @@ class TestAlternateToolHandlerBoundary(BaseAssistantTest):
             )
 
         self.assertEqual(listed["result"]["tools"], [{"name": "get_document"}])
-        self.registry.get_available_tools.assert_called_once_with(
-            user=frappe.session.user
-        )
+        self.registry.get_available_tools.assert_called_once_with(user=frappe.session.user)
         self.registry.execute_tool.assert_called_once_with(
             "get_document",
             {"doctype": "ToDo", "name": "TD-1"},
@@ -70,9 +66,7 @@ class TestAlternateToolHandlerBoundary(BaseAssistantTest):
                     return_value=self.registry,
                 )
             )
-            audit = stack.enter_context(
-                patch.object(self.tools_handler, "audit_unavailable_tool_call")
-            )
+            audit = stack.enter_context(patch.object(self.tools_handler, "audit_unavailable_tool_call"))
             for params, reason_code in cases:
                 with self.subTest(params=params):
                     audit.reset_mock()
@@ -96,12 +90,8 @@ class TestAlternateToolHandlerBoundary(BaseAssistantTest):
                     return_value=self.registry,
                 )
             )
-            stack.enter_context(
-                patch.object(self.tools_handler.api_logger, "error", error_log)
-            )
-            list_audit = stack.enter_context(
-                patch.object(self.tools_handler, "audit_tools_list_summary")
-            )
+            stack.enter_context(patch.object(self.tools_handler.api_logger, "error", error_log))
+            list_audit = stack.enter_context(patch.object(self.tools_handler, "audit_tools_list_summary"))
             listed = self.tools_handler.handle_tools_list(1)
 
         self.assertNotIn(secret, json.dumps(listed))
@@ -120,9 +110,7 @@ class TestAlternateToolHandlerBoundary(BaseAssistantTest):
                     return_value=self.registry,
                 )
             )
-            stack.enter_context(
-                patch.object(self.tools_handler.api_logger, "error", error_log)
-            )
+            stack.enter_context(patch.object(self.tools_handler.api_logger, "error", error_log))
             called = self.tools_handler.handle_tool_call(
                 {"name": secret, "arguments": {"token": secret}},
                 2,

@@ -306,9 +306,7 @@ class ToolRegistry:
 
             # Include safe structured diagnostics for non-policy execution errors.
             execution_time = result.get("execution_time", "unknown")
-            raise Exception(
-                f"[{error_type}] {error_message} (execution_time: {execution_time}s)"
-            )
+            raise Exception(f"[{error_type}] {error_message} (execution_time: {execution_time}s)")
 
         return result
 

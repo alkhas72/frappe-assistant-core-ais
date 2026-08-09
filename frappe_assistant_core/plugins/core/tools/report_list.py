@@ -71,9 +71,7 @@ class ReportList(BaseTool):
             )
 
         except Exception as exc:
-            frappe.logger("fac.report_list").warning(
-                f"report_list failed: {type(exc).__name__}"
-            )
+            frappe.logger("fac.report_list").warning(f"report_list failed: {type(exc).__name__}")
             return {"success": False, "error": "Report listing failed"}
 
 

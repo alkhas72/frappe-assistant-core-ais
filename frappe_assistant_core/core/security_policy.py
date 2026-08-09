@@ -153,18 +153,41 @@ RESTRICTED_DOCTYPES = frozenset(
 )
 
 _BUILTIN_PLUGINS = frozenset({"core", "data_science", "visualization"})
-_TOOL_PLUGIN = MappingProxyType({
-    **{name: "core" for name in EXPECTED_BUILTIN_TOOL_NAMES if name not in {
-        "run_python_code", "run_database_query", "analyze_business_data", "extract_file_content",
-        "create_dashboard", "create_dashboard_chart", "list_user_dashboards",
-    }},
-    **{name: "data_science" for name in {
-        "run_python_code", "run_database_query", "analyze_business_data", "extract_file_content",
-    }},
-    **{name: "visualization" for name in {
-        "create_dashboard", "create_dashboard_chart", "list_user_dashboards",
-    }},
-})
+_TOOL_PLUGIN = MappingProxyType(
+    {
+        **{
+            name: "core"
+            for name in EXPECTED_BUILTIN_TOOL_NAMES
+            if name
+            not in {
+                "run_python_code",
+                "run_database_query",
+                "analyze_business_data",
+                "extract_file_content",
+                "create_dashboard",
+                "create_dashboard_chart",
+                "list_user_dashboards",
+            }
+        },
+        **{
+            name: "data_science"
+            for name in {
+                "run_python_code",
+                "run_database_query",
+                "analyze_business_data",
+                "extract_file_content",
+            }
+        },
+        **{
+            name: "visualization"
+            for name in {
+                "create_dashboard",
+                "create_dashboard_chart",
+                "list_user_dashboards",
+            }
+        },
+    }
+)
 
 _FIELD_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _JSON_STRING_REDACTION_MAX_BYTES = 65_536
@@ -232,9 +255,7 @@ def _freeze_field_map(source: Mapping[str, Any]) -> Mapping[str, Any]:
             frozen[scope] = "*"
         else:
             frozen[scope] = frozenset(
-                _normalise_field_name(item)
-                for item in configured
-                if isinstance(item, str)
+                _normalise_field_name(item) for item in configured if isinstance(item, str)
             )
     return MappingProxyType(frozen)
 
@@ -302,9 +323,7 @@ def discover_builtin_tool_classes() -> Mapping[str, type[BaseTool]]:
             raise RuntimeError(f"Built-in plugin discovery failed: {plugin_name}")
 
         for declared_module in plugin_info.tools:
-            module_name = (
-                f"frappe_assistant_core.plugins.{plugin_name}.tools.{declared_module}"
-            )
+            module_name = f"frappe_assistant_core.plugins.{plugin_name}.tools.{declared_module}"
             module = importlib.import_module(module_name)
             candidates = {
                 value
@@ -314,9 +333,7 @@ def discover_builtin_tool_classes() -> Mapping[str, type[BaseTool]]:
                 and value.__module__ == module.__name__
             }
             if len(candidates) != 1:
-                raise RuntimeError(
-                    f"Expected one BaseTool class in {module_name}, found {len(candidates)}"
-                )
+                raise RuntimeError(f"Expected one BaseTool class in {module_name}, found {len(candidates)}")
             tool_class = next(iter(candidates))
             tool_name = tool_class().name
             if not tool_name or tool_name in classes:
@@ -384,9 +401,7 @@ class SecurityPolicy:
                 return cls._deny("CONFIG_MODE_DENIED", empty_context)
 
             allowed_roles = {role for role in config.get("roles", set()) if role}
-            if not allowed_roles.intersection(
-                cls._get_actor_roles(actor, fresh=fresh)
-            ):
+            if not allowed_roles.intersection(cls._get_actor_roles(actor, fresh=fresh)):
                 return cls._deny("ROLE_NOT_ALLOWED", empty_context)
 
             if tool_name not in EXPECTED_BUILTIN_TOOL_NAMES and tool_name not in TRUSTED_EXTERNAL_TOOLS:
@@ -419,9 +434,7 @@ class SecurityPolicy:
             return cls._deny("POLICY_ERROR_FAIL_CLOSED", empty_context)
 
     @classmethod
-    def extract_context(
-        cls, tool_name: str, arguments: dict | None
-    ) -> ToolContext | None:
+    def extract_context(cls, tool_name: str, arguments: dict | None) -> ToolContext | None:
         if arguments is None:
             arguments = {}
         if not isinstance(arguments, dict):
@@ -485,9 +498,7 @@ class SecurityPolicy:
                 text("query")
                 return ToolContext("read_many", required_permissions=frozenset({"read"}))
             if tool_name == "get_doctype_info":
-                return ToolContext(
-                    "metadata_read", text("doctype"), required_permissions=frozenset({"read"})
-                )
+                return ToolContext("metadata_read", text("doctype"), required_permissions=frozenset({"read"}))
             if tool_name == "report_list":
                 return ToolContext("report_discover", required_permissions=frozenset({"read"}))
             if tool_name in {"report_requirements", "generate_report"}:
@@ -543,9 +554,7 @@ class SecurityPolicy:
         del fresh  # DB reads are intentionally fresh in both phases for now.
         if not frappe.db.table_exists("FAC Plugin Configuration"):
             return False
-        enabled = frappe.db.get_value(
-            "FAC Plugin Configuration", plugin_name, "enabled"
-        )
+        enabled = frappe.db.get_value("FAC Plugin Configuration", plugin_name, "enabled")
         return bool(enabled)
 
     @staticmethod
@@ -570,9 +579,7 @@ class SecurityPolicy:
             "enabled": bool(config.get("enabled")),
             "role_access_mode": config.get("role_access_mode"),
             "roles": {
-                role
-                for role in roles
-                if role and frappe.db.exists("Role", {"name": role, "disabled": 0})
+                role for role in roles if role and frappe.db.exists("Role", {"name": role, "disabled": 0})
             },
         }
 
@@ -597,11 +604,7 @@ class SecurityPolicy:
                 pluck="role",
             )
         )
-        roles = {
-            role
-            for role in assigned_roles
-            if frappe.db.exists("Role", {"name": role, "disabled": 0})
-        }
+        roles = {role for role in assigned_roles if frappe.db.exists("Role", {"name": role, "disabled": 0})}
         roles.difference_update(AUTOMATIC_ROLES)
         roles.update({ALL_USER_ROLE, GUEST_ROLE})
         if frappe.db.get_value("User", actor, "user_type") == "System User":
@@ -617,9 +620,7 @@ class SecurityPolicy:
         return bool(getattr(frappe.get_meta(doctype), "istable", False))
 
     @classmethod
-    def _contains_restricted_fields(
-        cls, doctype: str | None, fields: frozenset[str]
-    ) -> bool:
+    def _contains_restricted_fields(cls, doctype: str | None, fields: frozenset[str]) -> bool:
         restricted = set(_UNIVERSAL_SENSITIVE_FIELDS)
         for source in (_SENSITIVE_FIELDS_SNAPSHOT, _ADMIN_ONLY_FIELDS_SNAPSHOT):
             for scope in ("all_doctypes", doctype):
@@ -647,9 +648,7 @@ class SecurityPolicy:
             kwargs = {"user": actor}
             if context.target_name and permission != "create":
                 kwargs["doc"] = context.target_name
-            if not frappe.has_permission(
-                context.target_doctype, ptype=permission, **kwargs
-            ):
+            if not frappe.has_permission(context.target_doctype, ptype=permission, **kwargs):
                 return False
         return True
 
@@ -659,14 +658,10 @@ class SecurityPolicy:
         return cls._redact_output(context, value, allow_row_doctype=True)
 
     @classmethod
-    def _redact_output(
-        cls, context: ToolContext, value: Any, allow_row_doctype: bool
-    ) -> Any:
+    def _redact_output(cls, context: ToolContext, value: Any, allow_row_doctype: bool) -> Any:
         if isinstance(value, Mapping):
             row_doctype = (
-                value.get("doctype")
-                if allow_row_doctype and isinstance(value.get("doctype"), str)
-                else None
+                value.get("doctype") if allow_row_doctype and isinstance(value.get("doctype"), str) else None
             )
             effective_doctype = row_doctype or context.target_doctype
             result = {}
@@ -674,24 +669,19 @@ class SecurityPolicy:
                 if cls._contains_restricted_fields(effective_doctype, frozenset({str(key)})):
                     result[key] = "***REDACTED***"
                 else:
-                    result[key] = cls._redact_output(
-                        context, nested, allow_row_doctype=allow_row_doctype
-                    )
+                    result[key] = cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype)
             return result
         if isinstance(value, list):
             return [
-                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype)
-                for nested in value
+                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype) for nested in value
             ]
         if isinstance(value, tuple):
             return tuple(
-                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype)
-                for nested in value
+                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype) for nested in value
             )
         if isinstance(value, set):
             return {
-                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype)
-                for nested in value
+                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype) for nested in value
             }
         if (
             isinstance(value, str)

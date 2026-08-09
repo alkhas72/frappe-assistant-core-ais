@@ -245,17 +245,11 @@ class BaseTool(ABC):
                     "error_type": "ToolReportedError",
                     "execution_time": execution_time,
                 }
-                self.log_execution(
-                    arguments, response, execution_time, status="Error", decision=decision
-                )
-                self.logger.info(
-                    f"{self.name} reported failure in {execution_time:.3f}s"
-                )
+                self.log_execution(arguments, response, execution_time, status="Error", decision=decision)
+                self.logger.info(f"{self.name} reported failure in {execution_time:.3f}s")
             else:
                 response = {"success": True, "result": result, "execution_time": execution_time}
-                self.log_execution(
-                    arguments, response, execution_time, status="Success", decision=decision
-                )
+                self.log_execution(arguments, response, execution_time, status="Success", decision=decision)
                 self.logger.info(f"Successfully executed {self.name} in {execution_time:.3f}s")
 
             return response
@@ -309,9 +303,7 @@ class BaseTool(ABC):
                 "execution_time": execution_time,
             }
 
-            self.log_execution(
-                arguments, response, execution_time, status="Error", decision=decision
-            )
+            self.log_execution(arguments, response, execution_time, status="Error", decision=decision)
 
             frappe.log_error(title=_("Validation Error"), message=f"Tool: {self.name}")
 
@@ -358,9 +350,7 @@ class BaseTool(ABC):
                 decision=decision,
             )
 
-            self.logger.error(
-                f"Tool execution failed: {self.name}; type={type(e).__name__}"
-            )
+            self.logger.error(f"Tool execution failed: {self.name}; type={type(e).__name__}")
             frappe.log_error(
                 title=_("Tool Execution Error"),
                 message=f"Tool: {self.name}\nType: {type(e).__name__}",
@@ -509,9 +499,7 @@ class BaseTool(ABC):
             )
         except Exception as e:
             # Don't fail tool execution due to logging issues
-            self.logger.warning(
-                f"Failed to log execution for {self.name}; type={type(e).__name__}"
-            )
+            self.logger.warning(f"Failed to log execution for {self.name}; type={type(e).__name__}")
 
     def _sanitize_arguments(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Remove sensitive data from arguments for logging"""

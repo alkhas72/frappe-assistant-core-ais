@@ -106,7 +106,7 @@ def _fetch_latest_audit_row(tool_name: str) -> Dict[str, Any]:
 
 def _delete_test_rows(tool_name: str):
     frappe.db.delete("Assistant Audit Log", {"tool_name": tool_name})
-    frappe.db.commit()
+    frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist audit-row fixture cleanup
 
 
 class TestAuditLogStatusClassification(BaseAssistantTest):
@@ -135,7 +135,7 @@ class TestAuditLogStatusClassification(BaseAssistantTest):
                     status="Success",
                     execution_time=0.0,
                 )
-                frappe.db.commit()
+                frappe.db.commit()  # nosemgrep: frappe-manual-commit — make cleanup probe audit row observable
 
         probe = CleanupProbe()
         result = unittest.TestResult()

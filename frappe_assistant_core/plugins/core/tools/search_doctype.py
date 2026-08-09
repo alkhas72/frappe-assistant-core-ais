@@ -67,9 +67,7 @@ class SearchDoctype(BaseTool):
             )
 
         except Exception as exc:
-            frappe.logger("fac.search_doctype").warning(
-                f"search_doctype failed: {type(exc).__name__}"
-            )
+            frappe.logger("fac.search_doctype").warning(f"search_doctype failed: {type(exc).__name__}")
             return {"success": False, "error": "Document search failed"}
 
 
