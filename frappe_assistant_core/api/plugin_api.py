@@ -138,9 +138,11 @@ def refresh_tool_registry():
     frappe.only_for("System Manager")
 
     try:
-        from frappe_assistant_core.core.tool_registry import refresh_tool_registry
+        from frappe_assistant_core.core.tool_registry import get_tool_registry
 
-        registry = refresh_tool_registry()
+        registry = get_tool_registry()
+        registry.clear_cache()
+        registry.refresh()
         stats = registry.get_stats()
 
         return {"success": True, "message": _("Tool registry refreshed"), "stats": stats}
