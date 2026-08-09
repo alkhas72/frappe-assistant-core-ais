@@ -53,9 +53,7 @@ def _security_snapshot_hash(snapshot):
 
 def _restore_security_rows(snapshot):
     for table in SNAPSHOT_TABLES:
-        columns = [
-            column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)
-        ]
+        columns = [column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)]
         frappe.db.sql(f"DELETE FROM `{table}`")
         if not snapshot[table]:
             continue
@@ -77,12 +75,11 @@ def tearDownModule():
     after_hash = _security_snapshot_hash(after)
     try:
         if after_hash != before_hash:
-            raise AssertionError(
-                f"FAC security snapshot changed: before={before_hash}, after={after_hash}"
-            )
+            raise AssertionError(f"FAC security snapshot changed: before={before_hash}, after={after_hash}")
     finally:
         _restore_security_rows(_module_security_snapshot)
         frappe.db.commit()
+
 
 PATCH_MODULE = "frappe_assistant_core.patches.v2_5.harden_fac_tool_access_defaults"
 
@@ -180,9 +177,7 @@ def _seed_config(tool_name, enabled, mode, role_rows, plugin_name="core"):
 
 
 def _config_state(tool_name):
-    enabled, mode = frappe.db.get_value(
-        TOOL_CONFIG_DOCTYPE, tool_name, ["enabled", "role_access_mode"]
-    )
+    enabled, mode = frappe.db.get_value(TOOL_CONFIG_DOCTYPE, tool_name, ["enabled", "role_access_mode"])
     roles = frappe.get_all(ROLE_ACCESS_DOCTYPE, filters={"parent": tool_name}, pluck="role")
     return int(enabled or 0), mode, sorted(roles)
 
@@ -255,9 +250,9 @@ class TestHardenFacToolAccessDefaults(FACSecuritySnapshotTestCase):
                 self.assertEqual(_config_state(tool_name), (exp_enabled, exp_mode, exp_roles))
 
     def test_mixed_restricted_config_prunes_only_invalid_rows(self):
-        frappe.get_doc(
-            {"doctype": "Role", "role_name": "__test_disabled_role", "disabled": 1}
-        ).insert(ignore_permissions=True)
+        frappe.get_doc({"doctype": "Role", "role_name": "__test_disabled_role", "disabled": 1}).insert(
+            ignore_permissions=True
+        )
 
         _seed_config(
             "__test_mixed_tool",
@@ -546,9 +541,7 @@ class TestSyncPluginConfigurationDefaults(FACSecuritySnapshotTestCase):
                 "__test_new_plugin": self._plugin_info("Test Plugin"),
             }
         )
-        self.assertEqual(
-            int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "core", "enabled") or 0), 1
-        )
+        self.assertEqual(int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "core", "enabled") or 0), 1)
         self.assertEqual(
             int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "__test_new_plugin", "enabled") or 0),
             0,
@@ -655,9 +648,7 @@ class TestAfterInstallDenyByDefault(FACSecuritySnapshotTestCase):
 
         self.assertEqual(first, second)
         self.assertTrue(first)
-        self.assertTrue(
-            all(not row.enabled and row.role_access_mode == "Deny All" for row in first)
-        )
+        self.assertTrue(all(not row.enabled and row.role_access_mode == "Deny All" for row in first))
         self.assertEqual(
             frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "core", "enabled"),
             1,
@@ -699,15 +690,19 @@ class TestAdminEndpointHardening(FACSecuritySnapshotTestCase):
         registry = MagicMock()
         registry._get_external_tools.return_value = {}
 
-        return patch(
-            "frappe_assistant_core.utils.plugin_manager.get_plugin_manager",
-            return_value=plugin_manager,
-        ), patch(
-            "frappe_assistant_core.core.tool_registry.get_tool_registry",
-            return_value=registry,
-        ), patch(
-            "frappe_assistant_core.utils.tool_category_detector.detect_tool_category",
-            return_value="read_only",
+        return (
+            patch(
+                "frappe_assistant_core.utils.plugin_manager.get_plugin_manager",
+                return_value=plugin_manager,
+            ),
+            patch(
+                "frappe_assistant_core.core.tool_registry.get_tool_registry",
+                return_value=registry,
+            ),
+            patch(
+                "frappe_assistant_core.utils.tool_category_detector.detect_tool_category",
+                return_value="read_only",
+            ),
         )
 
     def test_toggle_tool_cannot_enable_hard_denied(self):
@@ -768,9 +763,9 @@ class TestAdminEndpointHardening(FACSecuritySnapshotTestCase):
 
         role_name = "__test_disabled_admin_role"
         frappe.db.delete("Role", role_name)
-        frappe.get_doc(
-            {"doctype": "Role", "role_name": role_name, "disabled": 1}
-        ).insert(ignore_permissions=True)
+        frappe.get_doc({"doctype": "Role", "role_name": role_name, "disabled": 1}).insert(
+            ignore_permissions=True
+        )
         self.addCleanup(frappe.db.delete, "Role", role_name)
 
         pm, reg, cat = self._mock_tool_inventory("__test_role_tool")
@@ -848,9 +843,7 @@ class TestAdminUIContract(FrappeTestCase):
         return match.group(0)
 
     def test_js_role_mode_options_match_api_contract(self):
-        js_role_modes = set(
-            re.findall(r'<option value="([^"]+)"', self._role_mode_select())
-        )
+        js_role_modes = set(re.findall(r'<option value="([^"]+)"', self._role_mode_select()))
         self.assertEqual(js_role_modes, {"Deny All", "Restrict to Listed Roles"})
 
         # Every mode the UI can submit is accepted by the API (fails later on
@@ -926,18 +919,18 @@ class TestToolConfigurationAccess(FACSecuritySnapshotTestCase):
             doc.insert(ignore_permissions=True)
 
         disabled_role = "__test_disabled_controller_role"
-        frappe.get_doc(
-            {"doctype": "Role", "role_name": disabled_role, "disabled": 1}
-        ).insert(ignore_permissions=True)
+        frappe.get_doc({"doctype": "Role", "role_name": disabled_role, "disabled": 1}).insert(
+            ignore_permissions=True
+        )
         self.addCleanup(frappe.db.delete, "Role", disabled_role)
         doc = self._doc(1, "Restrict to Listed Roles", [disabled_role])
         with self.assertRaises(frappe.ValidationError):
             doc.insert(ignore_permissions=True)
 
     def test_disabled_role_cannot_grant_access_after_configuration_is_saved(self):
-        frappe.get_doc(
-            {"doctype": "Role", "role_name": self.RUNTIME_ROLE, "disabled": 0}
-        ).insert(ignore_permissions=True)
+        frappe.get_doc({"doctype": "Role", "role_name": self.RUNTIME_ROLE, "disabled": 0}).insert(
+            ignore_permissions=True
+        )
         frappe.get_doc(
             {
                 "doctype": "Has Role",

@@ -123,9 +123,7 @@ class TestMetadataTools(BaseAssistantTest):
 
         result = MetadataTools.get_doctype_metadata("Sales Order")
         if not result.get("success"):
-            self.skipTest(
-                f"Sales Order DocType not present in this site: {result.get('error')}"
-            )
+            self.skipTest(f"Sales Order DocType not present in this site: {result.get('error')}")
 
         self.assertIn("child_tables", result)
         child_tables = result["child_tables"]
@@ -136,9 +134,7 @@ class TestMetadataTools(BaseAssistantTest):
             None,
         )
         if items_entry is None:
-            self.skipTest(
-                f"Sales Order has no 'items' child table in this site: {child_tables}"
-            )
+            self.skipTest(f"Sales Order has no 'items' child table in this site: {child_tables}")
 
         self.assertEqual(items_entry["options"], "Sales Order Item")
         self.assertIn(items_entry["fieldtype"], ("Table", "Table MultiSelect"))
@@ -167,9 +163,7 @@ class TestMetadataTools(BaseAssistantTest):
         # Frappe install.
         parent_result = MetadataTools.get_doctype_metadata("Customer")
         if not parent_result.get("success"):
-            self.skipTest(
-                f"Customer DocType not present in this site: {parent_result.get('error')}"
-            )
+            self.skipTest(f"Customer DocType not present in this site: {parent_result.get('error')}")
         self.assertFalse(parent_result["is_single"])
         self.assertFalse(parent_result["is_child_table"])
 
@@ -231,9 +225,14 @@ class TestMetadataTools(BaseAssistantTest):
         parent_meta.naming_rule = ""
         parent_meta.title_field = None
 
-        with patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.db.exists", return_value=True), \
-             patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.has_permission", return_value=True), \
-             patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.get_meta", return_value=parent_meta):
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.db.exists", return_value=True
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.has_permission", return_value=True
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.get_meta",
+            return_value=parent_meta,
+        ):
             result = MetadataTools.get_doctype_metadata("Synthetic Parent")
 
         self.assertTrue(result.get("success"), result)

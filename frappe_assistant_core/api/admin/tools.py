@@ -466,9 +466,7 @@ def update_tool_role_access(tool_name: str, role_access_mode: str, roles: list |
         for role_entry in roles:
             role = role_entry.get("role") if isinstance(role_entry, dict) else role_entry
             allow_access = (
-                frappe.utils.cint(role_entry.get("allow_access", 1))
-                if isinstance(role_entry, dict)
-                else 1
+                frappe.utils.cint(role_entry.get("allow_access", 1)) if isinstance(role_entry, dict) else 1
             )
             if not role or not frappe.db.exists("Role", {"name": role, "disabled": 0}):
                 return {"success": False, "message": _(f"Invalid role: '{role}'")}

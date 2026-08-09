@@ -80,10 +80,7 @@ def sanitize_for_audit(value: Any, _seen: Optional[set] = None) -> Any:
 
     if isinstance(value, str):
         candidate = value.lstrip()
-        if (
-            candidate.startswith(("{", "["))
-            and len(value.encode("utf-8")) <= _JSON_STRING_MAX_BYTES
-        ):
+        if candidate.startswith(("{", "[")) and len(value.encode("utf-8")) <= _JSON_STRING_MAX_BYTES:
             try:
                 decoded = json.loads(value)
             except (TypeError, ValueError, json.JSONDecodeError):
@@ -108,9 +105,7 @@ def sanitize_for_audit(value: Any, _seen: Optional[set] = None) -> Any:
         _seen.add(identity)
         try:
             return {
-                key: "***REDACTED***"
-                if _is_audit_sensitive_key(key)
-                else sanitize_for_audit(nested, _seen)
+                key: "***REDACTED***" if _is_audit_sensitive_key(key) else sanitize_for_audit(nested, _seen)
                 for key, nested in value.items()
             }
         finally:
@@ -228,9 +223,7 @@ def log_tool_execution(
 
     except Exception as e:
         # Don't fail tool execution due to audit logging issues
-        frappe.logger("audit_trail").warning(
-            f"Failed to log tool execution: {type(e).__name__}"
-        )
+        frappe.logger("audit_trail").warning(f"Failed to log tool execution: {type(e).__name__}")
 
 
 def log_denied_tool_attempt(
@@ -311,9 +304,7 @@ def log_tool_discovery(app_name: str, tools_found: int, errors: int, discovery_t
         audit_doc.insert(ignore_permissions=True)
 
     except Exception as e:
-        frappe.logger("audit_trail").warning(
-            f"Failed to log tool discovery: {type(e).__name__}"
-        )
+        frappe.logger("audit_trail").warning(f"Failed to log tool discovery: {type(e).__name__}")
 
 
 def log_security_event(event_type: str, user: str, details: Dict[str, Any], severity: str = "Medium"):
@@ -359,9 +350,7 @@ def log_security_event(event_type: str, user: str, details: Dict[str, Any], seve
             )
 
     except Exception as e:
-        frappe.logger("audit_trail").warning(
-            f"Failed to log security event: {type(e).__name__}"
-        )
+        frappe.logger("audit_trail").warning(f"Failed to log security event: {type(e).__name__}")
 
 
 def get_audit_summary(user: Optional[str] = None, days: int = 7) -> Dict[str, Any]:
@@ -418,7 +407,5 @@ def get_audit_summary(user: Optional[str] = None, days: int = 7) -> Dict[str, An
         return summary
 
     except Exception as e:
-        frappe.logger("audit_trail").error(
-            f"Failed to get audit summary: {type(e).__name__}"
-        )
+        frappe.logger("audit_trail").error(f"Failed to get audit summary: {type(e).__name__}")
         return {"total_events": 0, "error": "Audit summary unavailable"}

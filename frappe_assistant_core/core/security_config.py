@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import frappe
 
@@ -95,8 +95,7 @@ class _DenyAll:
 
     def __iter__(self):
         raise RuntimeError(
-            "fac_deny_all: canonical restricted-Doctype set is unavailable; "
-            "iteration is not safe"
+            "fac_deny_all: canonical restricted-Doctype set is unavailable; " "iteration is not safe"
         )
 
     def __len__(self) -> int:
@@ -177,7 +176,7 @@ RESTRICTED_DOCTYPES: Mapping[str, Any] = _LegacyRestrictedDoctypes()
 # Sensitive / admin-only field snapshots (still authoritative for policy)
 # ---------------------------------------------------------------------------
 
-SENSITIVE_FIELDS: Dict[str, Any] = {
+SENSITIVE_FIELDS: dict[str, Any] = {
     "all_doctypes": [
         "password",
         "new_password",
@@ -285,7 +284,7 @@ SENSITIVE_FIELDS: Dict[str, Any] = {
     ],
 }
 
-ADMIN_ONLY_FIELDS: Dict[str, Any] = {
+ADMIN_ONLY_FIELDS: dict[str, Any] = {
     "all_doctypes": [
         "owner",
         "creation",
@@ -376,7 +375,7 @@ def check_tool_access(user_role: str, tool_name: str) -> bool:
     return False
 
 
-def get_allowed_tools(user_role: str) -> List[str]:
+def get_allowed_tools(user_role: str) -> list[str]:
     """Deprecated. The matrix no longer exists; there is no static per-role
     allowlist to return. Publication/execution authority lives in
     :class:`SecurityPolicy` and the FAC Tool Configuration rows it consults.
@@ -431,8 +430,8 @@ def get_user_primary_role(user: str) -> str:
 
 
 def filter_sensitive_fields(
-    doc_dict: Dict[str, Any], doctype: str, user_role: str | None = None
-) -> Dict[str, Any]:
+    doc_dict: dict[str, Any], doctype: str, user_role: str | None = None
+) -> dict[str, Any]:
     """Redact sensitive/admin-only fields from ``doc_dict``.
 
     Previously granted ``System Manager`` a full bypass (returned the dict
@@ -483,8 +482,8 @@ def validate_document_access(
     doctype: str,
     name: str,
     perm_type: str = "read",
-    data: str | Dict[str, Any] | None = "",
-) -> Dict[str, Any]:
+    data: str | dict[str, Any] | None = "",
+) -> dict[str, Any]:
     """Backwards-compatible wrapper around the central policy decision plus a
     native Frappe permission check.
 

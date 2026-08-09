@@ -108,9 +108,9 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
 
         tool = RunWorkflow()
         with patch(
-             "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
-             side_effect=AssertionError("restricted target must not reach get_doc"),
-         ) as get_doc:
+            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
+            side_effect=AssertionError("restricted target must not reach get_doc"),
+        ) as get_doc:
             result = tool.execute(
                 {
                     "doctype": "User",
@@ -183,28 +183,21 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
 
         with patch(
             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.session"
-        ) as session, \
-         patch(
-             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_roles",
-             return_value=["Assistant User"],
-         ), \
-         patch(
-             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb",
-             fake_qb,
-         ), \
-         patch(
-             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.has_permission",
-             side_effect=lambda dt, ptype="read", doc=None, **kw: (
-                 dt == "Customer" and doc == "CUST-001"
-             ),
-         ), \
-         patch(
-             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_all",
-             return_value=[],
-         ), \
-         patch(
-             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.DocType",
-             return_value=MagicMock(),
+        ) as session, patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_roles",
+            return_value=["Assistant User"],
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb",
+            fake_qb,
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.has_permission",
+            side_effect=lambda dt, ptype="read", doc=None, **kw: (dt == "Customer" and doc == "CUST-001"),
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_all",
+            return_value=[],
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.DocType",
+            return_value=MagicMock(),
         ):
             session.user = "user@example.com"
 
@@ -236,15 +229,19 @@ class TestFacV23WorkflowRowPermission(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools.run_workflow import RunWorkflow
 
         tool = RunWorkflow()
-        with patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission",
-                   return_value=True), \
-             patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
-                   side_effect=AssertionError("restricted target must not reach get_doc")):
-            result = tool.execute({
-                "doctype": "User",
-                "name": "admin@example.com",
-                "action": "Approve",
-            })
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission", return_value=True
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
+            side_effect=AssertionError("restricted target must not reach get_doc"),
+        ):
+            result = tool.execute(
+                {
+                    "doctype": "User",
+                    "name": "admin@example.com",
+                    "action": "Approve",
+                }
+            )
         self.assertFalse(result.get("success"))
         self.assertEqual(result.get("error"), "Workflow action not available")
 
@@ -256,21 +253,27 @@ class TestFacV23WorkflowRowPermission(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools.run_workflow import RunWorkflow
 
         tool = RunWorkflow()
+
         # ``has_permission(doc=...)`` returns False for the unreadable row.
         def perm_gate(doctype, ptype="read", doc=None, **kw):
             if doc == "CUST-PRIVATE":
                 return False
             return True
 
-        with patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission",
-                   side_effect=perm_gate), \
-             patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
-                   side_effect=AssertionError("get_doc must NOT be called for unreadable row")):
-            result = tool.execute({
-                "doctype": "Customer",
-                "name": "CUST-PRIVATE",
-                "action": "Approve",
-            })
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission",
+            side_effect=perm_gate,
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
+            side_effect=AssertionError("get_doc must NOT be called for unreadable row"),
+        ):
+            result = tool.execute(
+                {
+                    "doctype": "Customer",
+                    "name": "CUST-PRIVATE",
+                    "action": "Approve",
+                }
+            )
         self.assertFalse(result.get("success"))
         self.assertEqual(result.get("error"), "Workflow action not available")
 
@@ -282,18 +285,23 @@ class TestFacV23WorkflowRowPermission(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools.run_workflow import RunWorkflow
 
         tool = RunWorkflow()
-        with patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission",
-                   return_value=False):
-            missing = tool.execute({
-                "doctype": "Customer",
-                "name": "TRULY-MISSING",
-                "action": "Approve",
-            })
-            unreadable = tool.execute({
-                "doctype": "Customer",
-                "name": "CUST-PRIVATE",
-                "action": "Approve",
-            })
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission", return_value=False
+        ):
+            missing = tool.execute(
+                {
+                    "doctype": "Customer",
+                    "name": "TRULY-MISSING",
+                    "action": "Approve",
+                }
+            )
+            unreadable = tool.execute(
+                {
+                    "doctype": "Customer",
+                    "name": "CUST-PRIVATE",
+                    "action": "Approve",
+                }
+            )
         self.assertEqual(missing.get("error"), unreadable.get("error"))
         self.assertEqual(missing.get("error"), "Workflow action not available")
 
@@ -337,15 +345,19 @@ class TestFacV23PendingApprovalsActiveRoles(BaseAssistantTest):
         fake_qb.from_.side_effect = lambda *args, **kwargs: _FakeQuery()
         fake_qb.desc = "desc"
 
-        with patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_roles",
-                   return_value=["Active Role", "Disabled Role"]), \
-             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.db.get_list",
-                   return_value=["Active Role"]) as get_list, \
-             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.session") as session, \
-             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb",
-                   fake_qb), \
-             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.DocType",
-                   return_value=MagicMock()):
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_roles",
+            return_value=["Active Role", "Disabled Role"],
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.db.get_list",
+            return_value=["Active Role"],
+        ) as get_list, patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.session"
+        ) as session, patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb", fake_qb
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.DocType", return_value=MagicMock()
+        ):
             session.user = "user@example.com"
             result = tool.execute({"doctype": None, "include_actions": False})
 

@@ -38,6 +38,7 @@ def _log_safe(tag: str, exc=None) -> None:
     except Exception:
         pass
 
+
 MAX_TRANSITION_DOCS = 20
 
 

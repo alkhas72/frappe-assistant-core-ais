@@ -659,9 +659,7 @@ class TestFetchToolRedaction(BaseAssistantTest):
 
         from frappe_assistant_core.core.security_config import is_doctype_accessible
 
-        with patch(
-            "frappe_assistant_core.core.security_config.frappe.get_meta"
-        ) as get_meta:
+        with patch("frappe_assistant_core.core.security_config.frappe.get_meta") as get_meta:
             # Restricted parent (User) is checked before meta is consulted, so
             # the meta mock is just defensive.
             get_meta.return_value.istable = False
@@ -744,18 +742,13 @@ class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
         with patch(
             "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
             return_value=True,
-        ), \
-         patch(
-             "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
-             side_effect=AssertionError(
-                 f"restricted target {doctype} must not reach frappe.get_doc"
-             ),
-         ):
+        ), patch(
+            "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+            side_effect=AssertionError(f"restricted target {doctype} must not reach frappe.get_doc"),
+        ):
             try:
                 tool.execute({"id": f"{doctype}/{name}"})
-                self.fail(
-                    f"ChatGPTFetch.execute for restricted DocType {doctype} did not raise"
-                )
+                self.fail(f"ChatGPTFetch.execute for restricted DocType {doctype} did not raise")
             except frappe.PermissionError:
                 # Expected: same "Permission denied" answer for every
                 # restricted target, regardless of which one was hit.
@@ -768,14 +761,10 @@ class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
         self._assert_restricted_refused("File", "FILE-LEAK")
 
     def test_fetch_fac_tool_configuration_target_refused_directly(self):
-        self._assert_restricted_refused(
-            "FAC Tool Configuration", "get_document"
-        )
+        self._assert_restricted_refused("FAC Tool Configuration", "get_document")
 
     def test_fetch_fac_plugin_configuration_target_refused_directly(self):
-        self._assert_restricted_refused(
-            "FAC Plugin Configuration", "core"
-        )
+        self._assert_restricted_refused("FAC Plugin Configuration", "core")
 
     def test_fetch_restricted_targets_indistinguishable(self):
         """All restricted targets must yield the same external answer so the
@@ -794,11 +783,10 @@ class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
             with patch(
                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
                 return_value=True,
-            ), \
-             patch(
-                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
-                 side_effect=AssertionError("must not be reached"),
-             ):
+            ), patch(
+                "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+                side_effect=AssertionError("must not be reached"),
+            ):
                 try:
                     tool.execute({"id": f"{doctype}/{name}"})
                     msg = "no-exception"
@@ -1099,11 +1087,10 @@ class TestFacV23FetchParity(BaseAssistantTest):
             with patch(
                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
                 return_value=True,
-            ), \
-             patch(
-                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
-                 side_effect=AssertionError("restricted target must not reach get_doc"),
-             ):
+            ), patch(
+                "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+                side_effect=AssertionError("restricted target must not reach get_doc"),
+            ):
                 try:
                     tool.execute({"id": f"{doctype}/{name}"})
                     msgs.append("no-exception")
@@ -1119,6 +1106,7 @@ class TestFacV23FetchParity(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools import chatgpt_fetch
 
         tool = chatgpt_fetch.ChatGPTFetch()
+
         # Missing: get_doc raises DoesNotExistError.
         def raise_missing(doctype, name):
             raise frappe.DoesNotExistError("missing")
@@ -1150,11 +1138,9 @@ class TestFacV23FetchParity(BaseAssistantTest):
         secret_doc_id = "User/secret-token-in-doc-id-hunter2"
 
         capturing_logger = MagicMock()
-        with patch.object(chatgpt_fetch.frappe, "has_permission", return_value=True), \
-             patch.object(chatgpt_fetch.frappe, "get_doc",
-                          side_effect=AssertionError("must not be reached")), \
-             patch.object(chatgpt_fetch.frappe, "logger",
-                          return_value=capturing_logger):
+        with patch.object(chatgpt_fetch.frappe, "has_permission", return_value=True), patch.object(
+            chatgpt_fetch.frappe, "get_doc", side_effect=AssertionError("must not be reached")
+        ), patch.object(chatgpt_fetch.frappe, "logger", return_value=capturing_logger):
             try:
                 tool.execute({"id": secret_doc_id})
                 response = {"no": "exception"}
@@ -1180,6 +1166,7 @@ class TestFacV23LegacyFailClosed(BaseAssistantTest):
     def test_membership_canonical_for_every_role(self):
         from frappe_assistant_core.core import security_config
         from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES as canonical
+
         for role in ("Assistant User", "Assistant Admin", "System Manager", "Default"):
             legacy = security_config.RESTRICTED_DOCTYPES.get(role, [])
             self.assertIn("User", legacy, f"role={role}")
@@ -1188,16 +1175,19 @@ class TestFacV23LegacyFailClosed(BaseAssistantTest):
 
     def test_unknown_role_returns_canonical_not_empty(self):
         from frappe_assistant_core.core import security_config
+
         legacy = security_config.RESTRICTED_DOCTYPES.get("Unknown Role XYZ", [])
         self.assertIn("User", legacy)
 
     def test_truthiness_non_empty(self):
         from frappe_assistant_core.core import security_config
+
         legacy = security_config.RESTRICTED_DOCTYPES.get("Assistant User", [])
         self.assertTrue(legacy)
 
     def test_mutation_rejected(self):
         from frappe_assistant_core.core import security_config
+
         with self.assertRaises((TypeError, NotImplementedError)):
             security_config.RESTRICTED_DOCTYPES["Assistant User"] = ["Customer"]
 
@@ -1205,6 +1195,7 @@ class TestFacV23LegacyFailClosed(BaseAssistantTest):
         from collections.abc import Mapping
 
         from frappe_assistant_core.core import security_config
+
         # Tuple / frozenset / MappingProxyType — all immutable.
         self.assertIsInstance(security_config.BASIC_CORE_TOOLS, (tuple, frozenset))
         self.assertIsInstance(security_config.ROLE_TOOL_ACCESS, (tuple, frozenset, Mapping))

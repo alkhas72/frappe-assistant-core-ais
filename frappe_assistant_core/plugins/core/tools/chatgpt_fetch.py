@@ -162,9 +162,7 @@ class ChatGPTFetch(BaseTool):
             # underlying exception text never reaches the public surface; the
             # log keeps one safe record (constant tag + type only).
             try:
-                frappe.logger("fac.chatgpt_fetch").warning(
-                    "fetch refused: DoesNotExistError"
-                )
+                frappe.logger("fac.chatgpt_fetch").warning("fetch refused: DoesNotExistError")
             except Exception:
                 pass
             raise frappe.PermissionError("Permission denied") from None
@@ -178,9 +176,7 @@ class ChatGPTFetch(BaseTool):
             # cannot distinguish restricted-target from unreadable-record OR
             # from a missing record by inspecting the exception text.
             try:
-                frappe.logger("fac.chatgpt_fetch").warning(
-                    f"fetch refused: {type(e).__name__}"
-                )
+                frappe.logger("fac.chatgpt_fetch").warning(f"fetch refused: {type(e).__name__}")
             except Exception:
                 pass
             raise frappe.PermissionError("Permission denied") from e

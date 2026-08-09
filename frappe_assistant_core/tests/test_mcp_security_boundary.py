@@ -54,13 +54,15 @@ class TestMCPToolCallBoundary(BaseAssistantTest):
             ToolContext(operation="authorize"),
         )
         with ExitStack() as stack:
-            stack.enter_context(patch(
-                "frappe_assistant_core.core.security_policy.SecurityPolicy.authorize",
-                return_value=decision,
-            ))
-            audit = stack.enter_context(patch(
-                "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-            ))
+            stack.enter_context(
+                patch(
+                    "frappe_assistant_core.core.security_policy.SecurityPolicy.authorize",
+                    return_value=decision,
+                )
+            )
+            audit = stack.enter_context(
+                patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt")
+            )
             stack.enter_context(patch.object(frappe, "logger", return_value=logger))
             result = self.server._handle_tools_call(
                 {
@@ -107,9 +109,7 @@ class TestMCPToolCallBoundary(BaseAssistantTest):
 
     def test_non_dict_arguments_are_rejected_before_executor_and_audited_once(self):
         executor = MagicMock()
-        with patch(
-            "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-        ) as audit:
+        with patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt") as audit:
             for arguments in (None, [], "{}", 1, True):
                 with self.subTest(arguments=arguments):
                     audit.reset_mock()
@@ -145,9 +145,7 @@ class TestMCPToolCallBoundary(BaseAssistantTest):
         executor.assert_called_once_with()
 
     def test_invalid_tool_names_are_stable_and_audited(self):
-        with patch(
-            "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-        ) as audit:
+        with patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt") as audit:
             for tool_name in (None, "", []):
                 with self.subTest(tool_name=tool_name):
                     audit.reset_mock()
@@ -208,9 +206,9 @@ class TestMCPToolCallBoundary(BaseAssistantTest):
             raise PolicyDenied(decision)
 
         with ExitStack() as stack:
-            boundary_audit = stack.enter_context(patch(
-                "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-            ))
+            boundary_audit = stack.enter_context(
+                patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt")
+            )
             result = self.server._handle_tools_call(
                 {"name": "get_document", "arguments": {}},
                 {
@@ -229,13 +227,13 @@ class TestMCPToolCallBoundary(BaseAssistantTest):
     def test_tools_list_writes_one_count_only_summary(self):
         registry = {"get_document": _tool("get_document", MagicMock())}
         with ExitStack() as stack:
-            stack.enter_context(patch(
-                "frappe_assistant_core.core.security_policy.SecurityPolicy.inventory",
-                return_value=frozenset({"get_document", "create_document", "run_workflow"}),
-            ))
-            audit = stack.enter_context(patch(
-                "frappe_assistant_core.utils.audit_trail.log_tool_execution"
-            ))
+            stack.enter_context(
+                patch(
+                    "frappe_assistant_core.core.security_policy.SecurityPolicy.inventory",
+                    return_value=frozenset({"get_document", "create_document", "run_workflow"}),
+                )
+            )
+            audit = stack.enter_context(patch("frappe_assistant_core.utils.audit_trail.log_tool_execution"))
             result = self.server._handle_tools_list({}, registry)
 
         self.assertEqual([tool["name"] for tool in result["tools"]], ["get_document"])
@@ -261,12 +259,8 @@ class TestMCPAuthenticationBoundary(BaseAssistantTest):
         )
         with ExitStack() as stack:
             stack.enter_context(patch.object(fac_endpoint.frappe, "request", request))
-            build = stack.enter_context(
-                patch.object(fac_endpoint, "_build_tool_registry")
-            )
-            audit = stack.enter_context(patch(
-                "frappe_assistant_core.utils.audit_trail.log_security_event"
-            ))
+            build = stack.enter_context(patch.object(fac_endpoint, "_build_tool_registry"))
+            audit = stack.enter_context(patch("frappe_assistant_core.utils.audit_trail.log_security_event"))
             response = fac_endpoint.mcp._entry_fn()
 
         self.assertIsInstance(response, Response)
@@ -289,20 +283,16 @@ class TestMCPAuthenticationBoundary(BaseAssistantTest):
         logger = MagicMock()
         with ExitStack() as stack:
             stack.enter_context(patch.object(fac_endpoint.frappe, "request", request))
+            stack.enter_context(patch.object(fac_endpoint.frappe, "logger", return_value=logger))
             stack.enter_context(
-                patch.object(fac_endpoint.frappe, "logger", return_value=logger)
+                patch.object(
+                    fac_endpoint.frappe,
+                    "get_doc",
+                    side_effect=RuntimeError("internal-secret"),
+                )
             )
-            stack.enter_context(patch.object(
-                fac_endpoint.frappe,
-                "get_doc",
-                side_effect=RuntimeError("internal-secret"),
-            ))
-            error_log = stack.enter_context(
-                patch.object(fac_endpoint.frappe, "log_error")
-            )
-            audit = stack.enter_context(patch(
-                "frappe_assistant_core.utils.audit_trail.log_security_event"
-            ))
+            error_log = stack.enter_context(patch.object(fac_endpoint.frappe, "log_error"))
+            audit = stack.enter_context(patch("frappe_assistant_core.utils.audit_trail.log_security_event"))
             response = fac_endpoint._authenticate_mcp_request()
 
         body = response.get_data(as_text=True)
@@ -329,20 +319,22 @@ class TestMCPAuthenticationBoundary(BaseAssistantTest):
         )
         with ExitStack() as stack:
             stack.enter_context(patch.object(fac_endpoint.frappe, "request", request))
-            stack.enter_context(patch.object(
-                fac_endpoint,
-                "_authenticate_mcp_request",
-                return_value="Guest",
-            ))
-            stack.enter_context(patch.object(
-                fac_endpoint,
-                "_check_assistant_enabled",
-                return_value=True,
-            ))
+            stack.enter_context(
+                patch.object(
+                    fac_endpoint,
+                    "_authenticate_mcp_request",
+                    return_value="Guest",
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    fac_endpoint,
+                    "_check_assistant_enabled",
+                    return_value=True,
+                )
+            )
             build = stack.enter_context(patch.object(fac_endpoint, "_build_tool_registry"))
-            audit = stack.enter_context(patch(
-                "frappe_assistant_core.utils.audit_trail.log_security_event"
-            ))
+            audit = stack.enter_context(patch("frappe_assistant_core.utils.audit_trail.log_security_event"))
             response = fac_endpoint.mcp._entry_fn()
 
         self.assertIsInstance(response, Response)
@@ -436,12 +428,10 @@ class TestMCPHandleLogging(BaseAssistantTest):
                 frappe.local.request = request
                 try:
                     with ExitStack() as stack:
-                        stack.enter_context(
-                            patch.object(frappe, "logger", return_value=logger)
+                        stack.enter_context(patch.object(frappe, "logger", return_value=logger))
+                        audit = stack.enter_context(
+                            patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt")
                         )
-                        audit = stack.enter_context(patch(
-                            "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-                        ))
                         result = server.handle(request, response, tool_registry={})
                 finally:
                     frappe.local.request = original_request
@@ -490,9 +480,7 @@ class TestMCPHandleLogging(BaseAssistantTest):
         original_request = getattr(frappe.local, "request", None)
         frappe.local.request = request
         try:
-            with patch(
-                "frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt"
-            ) as audit:
+            with patch("frappe_assistant_core.utils.audit_trail.log_denied_tool_attempt") as audit:
                 result = server.handle(request, response, tool_registry={})
         finally:
             frappe.local.request = original_request
@@ -521,9 +509,7 @@ class TestMCPHandleLogging(BaseAssistantTest):
         original_request = getattr(frappe.local, "request", None)
         frappe.local.request = request
         try:
-            with patch(
-                "frappe_assistant_core.mcp.server.audit_tools_list_summary"
-            ) as audit:
+            with patch("frappe_assistant_core.mcp.server.audit_tools_list_summary") as audit:
                 result = server.handle(
                     request,
                     response,

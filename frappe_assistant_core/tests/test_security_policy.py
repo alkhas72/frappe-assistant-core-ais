@@ -44,27 +44,92 @@ EXPECTED_24_TOOLS = {
     "list_user_dashboards",
 }
 EXPECTED_HARD_DENY = {
-    "delete_document", "run_python_code", "run_database_query", "analyze_business_data",
-    "extract_file_content", "create_dashboard", "create_dashboard_chart", "list_user_dashboards",
-    "document_create", "document_get", "document_update", "document_list", "search_global",
-    "report_execute", "report_columns", "metadata_doctype", "create_visualization",
-    "analyze_frappe_data", "workflow_status", "workflow_list", "execute_python_code",
-    "query_and_analyze", "metadata_permissions", "metadata_workflow", "tool_registry_list",
-    "tool_registry_toggle", "audit_log_view", "workflow_action",
+    "delete_document",
+    "run_python_code",
+    "run_database_query",
+    "analyze_business_data",
+    "extract_file_content",
+    "create_dashboard",
+    "create_dashboard_chart",
+    "list_user_dashboards",
+    "document_create",
+    "document_get",
+    "document_update",
+    "document_list",
+    "search_global",
+    "report_execute",
+    "report_columns",
+    "metadata_doctype",
+    "create_visualization",
+    "analyze_frappe_data",
+    "workflow_status",
+    "workflow_list",
+    "execute_python_code",
+    "query_and_analyze",
+    "metadata_permissions",
+    "metadata_workflow",
+    "tool_registry_list",
+    "tool_registry_toggle",
+    "audit_log_view",
+    "workflow_action",
 }
 EXPECTED_RESTRICTED_DOCTYPES = {
-    "User", "Role", "User Permission", "Role Permission", "Custom Role", "Module Profile",
-    "Role Profile", "Custom DocPerm", "DocShare", "System Settings", "Print Settings",
-    "Email Domain", "LDAP Settings", "OAuth Settings", "Social Login Key", "Dropbox Settings",
-    "Connected App", "OAuth Bearer Token", "OAuth Client", "Error Log", "Activity Log",
-    "Access Log", "View Log", "Scheduler Log", "Integration Request", "Server Script",
-    "Client Script", "Custom Script", "Property Setter", "Customize Form",
-    "Customize Form Field", "DocType", "DocField", "DocPerm", "Custom Field", "Package",
-    "Package Release", "Installed Application", "Data Import", "Data Export", "Bulk Update",
-    "Rename Tool", "Database Storage Usage By Tables", "Workflow", "Workflow Action",
-    "Workflow State", "Workflow Transition", "Email Queue", "Email Queue Recipient",
-    "Email Alert", "Auto Email Report", "File", "Assistant Core Settings",
-    "FAC Tool Configuration", "FAC Tool Role Access", "FAC Plugin Configuration",
+    "User",
+    "Role",
+    "User Permission",
+    "Role Permission",
+    "Custom Role",
+    "Module Profile",
+    "Role Profile",
+    "Custom DocPerm",
+    "DocShare",
+    "System Settings",
+    "Print Settings",
+    "Email Domain",
+    "LDAP Settings",
+    "OAuth Settings",
+    "Social Login Key",
+    "Dropbox Settings",
+    "Connected App",
+    "OAuth Bearer Token",
+    "OAuth Client",
+    "Error Log",
+    "Activity Log",
+    "Access Log",
+    "View Log",
+    "Scheduler Log",
+    "Integration Request",
+    "Server Script",
+    "Client Script",
+    "Custom Script",
+    "Property Setter",
+    "Customize Form",
+    "Customize Form Field",
+    "DocType",
+    "DocField",
+    "DocPerm",
+    "Custom Field",
+    "Package",
+    "Package Release",
+    "Installed Application",
+    "Data Import",
+    "Data Export",
+    "Bulk Update",
+    "Rename Tool",
+    "Database Storage Usage By Tables",
+    "Workflow",
+    "Workflow Action",
+    "Workflow State",
+    "Workflow Transition",
+    "Email Queue",
+    "Email Queue Recipient",
+    "Email Alert",
+    "Auto Email Report",
+    "File",
+    "Assistant Core Settings",
+    "FAC Tool Configuration",
+    "FAC Tool Role Access",
+    "FAC Plugin Configuration",
     "Assistant Audit Log",
 }
 ALLOW_SYSTEM_MANAGER = {
@@ -85,15 +150,11 @@ class TestSecurityPolicy(FrappeTestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(SecurityPolicy, "_is_actor_enabled", return_value=True))
             stack.enter_context(patch.object(SecurityPolicy, "_is_plugin_enabled", return_value=True))
-            stack.enter_context(
-                patch.object(SecurityPolicy, "_load_access_config", return_value=config)
-            )
+            stack.enter_context(patch.object(SecurityPolicy, "_load_access_config", return_value=config))
             stack.enter_context(
                 patch.object(SecurityPolicy, "_get_actor_roles", return_value={"Assistant User"})
             )
-            stack.enter_context(
-                patch.object(SecurityPolicy, "_has_native_permissions", return_value=True)
-            )
+            stack.enter_context(patch.object(SecurityPolicy, "_has_native_permissions", return_value=True))
             return SecurityPolicy.authorize(
                 actor="agent@example.com",
                 tool_name=tool_name,
@@ -202,16 +263,12 @@ class TestSecurityPolicy(FrappeTestCase):
         self.assertEqual(guest.reason_code, "ACTOR_UNAUTHENTICATED")
 
         with patch.object(SecurityPolicy, "_is_actor_enabled", return_value=False):
-            actor_disabled = SecurityPolicy.authorize(
-                "agent@example.com", "get_document", {}, "execute"
-            )
+            actor_disabled = SecurityPolicy.authorize("agent@example.com", "get_document", {}, "execute")
         self.assertFalse(actor_disabled.allowed)
         self.assertEqual(actor_disabled.reason_code, "ASSISTANT_DISABLED")
 
         config = dict(ALLOW_ASSISTANT_USER, enabled=False)
-        tool_disabled = self._authorize(
-            "get_document", {"doctype": "ToDo", "name": "TD-1"}, config
-        )
+        tool_disabled = self._authorize("get_document", {"doctype": "ToDo", "name": "TD-1"}, config)
         self.assertFalse(tool_disabled.allowed)
         self.assertEqual(tool_disabled.reason_code, "TOOL_DISABLED")
 
@@ -219,16 +276,12 @@ class TestSecurityPolicy(FrappeTestCase):
             stack.enter_context(patch.object(SecurityPolicy, "_is_actor_enabled", return_value=True))
             stack.enter_context(patch.object(SecurityPolicy, "_is_plugin_enabled", return_value=True))
             stack.enter_context(
-                patch.object(
-                    SecurityPolicy, "_load_access_config", return_value=ALLOW_ASSISTANT_USER
-                )
+                patch.object(SecurityPolicy, "_load_access_config", return_value=ALLOW_ASSISTANT_USER)
             )
             stack.enter_context(
                 patch.object(SecurityPolicy, "_get_actor_roles", return_value={"Assistant User"})
             )
-            stack.enter_context(
-                patch.object(SecurityPolicy, "_has_native_permissions", return_value=False)
-            )
+            stack.enter_context(patch.object(SecurityPolicy, "_has_native_permissions", return_value=False))
             native_denied = SecurityPolicy.authorize(
                 "agent@example.com",
                 "get_document",
@@ -338,9 +391,7 @@ class TestSecurityPolicy(FrappeTestCase):
         for phase, fresh in (("execute", True), ("publish", False)):
             with self.subTest(phase=phase):
                 with ExitStack() as stack:
-                    stack.enter_context(
-                        patch.object(SecurityPolicy, "_is_actor_enabled", return_value=True)
-                    )
+                    stack.enter_context(patch.object(SecurityPolicy, "_is_actor_enabled", return_value=True))
                     plugin_check = stack.enter_context(
                         patch.object(SecurityPolicy, "_is_plugin_enabled", return_value=True)
                     )
@@ -373,12 +424,8 @@ class TestSecurityPolicy(FrappeTestCase):
 
     def test_publish_does_not_require_call_arguments(self):
         with ExitStack() as stack:
-            stack.enter_context(
-                patch.object(SecurityPolicy, "_is_actor_enabled", return_value=True)
-            )
-            stack.enter_context(
-                patch.object(SecurityPolicy, "_is_plugin_enabled", return_value=True)
-            )
+            stack.enter_context(patch.object(SecurityPolicy, "_is_actor_enabled", return_value=True))
+            stack.enter_context(patch.object(SecurityPolicy, "_is_plugin_enabled", return_value=True))
             stack.enter_context(
                 patch.object(
                     SecurityPolicy,
@@ -393,9 +440,7 @@ class TestSecurityPolicy(FrappeTestCase):
                     return_value={"Assistant User"},
                 )
             )
-            native = stack.enter_context(
-                patch.object(SecurityPolicy, "_has_native_permissions")
-            )
+            native = stack.enter_context(patch.object(SecurityPolicy, "_has_native_permissions"))
             decision = SecurityPolicy.authorize(
                 "agent@example.com",
                 "get_document",

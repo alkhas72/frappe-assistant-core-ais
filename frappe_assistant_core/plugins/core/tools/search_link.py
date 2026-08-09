@@ -67,9 +67,7 @@ class SearchLink(BaseTool):
             )
 
         except Exception as exc:
-            frappe.logger("fac.search_link").warning(
-                f"search_link failed: {type(exc).__name__}"
-            )
+            frappe.logger("fac.search_link").warning(f"search_link failed: {type(exc).__name__}")
             return {"success": False, "error": "Link search failed"}
 
 

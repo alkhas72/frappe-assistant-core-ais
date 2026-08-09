@@ -51,9 +51,7 @@ def _security_snapshot_hash(snapshot):
 
 def _restore_security_rows(snapshot):
     for table in SNAPSHOT_TABLES:
-        columns = [
-            column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)
-        ]
+        columns = [column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)]
         frappe.db.sql(f"DELETE FROM `{table}`")
         if not snapshot[table]:
             continue
@@ -75,9 +73,7 @@ def tearDownModule():
     after_hash = _security_snapshot_hash(after)
     try:
         if after_hash != before_hash:
-            raise AssertionError(
-                f"FAC security snapshot changed: before={before_hash}, after={after_hash}"
-            )
+            raise AssertionError(f"FAC security snapshot changed: before={before_hash}, after={after_hash}")
     finally:
         _restore_security_rows(_module_security_snapshot)
         frappe.db.commit()

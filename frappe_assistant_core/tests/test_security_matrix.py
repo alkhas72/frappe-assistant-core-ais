@@ -70,9 +70,7 @@ def tearDownModule():
     after_hash = _security_snapshot_hash(after)
     try:
         if after_hash != before_hash:
-            raise AssertionError(
-                f"FAC matrix snapshot changed: before={before_hash}, after={after_hash}"
-            )
+            raise AssertionError(f"FAC matrix snapshot changed: before={before_hash}, after={after_hash}")
     finally:
         _restore_security_rows(_module_security_snapshot)
         frappe.db.commit()
@@ -80,6 +78,7 @@ def tearDownModule():
             frappe.local.assistant_session_id,
             frappe.local.assistant_client_id,
         ) = _module_request_identity
+
 
 # --- Literal acceptance snapshots (independent of production imports) ---------
 
@@ -285,9 +284,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         frappe.flags.in_test = True
         frappe.set_user("Administrator")
         self.probe_baseline = self._capture_tool_config(self.configurable_probe)
-        self.core_plugin_baseline = bool(
-            frappe.db.get_value("FAC Plugin Configuration", "core", "enabled")
-        )
+        self.core_plugin_baseline = bool(frappe.db.get_value("FAC Plugin Configuration", "core", "enabled"))
         self.actors = {label: self._unique_email(label) for label in ACTOR_ROLES}
         for label, email in self.actors.items():
             self._ensure_actor(email, ACTOR_ROLES[label])
@@ -356,10 +353,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         return {
             "enabled": current.enabled,
             "role_access_mode": current.role_access_mode,
-            "roles": [
-                {"role": row.role, "allow_access": row.allow_access}
-                for row in current.role_access
-            ],
+            "roles": [{"role": row.role, "allow_access": row.allow_access} for row in current.role_access],
         }
 
     def _apply_tool_config(self, tool_name: str, snapshot: dict) -> None:
@@ -969,12 +963,8 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         )
         with ExitStack() as stack:
             stack.enter_context(patch.object(fac_endpoint.frappe, "request", request))
-            stack.enter_context(
-                patch.object(fac_endpoint, "_authenticate_mcp_request", return_value="Guest")
-            )
-            stack.enter_context(
-                patch.object(fac_endpoint, "_check_assistant_enabled", return_value=True)
-            )
+            stack.enter_context(patch.object(fac_endpoint, "_authenticate_mcp_request", return_value="Guest"))
+            stack.enter_context(patch.object(fac_endpoint, "_check_assistant_enabled", return_value=True))
             build = stack.enter_context(patch.object(fac_endpoint, "_build_tool_registry"))
             response = fac_endpoint.mcp._entry_fn()
 
@@ -1009,10 +999,7 @@ class SecurityMatrixAcceptance(FrappeTestCase):
                 frappe.set_user(email)
                 frappe.local.assistant_session_id = f"{self.session_id}-{key}"
                 registry_obj = ToolRegistry()
-                published = {
-                    meta["name"]
-                    for meta in registry_obj.get_available_tools(user=email)
-                }
+                published = {meta["name"] for meta in registry_obj.get_available_tools(user=email)}
                 tools_dict: OrderedDict[str, dict] = OrderedDict()
                 for name in published:
                     tool = registry_obj.get_tool(name)

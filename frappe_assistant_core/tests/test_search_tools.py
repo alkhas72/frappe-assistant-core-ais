@@ -121,11 +121,7 @@ class TestSearchTools(BaseAssistantTest):
 
         self.assertTrue(result.get("success"), result)
         self.assertTrue(get_list.called, "global_search must query via frappe.get_list")
-        fac_calls = [
-            call
-            for call in get_list.call_args_list
-            if call.args and call.args[0] == "Employee"
-        ]
+        fac_calls = [call for call in get_list.call_args_list if call.args and call.args[0] == "Employee"]
         self.assertEqual(len(fac_calls), 1, get_list.call_args_list)
         self.assertFalse(
             fac_calls[0].kwargs.get("ignore_permissions", True),
@@ -185,12 +181,8 @@ class TestSearchTools(BaseAssistantTest):
         with ExitStack() as stack:
             # Pretend every doctype exists and is readable. Without the
             # restricted-target gate, User and DocType would leak through.
-            stack.enter_context(
-                patch.object(search_tools.frappe.db, "exists", return_value=True)
-            )
-            stack.enter_context(
-                patch.object(search_tools.frappe, "has_permission", return_value=True)
-            )
+            stack.enter_context(patch.object(search_tools.frappe.db, "exists", return_value=True))
+            stack.enter_context(patch.object(search_tools.frappe, "has_permission", return_value=True))
             get_list = stack.enter_context(patch.object(search_tools.frappe, "get_list"))
             get_list.return_value = [{"name": "LEAK"}]
 
@@ -212,12 +204,8 @@ class TestSearchTools(BaseAssistantTest):
         from frappe_assistant_core.plugins.core.tools import search_tools
 
         with ExitStack() as stack:
-            stack.enter_context(
-                patch.object(search_tools.frappe.db, "exists", return_value=True)
-            )
-            stack.enter_context(
-                patch.object(search_tools.frappe, "has_permission", return_value=True)
-            )
+            stack.enter_context(patch.object(search_tools.frappe.db, "exists", return_value=True))
+            stack.enter_context(patch.object(search_tools.frappe, "has_permission", return_value=True))
             # Sentinel: if restricted-target gate fails, ``get_list`` would be
             # reached. We assert on result + call count instead of trapping
             # ``get_list`` itself so the test does not interfere with any
@@ -240,15 +228,9 @@ class TestSearchTools(BaseAssistantTest):
         # ``search_link`` lazily inside the function, so we patch it on the
         # source module ``frappe.desk.search``.
         with ExitStack() as stack:
-            stack.enter_context(
-                patch.object(search_tools.frappe.db, "exists", return_value=True)
-            )
-            stack.enter_context(
-                patch.object(search_tools.frappe, "has_permission", return_value=True)
-            )
-            desk_search_link = stack.enter_context(
-                patch("frappe.desk.search.search_link")
-            )
+            stack.enter_context(patch.object(search_tools.frappe.db, "exists", return_value=True))
+            stack.enter_context(patch.object(search_tools.frappe, "has_permission", return_value=True))
+            desk_search_link = stack.enter_context(patch("frappe.desk.search.search_link"))
             desk_search_link.return_value = [{"name": "LEAK"}]
 
             result = search_tools.SearchTools.search_link(doctype="User", query="any", filters={})

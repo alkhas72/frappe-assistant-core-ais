@@ -55,9 +55,7 @@ def handle_tools_list(request_id: Optional[Any]) -> Dict[str, Any]:
         return response
 
     except Exception as e:
-        api_logger.error(
-            f"Error in handle_tools_list: type={type(e).__name__}"
-        )
+        api_logger.error(f"Error in handle_tools_list: type={type(e).__name__}")
         audit_tools_list_summary(0, status="Error")
 
         response = {
@@ -150,9 +148,7 @@ def handle_tool_call(params: Dict[str, Any], request_id: Optional[Any]) -> Dict[
                 response["id"] = request_id
             return response
         except Exception as e:
-            api_logger.error(
-                f"Tool execution failed: type={type(e).__name__}"
-            )
+            api_logger.error(f"Tool execution failed: type={type(e).__name__}")
             response = {
                 "jsonrpc": "2.0",
                 "error": {
@@ -177,9 +173,7 @@ def handle_tool_call(params: Dict[str, Any], request_id: Optional[Any]) -> Dict[
         return response
 
     except Exception as e:
-        api_logger.error(
-            f"Error in handle_tool_call: type={type(e).__name__}"
-        )
+        api_logger.error(f"Error in handle_tool_call: type={type(e).__name__}")
 
         response = {
             "jsonrpc": "2.0",

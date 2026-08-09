@@ -33,9 +33,7 @@ def _log_safe(tag: str, exc: Optional[BaseException] = None) -> None:
         if exc is None:
             frappe.logger("fac.report_tools").warning(tag)
         else:
-            frappe.logger("fac.report_tools").warning(
-                f"{tag}: {type(exc).__name__}"
-            )
+            frappe.logger("fac.report_tools").warning(f"{tag}: {type(exc).__name__}")
     except Exception:
         pass
 
@@ -318,9 +316,7 @@ class ReportTools:
                 fieldname = _parse_column_fieldname(col)
                 if isinstance(fieldname, str):
                     positional_fieldname_by_index[index] = fieldname
-                    if SecurityPolicy._contains_restricted_fields(
-                        ref_doctype, frozenset({fieldname})
-                    ):
+                    if SecurityPolicy._contains_restricted_fields(ref_doctype, frozenset({fieldname})):
                         sensitive_column_fields.add(fieldname)
                         continue
                 kept_columns.append(col)
@@ -332,11 +328,7 @@ class ReportTools:
             ref_doctype-driven redaction. The authoritative context remains
             ``ref_doctype``."""
             if isinstance(value, dict):
-                return {
-                    k: _strip_doctype_recursively(v)
-                    for k, v in value.items()
-                    if k != "doctype"
-                }
+                return {k: _strip_doctype_recursively(v) for k, v in value.items() if k != "doctype"}
             if isinstance(value, list):
                 return [_strip_doctype_recursively(v) for v in value]
             if isinstance(value, tuple):
@@ -401,17 +393,19 @@ class ReportTools:
             debug_info["data"] = _redact_dict_row(data)
         elif isinstance(data, (list, tuple)) and not isinstance(data, list):
             # ``data`` itself is a tuple of rows — normalise to list.
-            debug_info["data"] = [_redact_positional_row(r) if isinstance(r, (list, tuple))
-                                  else _redact_dict_row(r) if isinstance(r, dict)
-                                  else r
-                                  for r in data]
+            debug_info["data"] = [
+                _redact_positional_row(r)
+                if isinstance(r, (list, tuple))
+                else _redact_dict_row(r)
+                if isinstance(r, dict)
+                else r
+                for r in data
+            ]
 
         # Filters may carry a sensitive value (e.g. a token mistakenly pasted
         # into a filter). Apply universal redaction.
         if isinstance(debug_info.get("filters_applied"), dict):
-            debug_info["filters_applied"] = SecurityPolicy.redact_output(
-                ctx, debug_info["filters_applied"]
-            )
+            debug_info["filters_applied"] = SecurityPolicy.redact_output(ctx, debug_info["filters_applied"])
 
         return debug_info
 
@@ -608,9 +602,7 @@ class ReportTools:
                 # row would expose another user's data even if we discarded
                 # it afterwards.
                 try:
-                    prepared_doc_check = frappe.get_doc(
-                        "Prepared Report", prepared_report_name
-                    )
+                    prepared_doc_check = frappe.get_doc("Prepared Report", prepared_report_name)
                 except Exception:
                     prepared_doc_check = None
                 if (
@@ -1017,9 +1009,7 @@ class ReportTools:
                         " For Sales Analytics, you need: 'doc_type' (e.g., "
                         "'Sales Invoice') and 'tree_type' (e.g., 'Customer')."
                     )
-            elif "required" in lowered and any(
-                word in lowered for word in ["filter", "field", "parameter"]
-            ):
+            elif "required" in lowered and any(word in lowered for word in ["filter", "field", "parameter"]):
                 error_message = (
                     f"Missing required filters for {report_doc.name}. Use "
                     f"the report_requirements tool to discover all required "
@@ -1127,8 +1117,7 @@ class ReportTools:
                     )
                     if valid_options:
                         suggestions.append(
-                            f"Valid {doctype} names include: "
-                            f"{', '.join([v.name for v in valid_options])}"
+                            f"Valid {doctype} names include: " f"{', '.join([v.name for v in valid_options])}"
                         )
             except Exception:
                 # Never surface internal error text via suggestions.
