@@ -176,7 +176,7 @@ class LegacyToolRegistryAccess:
                 pass
 
         try:
-            frappe.db.commit()
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist exact fixture restoration
         except Exception:
             pass
 

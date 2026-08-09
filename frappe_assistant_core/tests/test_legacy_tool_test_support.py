@@ -78,4 +78,4 @@ class TestLegacyToolTestSupportRegression(BaseAssistantTest):
         frappe.set_user("Administrator")
         if frappe.db.exists("User", email):
             frappe.delete_doc("User", email, force=True)
-            frappe.db.commit()
+            frappe.db.commit()  # nosemgrep: frappe-manual-commit — persist forced-delete test cleanup
