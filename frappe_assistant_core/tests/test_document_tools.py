@@ -114,7 +114,12 @@ class TestDocumentTools(BaseAssistantTest):
             except Exception as e:
                 self.fail(f"Tool execution raised exception: {str(e)}")
             finally:
-                frappe.delete_doc(self.test_doctype, test_doc.name, force=True)
+                frappe.delete_doc(
+                    self.test_doctype,
+                    test_doc.name,
+                    ignore_permissions=True,
+                    force=True,
+                )
 
     def test_list_documents_via_execute_tool(self):
         """Test document listing"""
