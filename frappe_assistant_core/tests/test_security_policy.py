@@ -298,11 +298,18 @@ class TestSecurityPolicy(FrappeTestCase):
         context = ToolContext(operation="read", target_doctype="User")
         malformed = '{"token":'
         oversized = '{"token":"' + ("x" * 65_536) + '"}'
+        multibyte_oversized = '{"token":"' + ("€" * 21_846) + '"}'
         plain = "plain text"
 
         self.assertEqual(SecurityPolicy.redact_output(context, malformed), malformed)
         self.assertGreater(len(oversized.encode("utf-8")), 65_536)
         self.assertEqual(SecurityPolicy.redact_output(context, oversized), oversized)
+        self.assertLess(len(multibyte_oversized), 65_536)
+        self.assertGreater(len(multibyte_oversized.encode("utf-8")), 65_536)
+        self.assertEqual(
+            SecurityPolicy.redact_output(context, multibyte_oversized),
+            multibyte_oversized,
+        )
         self.assertEqual(SecurityPolicy.redact_output(context, plain), plain)
 
     def test_invalid_context_and_policy_exceptions_fail_closed(self):

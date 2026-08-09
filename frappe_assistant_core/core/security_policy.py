@@ -697,6 +697,7 @@ class SecurityPolicy:
         if (
             isinstance(value, str)
             and value.startswith(("{", "["))
+            and len(value) <= _JSON_STRING_REDACTION_MAX_BYTES
             and len(value.encode("utf-8")) <= _JSON_STRING_REDACTION_MAX_BYTES
         ):
             try:
