@@ -15,6 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import json
+import re
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 import frappe
@@ -35,28 +37,112 @@ _VALID_STATUSES = {
 # Output data is stored as JSON text in a Code field; cap to keep audit rows
 # from bloating when a tool returns a large payload.
 _OUTPUT_DATA_MAX_BYTES = 50_000
+_JSON_STRING_MAX_BYTES = 65_536
+_AUDIT_SENSITIVE_FIELDS = frozenset(
+    {
+        "api_key",
+        "api_secret",
+        "authorization",
+        "code",
+        "cookie",
+        "cookies",
+        "encryption_key",
+        "query",
+        "session",
+        "sql",
+        "file_content",
+        "raw_content",
+    }
+)
+_FIELD_SEPARATOR = re.compile(r"[^a-z0-9]+")
+_SENSITIVE_TEXT_PATTERN = re.compile(
+    r"\b(password|secret|api[_-]?key|api[_-]?secret|access[_-]?token|"
+    r"refresh[_-]?token|authorization)\b(\s*[:=]\s*)(?:bearer\s+)?([^\s,;]+)",
+    re.IGNORECASE,
+)
+
+
+def _is_audit_sensitive_key(key: Any) -> bool:
+    from frappe_assistant_core.core.base_tool import _is_sensitive_key
+
+    if _is_sensitive_key(key):
+        return True
+    if not isinstance(key, str):
+        return False
+    normalized = _FIELD_SEPARATOR.sub("_", key.strip().lower()).strip("_")
+    return normalized in _AUDIT_SENSITIVE_FIELDS
+
+
+def sanitize_for_audit(value: Any, _seen: Optional[set] = None) -> Any:
+    """Recursively remove credentials and executable payloads at the sink."""
+    if _seen is None:
+        _seen = set()
+
+    if isinstance(value, str):
+        candidate = value.lstrip()
+        if (
+            candidate.startswith(("{", "["))
+            and len(value.encode("utf-8")) <= _JSON_STRING_MAX_BYTES
+        ):
+            try:
+                decoded = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, (dict, list)):
+                sanitized = sanitize_for_audit(decoded, _seen)
+                return json.dumps(
+                    sanitized,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+        return _SENSITIVE_TEXT_PATTERN.sub(
+            lambda match: f"{match.group(1)}{match.group(2)}***REDACTED***",
+            value,
+        )
+
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in _seen:
+            return "***RECURSIVE***"
+        _seen.add(identity)
+        try:
+            return {
+                key: "***REDACTED***"
+                if _is_audit_sensitive_key(key)
+                else sanitize_for_audit(nested, _seen)
+                for key, nested in value.items()
+            }
+        finally:
+            _seen.remove(identity)
+
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in _seen:
+            return "***RECURSIVE***"
+        _seen.add(identity)
+        try:
+            return [sanitize_for_audit(nested, _seen) for nested in value]
+        finally:
+            _seen.remove(identity)
+
+    if isinstance(value, (set, frozenset)):
+        identity = id(value)
+        if identity in _seen:
+            return "***RECURSIVE***"
+        _seen.add(identity)
+        try:
+            sanitized = [sanitize_for_audit(nested, _seen) for nested in value]
+            return sorted(sanitized, key=repr)
+        finally:
+            _seen.remove(identity)
+
+    return value
 
 
 def _sanitize_arguments(arguments: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Defensive sanitization at the audit sink — callers are expected to
-    sanitize too, but this ensures secrets never land in the table even
-    when a non-BaseTool call site forgets.
-
-    Uses the same _is_sensitive_key heuristic as BaseTool so token-count
-    metrics (input_tokens / output_tokens / total_tokens) are preserved while
-    credential-shaped keys still get redacted.
-    """
-    if not isinstance(arguments, dict):
-        return arguments
-    from frappe_assistant_core.core.base_tool import _is_sensitive_key
-
-    sanitized: Dict[str, Any] = {}
-    for key, value in arguments.items():
-        if _is_sensitive_key(key):
-            sanitized[key] = "***REDACTED***"
-        else:
-            sanitized[key] = value
-    return sanitized
+    """Backward-compatible wrapper around the recursive sink sanitizer."""
+    return sanitize_for_audit(arguments)
 
 
 def log_tool_execution(
@@ -70,6 +156,9 @@ def log_tool_execution(
     error_type: Optional[str] = None,
     traceback_str: Optional[str] = None,
     output_data: Optional[Any] = None,
+    target_doctype: Optional[str] = None,
+    target_name: Optional[str] = None,
+    operation: Optional[str] = None,
 ):
     """
     Log tool execution for comprehensive audit trail.
@@ -96,18 +185,13 @@ def log_tool_execution(
             )
             status = AUDIT_STATUS_ERROR
 
-        sanitized_arguments = _sanitize_arguments(arguments)
-
-        # Extract target information from arguments (after sanitization so we
-        # can't leak secrets via target fields either)
-        target_doctype = None
-        target_name = None
-        if isinstance(sanitized_arguments, dict):
-            target_doctype = sanitized_arguments.get("doctype")
-            target_name = sanitized_arguments.get("name")
+        sanitized_arguments = sanitize_for_audit(arguments)
+        sanitized_output = sanitize_for_audit(output_data)
+        sanitized_error = sanitize_for_audit(error_message)
+        sanitized_traceback = sanitize_for_audit(traceback_str)
 
         # Serialize output for storage, clamp oversized payloads
-        output_data_str, output_truncated = _serialize_for_audit(output_data)
+        output_data_str, output_truncated = _serialize_for_audit(sanitized_output)
 
         input_data_str = None
         if sanitized_arguments is not None:
@@ -119,7 +203,7 @@ def log_tool_execution(
         audit_doc = frappe.get_doc(
             {
                 "doctype": "Assistant Audit Log",
-                "action": tool_name,
+                "action": operation or tool_name,
                 "tool_name": tool_name,
                 "user": user,
                 "status": status,
@@ -134,9 +218,9 @@ def log_tool_execution(
                 "input_data": input_data_str,
                 "output_data": output_data_str,
                 "output_truncated": 1 if output_truncated else 0,
-                "error_message": error_message,
+                "error_message": sanitized_error,
                 "error_type": error_type,
-                "traceback": traceback_str,
+                "traceback": sanitized_traceback,
             }
         )
 
@@ -144,7 +228,37 @@ def log_tool_execution(
 
     except Exception as e:
         # Don't fail tool execution due to audit logging issues
-        frappe.logger("audit_trail").warning(f"Failed to log tool execution: {str(e)}")
+        frappe.logger("audit_trail").warning(
+            f"Failed to log tool execution: {type(e).__name__}"
+        )
+
+
+def log_denied_tool_attempt(
+    tool_name: str,
+    user: str,
+    reason_code: str,
+    arguments: Optional[Dict[str, Any]] = None,
+    source_app: Optional[str] = None,
+    execution_time: float = 0.0,
+    target_doctype: Optional[str] = None,
+    target_name: Optional[str] = None,
+    operation: Optional[str] = None,
+):
+    """Write exactly one stable, sanitized audit row for a policy denial."""
+    log_tool_execution(
+        tool_name=tool_name,
+        user=user,
+        arguments=arguments,
+        status=AUDIT_STATUS_PERMISSION_DENIED,
+        execution_time=execution_time,
+        source_app=source_app,
+        error_message=reason_code,
+        error_type="PolicyDenied",
+        output_data={"reason_code": reason_code},
+        target_doctype=target_doctype,
+        target_name=target_name,
+        operation=operation,
+    )
 
 
 def _serialize_for_audit(output_data: Any) -> tuple:
@@ -152,7 +266,7 @@ def _serialize_for_audit(output_data: Any) -> tuple:
     if output_data is None:
         return None, False
     try:
-        serialized = json.dumps(output_data, default=str)
+        serialized = json.dumps(sanitize_for_audit(output_data), default=str)
     except (TypeError, ValueError):
         serialized = str(output_data)
     if len(serialized) > _OUTPUT_DATA_MAX_BYTES:
@@ -197,7 +311,9 @@ def log_tool_discovery(app_name: str, tools_found: int, errors: int, discovery_t
         audit_doc.insert(ignore_permissions=True)
 
     except Exception as e:
-        frappe.logger("audit_trail").warning(f"Failed to log tool discovery: {str(e)}")
+        frappe.logger("audit_trail").warning(
+            f"Failed to log tool discovery: {type(e).__name__}"
+        )
 
 
 def log_security_event(event_type: str, user: str, details: Dict[str, Any], severity: str = "Medium"):
@@ -211,7 +327,7 @@ def log_security_event(event_type: str, user: str, details: Dict[str, Any], seve
         severity: Event severity (Low, Medium, High, Critical)
     """
     try:
-        payload = {"event_type": event_type, "severity": severity, **details}
+        payload = sanitize_for_audit({"event_type": event_type, "severity": severity, **details})
         output_str, truncated = _serialize_for_audit(payload)
         audit_doc = frappe.get_doc(
             {
@@ -239,11 +355,13 @@ def log_security_event(event_type: str, user: str, details: Dict[str, Any], seve
         if severity == "Critical":
             frappe.log_error(
                 title=f"Critical Security Event: {event_type}",
-                message=f"User: {user}, Details: {json.dumps(details, default=str)}",
+                message=f"User: {user}; details retained in sanitized audit row",
             )
 
     except Exception as e:
-        frappe.logger("audit_trail").warning(f"Failed to log security event: {str(e)}")
+        frappe.logger("audit_trail").warning(
+            f"Failed to log security event: {type(e).__name__}"
+        )
 
 
 def get_audit_summary(user: Optional[str] = None, days: int = 7) -> Dict[str, Any]:
@@ -300,5 +418,7 @@ def get_audit_summary(user: Optional[str] = None, days: int = 7) -> Dict[str, An
         return summary
 
     except Exception as e:
-        frappe.logger("audit_trail").error(f"Failed to get audit summary: {str(e)}")
-        return {"total_events": 0, "error": str(e)}
+        frappe.logger("audit_trail").error(
+            f"Failed to get audit summary: {type(e).__name__}"
+        )
+        return {"total_events": 0, "error": "Audit summary unavailable"}

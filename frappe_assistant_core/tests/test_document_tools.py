@@ -84,8 +84,10 @@ class TestDocumentTools(BaseAssistantTest):
         if not self.registry.has_tool("get_document"):
             self.skipTest("get_document tool not available")
 
-        # Try to get Administrator user (should always exist)
-        arguments = {"doctype": "User", "name": "Administrator"}
+        test_doc = frappe.get_doc(
+            {"doctype": self.test_doctype, "description": "Safe get_document test"}
+        ).insert(ignore_permissions=True)
+        arguments = {"doctype": self.test_doctype, "name": test_doc.name}
 
         try:
             result = self.registry.execute_tool("get_document", arguments)
@@ -94,16 +96,22 @@ class TestDocumentTools(BaseAssistantTest):
             if "success" in result and result.get("success"):
                 # Document data is directly in result for successful gets
                 self.assertIn("name", result)
-                self.assertEqual(result["name"], "Administrator")
+                self.assertEqual(result["name"], test_doc.name)
         except Exception as e:
             self.fail(f"Tool execution raised exception: {str(e)}")
+        finally:
+            frappe.delete_doc(self.test_doctype, test_doc.name, force=True)
 
     def test_list_documents_via_execute_tool(self):
         """Test document listing"""
         if not self.registry.has_tool("list_documents"):
             self.skipTest("list_documents tool not available")
 
-        arguments = {"doctype": "User", "limit": 5, "fields": ["name", "full_name"]}
+        arguments = {
+            "doctype": self.test_doctype,
+            "limit": 5,
+            "fields": ["name", "description"],
+        }
 
         try:
             result = self.registry.execute_tool("list_documents", arguments)

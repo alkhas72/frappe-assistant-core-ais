@@ -22,13 +22,22 @@ tool subclass, so they do not depend on any specific plugin being loaded.
 """
 
 from typing import Any, Dict
+from unittest.mock import patch
 
 import frappe
 
 from frappe_assistant_core.core.base_tool import BaseTool
+from frappe_assistant_core.core.security_policy import PolicyDecision, SecurityPolicy, ToolContext
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.utils.audit_trail import sanitize_for_audit
 
 _TEST_TOOL_NAME = "test_audit_tool"
+_RECORDING_TOOL_NAME = "recording_test_tool"
+_ALLOWED_DECISION = PolicyDecision(
+    allowed=True,
+    reason_code="ALLOWED",
+    context=ToolContext(operation="execute"),
+)
 
 
 class _ToolBase(BaseTool):
@@ -45,6 +54,24 @@ class _ToolBase(BaseTool):
 
     def execute(self, arguments: Dict[str, Any]) -> Any:
         return self._executor(arguments)
+
+
+class _RecordingToolForAuditTest(BaseTool):
+    def __init__(self):
+        super().__init__()
+        self.name = _RECORDING_TOOL_NAME
+        self.description = "Policy denial recorder"
+        self.inputSchema = {"type": "object", "properties": {}}
+        self.dependencies_checked = False
+        self.executed = False
+
+    def validate_dependencies(self):
+        self.dependencies_checked = True
+        return True, None
+
+    def execute(self, arguments: Dict[str, Any]) -> Any:
+        self.executed = True
+        return {"should_not": "run"}
 
 
 def _fetch_latest_audit_row(tool_name: str) -> Dict[str, Any]:
@@ -79,6 +106,9 @@ class TestAuditLogStatusClassification(BaseAssistantTest):
     def setUp(self):
         super().setUp()
         _delete_test_rows(_TEST_TOOL_NAME)
+        policy = patch.object(SecurityPolicy, "authorize", return_value=_ALLOWED_DECISION)
+        policy.start()
+        self.addCleanup(policy.stop)
 
     def test_successful_execution_logs_success(self):
         tool = _ToolBase(executor=lambda arguments: {"items": [1, 2, 3]})
@@ -107,6 +137,19 @@ class TestAuditLogStatusClassification(BaseAssistantTest):
         self.assertEqual(row["status"], "Error")
         self.assertEqual(row["error_type"], "ToolReportedError")
         self.assertIn("file not found", row["error_message"] or "")
+
+    def test_tool_reported_secret_is_not_written_to_process_log(self):
+        tool = _ToolBase(
+            executor=lambda arguments: {
+                "success": False,
+                "error": "password=process-log-secret",
+            }
+        )
+        with patch.object(tool.logger, "info") as info_log:
+            tool._safe_execute({})
+
+        logged = " ".join(str(call) for call in info_log.call_args_list)
+        self.assertNotIn("process-log-secret", logged)
 
     def test_permission_error_logs_permission_denied(self):
         def executor(arguments):
@@ -143,6 +186,17 @@ class TestAuditLogStatusClassification(BaseAssistantTest):
         self.assertEqual(row["status"], "Timeout")
         self.assertEqual(row["error_type"], "Timeout")
 
+    def test_dependency_failure_is_logged_once(self):
+        tool = _ToolBase(executor=lambda arguments: {"should_not": "run"})
+        tool.dependencies = ["fac_dependency_that_does_not_exist"]
+        response = tool._safe_execute({})
+
+        self.assertEqual(response["error_type"], "DependencyError")
+        self.assertEqual(
+            frappe.db.count("Assistant Audit Log", {"tool_name": tool.name}),
+            1,
+        )
+
 
 class TestAuditLogFieldCapture(BaseAssistantTest):
     """New audit columns must actually be populated end-to-end."""
@@ -150,6 +204,9 @@ class TestAuditLogFieldCapture(BaseAssistantTest):
     def setUp(self):
         super().setUp()
         _delete_test_rows(_TEST_TOOL_NAME)
+        policy = patch.object(SecurityPolicy, "authorize", return_value=_ALLOWED_DECISION)
+        policy.start()
+        self.addCleanup(policy.stop)
 
     def test_source_app_is_written(self):
         tool = _ToolBase(executor=lambda arguments: {"ok": True})
@@ -185,9 +242,113 @@ class TestAuditLogFieldCapture(BaseAssistantTest):
         row = _fetch_latest_audit_row(_TEST_TOOL_NAME)
         self.assertEqual(row["output_truncated"], 1)
 
+    def test_policy_context_controls_target_and_output_is_redacted(self):
+        decision = PolicyDecision(
+            allowed=True,
+            reason_code="ALLOWED",
+            context=ToolContext(
+                operation="read",
+                target_doctype="ToDo",
+                target_name="SAFE-TARGET",
+                required_permissions=frozenset({"read"}),
+            ),
+        )
+        tool = _ToolBase(executor=lambda arguments: {"password": "output-secret"})
+
+        with patch.object(SecurityPolicy, "authorize", return_value=decision):
+            response = tool._safe_execute({"doctype": "User", "name": "Administrator"})
+
+        self.assertEqual(response["result"]["password"], "***REDACTED***")
+        row = frappe.get_all(
+            "Assistant Audit Log",
+            filters={"tool_name": tool.name},
+            fields=["action", "target_doctype", "target_name", "output_data"],
+            order_by="creation desc",
+            limit=1,
+        )[0]
+        self.assertEqual(row["action"], "read")
+        self.assertEqual(row["target_doctype"], "ToDo")
+        self.assertEqual(row["target_name"], "SAFE-TARGET")
+        self.assertNotIn("output-secret", row["output_data"] or "")
+
+    def test_audit_sink_failure_does_not_echo_secret_to_process_log(self):
+        tool = _ToolBase(executor=lambda arguments: {"ok": True})
+        with patch(
+            "frappe_assistant_core.utils.audit_trail.log_tool_execution",
+            side_effect=RuntimeError("password=warning-log-secret"),
+        ):
+            with patch.object(tool.logger, "warning") as warning_log:
+                tool.log_execution({}, {"success": True, "result": {}}, 0.01)
+
+        logged = " ".join(str(call) for call in warning_log.call_args_list)
+        self.assertNotIn("warning-log-secret", logged)
+
 
 class TestAuditSinkSanitization(BaseAssistantTest):
     """The sink defensively redacts sensitive keys even if the caller forgot."""
+
+    def test_nested_secrets_and_json_strings_are_redacted(self):
+        value = {
+            "headers": {"Authorization": "Bearer secret"},
+            "rows": [{"api_secret": "x"}],
+            "nested_json": '{"password":"inside"}',
+            "malformed_json": "{password=malformed-secret",
+            "variants": {
+                "cookie": "a",
+                "cookies": "b",
+                "session": "c",
+                "encryption-key": "d",
+                "API-Key": "e",
+            },
+        }
+        self.assertEqual(
+            sanitize_for_audit(value),
+            {
+                "headers": {"Authorization": "***REDACTED***"},
+                "rows": [{"api_secret": "***REDACTED***"}],
+                "nested_json": '{"password":"***REDACTED***"}',
+                "malformed_json": "{password=***REDACTED***",
+                "variants": {
+                    "cookie": "***REDACTED***",
+                    "cookies": "***REDACTED***",
+                    "session": "***REDACTED***",
+                    "encryption-key": "***REDACTED***",
+                    "API-Key": "***REDACTED***",
+                },
+            },
+        )
+
+    def test_policy_denial_is_logged_once_before_dependencies(self):
+        _delete_test_rows(_RECORDING_TOOL_NAME)
+        decision = PolicyDecision(
+            allowed=False,
+            reason_code="TOOL_HARD_DENY",
+            context=ToolContext(operation="execute"),
+        )
+        tool = _RecordingToolForAuditTest()
+
+        with patch.object(SecurityPolicy, "authorize", return_value=decision):
+            result = tool._safe_execute({"password": {"token": "never-log"}})
+
+        self.assertEqual(result["error_type"], "PolicyDenied")
+        self.assertEqual(
+            frappe.db.count("Assistant Audit Log", {"tool_name": tool.name}),
+            1,
+        )
+        self.assertFalse(tool.dependencies_checked)
+        self.assertFalse(tool.executed)
+
+        row = frappe.get_all(
+            "Assistant Audit Log",
+            filters={"tool_name": tool.name},
+            fields=["status", "error_type", "input_data", "output_data"],
+            order_by="creation desc",
+            limit=1,
+        )[0]
+        self.assertEqual(row["status"], "Permission Denied")
+        self.assertEqual(row["error_type"], "PolicyDenied")
+        self.assertNotIn("never-log", row["input_data"] or "")
+        self.assertNotIn("never-log", row["output_data"] or "")
 
     def test_sink_redacts_sensitive_keys(self):
         from frappe_assistant_core.utils.audit_trail import log_tool_execution
@@ -213,6 +374,33 @@ class TestAuditSinkSanitization(BaseAssistantTest):
         )[0]
         self.assertIn("REDACTED", row["input_data"])
         self.assertNotIn("hunter2", row["input_data"])
+
+    def test_sink_redacts_secrets_in_all_persisted_payloads(self):
+        from frappe_assistant_core.utils.audit_trail import log_tool_execution
+
+        tool_name = "test_audit_all_payloads"
+        _delete_test_rows(tool_name)
+        log_tool_execution(
+            tool_name=tool_name,
+            user=frappe.session.user,
+            arguments={"nested": [{"api_secret": "input-secret"}]},
+            status="Error",
+            execution_time=0.01,
+            error_message="request failed: password=error-secret",
+            traceback_str="Authorization: Bearer trace-secret",
+            output_data={"headers": {"authorization": "output-secret"}},
+        )
+
+        row = frappe.get_all(
+            "Assistant Audit Log",
+            filters={"tool_name": tool_name},
+            fields=["input_data", "output_data", "error_message", "traceback"],
+            order_by="creation desc",
+            limit=1,
+        )[0]
+        persisted = " ".join(str(row.get(field) or "") for field in row)
+        for secret in ("input-secret", "output-secret", "error-secret", "trace-secret"):
+            self.assertNotIn(secret, persisted)
 
     def test_invalid_status_is_coerced_to_error(self):
         from frappe_assistant_core.utils.audit_trail import log_tool_execution
