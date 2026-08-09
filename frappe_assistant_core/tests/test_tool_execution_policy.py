@@ -18,7 +18,33 @@ from frappe_assistant_core.mcp.server import MCPServer
 from frappe_assistant_core.mcp.tool_adapter import build_tool_dict
 from frappe_assistant_core.plugins.core.tools.get_document import DocumentGet
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.tests.test_security_migration import (
+    _restore_security_rows,
+    _security_snapshot_hash,
+    _snapshot_security_rows,
+)
 from frappe_assistant_core.utils.plugin_manager import get_plugin_manager
+
+_module_security_snapshot = None
+
+
+def setUpModule():
+    global _module_security_snapshot
+    _module_security_snapshot = _snapshot_security_rows()
+
+
+def tearDownModule():
+    after = _snapshot_security_rows()
+    before_hash = _security_snapshot_hash(_module_security_snapshot)
+    after_hash = _security_snapshot_hash(after)
+    try:
+        if after_hash != before_hash:
+            raise AssertionError(
+                f"FAC execution-policy snapshot changed: before={before_hash}, after={after_hash}"
+            )
+    finally:
+        _restore_security_rows(_module_security_snapshot)
+        frappe.db.commit()
 
 
 class _DummyTool:
@@ -167,20 +193,22 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
     def setUp(self):
         super().setUp()
         frappe.set_user("Administrator")
+        self._fac_security_snapshot = _snapshot_security_rows()
+        self.actor = "fac-task3-config@example.com"
+        self.assertFalse(frappe.db.exists("User", self.actor))
+        frappe.get_doc(
+            {
+                "doctype": "User",
+                "email": self.actor,
+                "first_name": "FAC Task 3 Config",
+                "enabled": 1,
+                "user_type": "System User",
+                "assistant_enabled": 1,
+                "roles": [{"role": "System Manager"}],
+            }
+        ).insert(ignore_permissions=True)
         self.registry = ToolRegistry()
         self.plugin_manager = get_plugin_manager()
-        self.original_plugin_enabled = frappe.db.get_value(
-            "FAC Plugin Configuration", "core", "enabled"
-        )
-        self.original_config = frappe.get_doc(
-            "FAC Tool Configuration", self.tool_name
-        )
-        self.original_enabled = self.original_config.enabled
-        self.original_mode = self.original_config.role_access_mode
-        self.original_roles = [
-            {"role": row.role, "allow_access": row.allow_access}
-            for row in self.original_config.role_access
-        ]
 
         frappe.db.set_value(
             "FAC Plugin Configuration",
@@ -200,27 +228,34 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
         config.save(ignore_permissions=True)
         self.plugin_manager.refresh_plugins()
         self.registry.clear_cache()
+        frappe.set_user(self.actor)
 
     def tearDown(self):
-        config = frappe.get_doc("FAC Tool Configuration", self.tool_name)
-        config.enabled = self.original_enabled
-        config.role_access_mode = self.original_mode
-        config.set("role_access", [])
-        for role in self.original_roles:
-            config.append("role_access", role)
-        config.save(ignore_permissions=True)
-        frappe.db.set_value(
-            "FAC Plugin Configuration",
-            "core",
-            "enabled",
-            self.original_plugin_enabled,
-            update_modified=False,
-        )
-        self.plugin_manager.refresh_plugins()
-        self.registry.clear_cache()
-        super().tearDown()
+        try:
+            frappe.set_user("Administrator")
+            if frappe.db.exists("User", self.actor):
+                frappe.delete_doc("User", self.actor, force=True)
+            _restore_security_rows(self._fac_security_snapshot)
+            restored = _snapshot_security_rows()
+            self.assertEqual(restored, self._fac_security_snapshot)
+            frappe.db.commit()
+            self.plugin_manager.refresh_plugins()
+            self.registry.clear_cache()
+        finally:
+            super().tearDown()
 
-    def _assert_published(self, actor="Administrator"):
+    def _assert_published(self, actor=None):
+        actor = actor or self.actor
+        decision = SecurityPolicy.authorize(
+            actor=actor,
+            tool_name=self.tool_name,
+            arguments=None,
+            phase="publish",
+        )
+        self.assertTrue(
+            decision.allowed,
+            f"publication denied: {decision.reason_code}",
+        )
         published = self.registry.get_available_tools(user=actor)
         self.assertIn(self.tool_name, {tool["name"] for tool in published})
 
