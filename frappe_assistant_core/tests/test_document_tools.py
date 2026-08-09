@@ -673,6 +673,96 @@ class TestFetchToolRedaction(BaseAssistantTest):
             self.assertFalse(is_doctype_accessible("Has Role", "System Manager"))
 
 
+class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
+    """FAC Task 7 rev. 2 (2026-08-09).
+
+    Central policy closes the MCP path, but a direct call into
+    ``ChatGPTFetch.execute`` from privileged internal code could previously
+    pass ``frappe.has_permission`` (System Manager has read on restricted
+    DocTypes) and reach ``frappe.get_doc``. The restricted-target gate must
+    fire BEFORE ``has_permission`` / ``get_doc`` for every restricted DocType —
+    ``User``, ``File``, and FAC configuration DocTypes alike — and the
+    external response must not distinguish them from one another.
+    """
+
+    def _assert_restricted_refused(self, doctype, name):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.chatgpt_fetch import ChatGPTFetch
+
+        tool = ChatGPTFetch()
+        # If the gate fails, has_permission returns True (privileged) and
+        # get_doc would leak the restricted document.
+        with patch.object(
+            "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
+            return_value=True,
+        ), \
+         patch.object(
+             "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+             side_effect=AssertionError(
+                 f"restricted target {doctype} must not reach frappe.get_doc"
+             ),
+         ):
+            try:
+                tool.execute({"id": f"{doctype}/{name}"})
+                self.fail(
+                    f"ChatGPTFetch.execute for restricted DocType {doctype} did not raise"
+                )
+            except frappe.PermissionError:
+                # Expected: same "Permission denied" answer for every
+                # restricted target, regardless of which one was hit.
+                pass
+
+    def test_fetch_user_target_refused_directly(self):
+        self._assert_restricted_refused("User", "admin@example.com")
+
+    def test_fetch_file_target_refused_directly(self):
+        self._assert_restricted_refused("File", "FILE-LEAK")
+
+    def test_fetch_fac_tool_configuration_target_refused_directly(self):
+        self._assert_restricted_refused(
+            "FAC Tool Configuration", "get_document"
+        )
+
+    def test_fetch_fac_plugin_configuration_target_refused_directly(self):
+        self._assert_restricted_refused(
+            "FAC Plugin Configuration", "core"
+        )
+
+    def test_fetch_restricted_targets_indistinguishable(self):
+        """All restricted targets must yield the same external answer so the
+        response itself cannot be used to enumerate restricted DocTypes."""
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.chatgpt_fetch import ChatGPTFetch
+
+        tool = ChatGPTFetch()
+        messages = []
+        for doctype, name in [
+            ("User", "admin@example.com"),
+            ("File", "FILE-LEAK"),
+            ("FAC Tool Configuration", "get_document"),
+        ]:
+            with patch.object(
+                "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.has_permission",
+                return_value=True,
+            ), \
+             patch.object(
+                 "frappe_assistant_core.plugins.core.tools.chatgpt_fetch.frappe.get_doc",
+                 side_effect=AssertionError("must not be reached"),
+             ):
+                try:
+                    tool.execute({"id": f"{doctype}/{name}"})
+                    msg = "no-exception"
+                except frappe.PermissionError as e:
+                    msg = str(e)
+            messages.append(msg)
+        # All three must produce identical external answers.
+        self.assertEqual(messages[0], messages[1])
+        self.assertEqual(messages[1], messages[2])
+        self.assertNotEqual(messages[0], "no-exception")
+
+
 class TestDocumentToolsIntegration(BaseAssistantTest):
     """Integration tests for document tools"""
 

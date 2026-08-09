@@ -94,6 +94,19 @@ class ChatGPTFetch(BaseTool):
 
             doctype, name = doc_id.split("/", 1)
 
+            # FAC Task 7 (rev. 2): restricted-target gate MUST run before
+            # ``frappe.has_permission`` and ``frappe.get_doc``. The central
+            # policy closes the MCP path, but a direct call into
+            # ``ChatGPTFetch.execute`` from a privileged internal caller could
+            # otherwise pass ``has_permission`` (System Manager has read on
+            # restricted DocTypes) and reach ``get_doc``. We refuse here with
+            # the same "permission denied" answer for every restricted DocType
+            # (User, File, FAC configuration DocTypes, ...).
+            if SecurityPolicy._is_restricted_target(doctype):
+                raise frappe.PermissionError(
+                    f"Permission denied for {doctype} {name}"
+                )
+
             # Native Frappe row-level read permission. The central policy in
             # ``BaseTool._safe_execute`` already authorized the tool call
             # (restricted DocType, hard-deny set, role config, DocType-level

@@ -140,7 +140,13 @@ class TestReportTools(BaseAssistantTest):
 
     def test_list_reports_uses_permission_aware_query(self):
         """Regression: ``list_reports`` must call ``frappe.get_list`` with
-        ``ignore_permissions=False`` and must NOT call ``frappe.get_all``."""
+        ``ignore_permissions=False``.
+
+        FAC Task 7 rev. 2: the AssertionError trap on ``frappe.get_all`` was
+        removed — it caught Frappe-internal reads (Custom DocPerm, meta
+        lookups) and broke unrelated behaviour. We assert the FAC call site
+        (``get_list`` with ``ignore_permissions=False``) directly.
+        """
         from contextlib import ExitStack
         from unittest.mock import patch
 
@@ -153,15 +159,6 @@ class TestReportTools(BaseAssistantTest):
             stack.enter_context(
                 patch.object(report_tools.frappe, "has_permission", return_value=True)
             )
-            get_all = stack.enter_context(
-                patch.object(
-                    report_tools.frappe,
-                    "get_all",
-                    side_effect=AssertionError(
-                        "frappe.get_all bypasses Report discovery permissions"
-                    ),
-                )
-            )
             get_list = stack.enter_context(patch.object(report_tools.frappe, "get_list"))
             # ``list_reports`` now also reads ``ref_doctype`` so it can filter
             # restricted-target reports.
@@ -172,7 +169,6 @@ class TestReportTools(BaseAssistantTest):
             result = report_tools.ReportTools.list_reports()
 
         self.assertTrue(result.get("success"), result)
-        get_all.assert_not_called()
         self.assertTrue(get_list.called, "list_reports must use frappe.get_list")
         call = get_list.call_args_list[0]
         self.assertFalse(

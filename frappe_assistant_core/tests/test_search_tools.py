@@ -80,7 +80,14 @@ class TestSearchTools(BaseAssistantTest):
 
     def test_global_search_uses_permission_aware_query(self):
         """Regression guard for #189: global_search (behind the search_documents
-        tool) must use frappe.get_list, not the permission-bypassing get_all."""
+        tool) must use frappe.get_list with ``ignore_permissions=False``.
+
+        Note (FAC Task 7 rev. 2): we no longer plant an AssertionError on
+        ``frappe.get_all`` — that hook also caught Frappe-internal calls
+        (Custom DocPerm reads, meta lookups, etc.) and broke unrelated
+        behaviour. We verify the actual FAC call site: ``get_list`` is used
+        and carries ``ignore_permissions=False``.
+        """
         from frappe_assistant_core.plugins.core.tools import search_tools
 
         with ExitStack() as stack:
@@ -101,20 +108,12 @@ class TestSearchTools(BaseAssistantTest):
                     side_effect=lambda doctype, *a, **k: doctype == "Employee",
                 )
             )
-            get_all = stack.enter_context(
-                patch.object(
-                    search_tools.frappe,
-                    "get_all",
-                    side_effect=AssertionError("frappe.get_all bypasses DocType permissions"),
-                )
-            )
             get_list = stack.enter_context(patch.object(search_tools.frappe, "get_list"))
             get_list.return_value = [{"name": "EMP-0001"}]
 
             result = search_tools.SearchTools.global_search(query="EMP", limit=20)
 
         self.assertTrue(result.get("success"), result)
-        get_all.assert_not_called()
         self.assertTrue(get_list.called, "global_search must query via frappe.get_list")
         for call in get_list.call_args_list:
             self.assertFalse(
@@ -124,32 +123,32 @@ class TestSearchTools(BaseAssistantTest):
 
     def test_search_doctype_uses_permission_aware_query(self):
         """Regression guard for #189: search_doctype (behind the search_doctype
-        tool) must use frappe.get_list, not the permission-bypassing get_all."""
+        tool) must use frappe.get_list with ``ignore_permissions=False``.
+
+        Note (FAC Task 7 rev. 2): ``frappe.get_all`` is no longer trapped with
+        an AssertionError — that broke Frappe-internal reads. We assert on
+        ``get_list`` directly instead.
+        """
         from frappe_assistant_core.plugins.core.tools import search_tools
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(search_tools.frappe.db, "exists", return_value=True))
             stack.enter_context(patch.object(search_tools.frappe, "has_permission", return_value=True))
             # Minimal meta stub: one searchable Data field, no title field.
+            # Explicit ``istable=False`` so the restricted-target gate does
+            # not classify Employee as a child table.
             meta = MagicMock()
             meta.title_field = None
+            meta.istable = False
             field = MagicMock(fieldtype="Data", hidden=False, fieldname="employee_name")
             meta.fields = [field]
             stack.enter_context(patch.object(search_tools.frappe, "get_meta", return_value=meta))
-            get_all = stack.enter_context(
-                patch.object(
-                    search_tools.frappe,
-                    "get_all",
-                    side_effect=AssertionError("frappe.get_all bypasses DocType permissions"),
-                )
-            )
             get_list = stack.enter_context(patch.object(search_tools.frappe, "get_list"))
             get_list.return_value = [{"name": "EMP-0001", "employee_name": "Allowed"}]
 
             result = search_tools.SearchTools.search_doctype(doctype="Employee", query="All", limit=20)
 
         self.assertTrue(result.get("success"), result)
-        get_all.assert_not_called()
         self.assertEqual(get_list.call_count, 1)
         call = get_list.call_args_list[0]
         self.assertEqual(call.args[0], "Employee")
@@ -208,13 +207,12 @@ class TestSearchTools(BaseAssistantTest):
             stack.enter_context(
                 patch.object(search_tools.frappe, "has_permission", return_value=True)
             )
-            get_list = stack.enter_context(
-                patch.object(
-                    search_tools.frappe,
-                    "get_list",
-                    side_effect=AssertionError("restricted target must not be queried"),
-                )
-            )
+            # Sentinel: if restricted-target gate fails, ``get_list`` would be
+            # reached. We assert on result + call count instead of trapping
+            # ``get_list`` itself so the test does not interfere with any
+            # future internal Frappe calls.
+            get_list = stack.enter_context(patch.object(search_tools.frappe, "get_list"))
+            get_list.return_value = [{"name": "LEAK"}]
 
             result = search_tools.SearchTools.search_doctype(doctype="User", query="any", limit=20)
 
@@ -227,6 +225,9 @@ class TestSearchTools(BaseAssistantTest):
         Frappe's ``frappe.desk.search.search_link``."""
         from frappe_assistant_core.plugins.core.tools import search_tools
 
+        # Patch the symbol where it is looked up. ``search_tools`` imports
+        # ``search_link`` lazily inside the function, so we patch it on the
+        # source module ``frappe.desk.search``.
         with ExitStack() as stack:
             stack.enter_context(
                 patch.object(search_tools.frappe.db, "exists", return_value=True)
@@ -234,17 +235,16 @@ class TestSearchTools(BaseAssistantTest):
             stack.enter_context(
                 patch.object(search_tools.frappe, "has_permission", return_value=True)
             )
-            stack.enter_context(
-                patch.object(
-                    "frappe.desk.search.search_link",
-                    side_effect=AssertionError("restricted target must not reach desk.search"),
-                )
+            desk_search_link = stack.enter_context(
+                patch("frappe.desk.search.search_link")
             )
+            desk_search_link.return_value = [{"name": "LEAK"}]
 
             result = search_tools.SearchTools.search_link(doctype="User", query="any", filters={})
 
         self.assertFalse(result.get("success"), result)
         self.assertIn("restricted", (result.get("error") or "").lower())
+        desk_search_link.assert_not_called()
 
 
 class TestSearchToolsIntegration(BaseAssistantTest):

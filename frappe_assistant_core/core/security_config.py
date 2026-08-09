@@ -34,9 +34,31 @@ must not be removed without a coordinated change to the policy contract
 (owned by the Foundation workstream).
 """
 
+from __future__ import annotations
+
 from typing import Any, Dict, List, Optional
 
 import frappe
+
+# ---------------------------------------------------------------------------
+# Deprecated inert exports (kept for import compatibility)
+#
+# Older code paths imported ``BASIC_CORE_TOOLS``, ``ROLE_TOOL_ACCESS`` and the
+# dict-form ``RESTRICTED_DOCTYPES`` for role-matrix lookups. With Task 6 the
+# matrix retired from runtime authority — these names now resolve to inert
+# empty values so that legacy imports keep working but cannot re-enable a
+# hard-denied tool, a restricted DocType, or a System Manager wildcard.
+#
+# Removing these exports entirely is a separate breaking-change decision for
+# the Arbiter; until then they remain defined and inert.
+# ---------------------------------------------------------------------------
+
+BASIC_CORE_TOOLS: List[str] = []
+ROLE_TOOL_ACCESS: Dict[str, Any] = {}
+# Legacy dict form ``{"Assistant User": [...]}``; ``SecurityPolicy.RESTRICTED_DOCTYPES``
+# (a frozenset) is the only authoritative restricted-target source.
+RESTRICTED_DOCTYPES: Dict[str, List[str]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Sensitive / admin-only field snapshots (still authoritative for policy)

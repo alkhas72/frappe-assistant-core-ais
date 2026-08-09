@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import frappe
 from frappe import _
@@ -78,6 +78,18 @@ class ReportTools:
                     ),
                 }
 
+            # Native read permission on the report's reference DocType. Even
+            # for non-restricted DocTypes, an actor without ``read`` on
+            # ``ref_doctype`` has no business executing a report against it;
+            # we fail closed without distinguishing "no permission" from
+            # "report cannot run" to avoid leaking the existence of reports
+            # the user is not entitled to see.
+            if ref_doctype and not frappe.has_permission(ref_doctype, "read"):
+                return {
+                    "success": False,
+                    "error": f"No permission to run report '{report_name}'",
+                }
+
             # Validate filters before execution
             validation_result = ReportTools._validate_filters(filters or {}, report_doc)
             if not validation_result.get("valid"):
@@ -138,6 +150,15 @@ class ReportTools:
             else:
                 return {"success": False, "error": f"Unexpected result type: {type(result).__name__}"}
 
+            # FAC Task 7 (rev. 2): redact report output against the report's
+            # ``ref_doctype``, NOT against ``Report``. Report rows typically do
+            # not carry a ``doctype`` key, so the central sink in
+            # ``_safe_execute`` (which infers the effective doctype from each
+            # row's ``doctype`` field) cannot apply DocType-specific sensitive
+            # fields. We pre-redact here using an explicit ref_doctype context;
+            # the central sink still runs afterwards as defence in depth.
+            debug_info = ReportTools._redact_report_output(debug_info, ref_doctype)
+
             # Add actionable guidance when report returns no data
             data = debug_info.get("data", [])
             if not data or len(data) == 0:
@@ -158,6 +179,81 @@ class ReportTools:
         except Exception as e:
             frappe.log_error(f"assistant Execute Report Error: {str(e)}")
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def _redact_report_output(debug_info: Dict[str, Any], ref_doctype: Optional[str]) -> Dict[str, Any]:
+        """Apply ref_doctype-aware redaction to report rows and columns.
+
+        Two-layer fail-closed:
+
+        1. **Rows**: ``SecurityPolicy.redact_output`` with an explicit
+           ``ref_doctype`` context applies universal + DocType-specific
+           sensitive fields even when the row has no ``doctype`` key.
+        2. **Columns**: any column whose ``fieldname`` is itself a sensitive
+           name (e.g. ``password``, ``api_key``) is dropped from the column
+           list and its value is removed from every row. This is the verified
+           fail-closed mechanism for Query/Script Reports whose column
+           definitions can alias sensitive fields under a different label.
+        """
+        from frappe_assistant_core.core.security_policy import (
+            SecurityPolicy,
+            ToolContext,
+        )
+
+        if not isinstance(debug_info, dict):
+            return debug_info
+
+        # Without a ref_doctype we cannot prove what counts as sensitive for
+        # these rows; the universal set still applies via the empty target.
+        ctx = ToolContext(
+            operation="report_read",
+            target_doctype=ref_doctype,
+            required_permissions=frozenset({"read"}),
+        )
+
+        data = debug_info.get("data")
+        if isinstance(data, list):
+            debug_info["data"] = [SecurityPolicy.redact_output(ctx, row) for row in data]
+        elif data is not None:
+            debug_info["data"] = SecurityPolicy.redact_output(ctx, data)
+
+        # Column-level fail-closed: identify sensitive column fieldnames and
+        # drop both the column entry and the per-row value.
+        columns = debug_info.get("columns")
+        sensitive_column_fields: set = set()
+        if isinstance(columns, list) and columns:
+            kept_columns = []
+            for col in columns:
+                # Columns may be dicts (``{"fieldname": ..., "label": ...}``)
+                # or strings. Only dict columns carry a fieldname to check.
+                if isinstance(col, dict):
+                    fieldname = col.get("fieldname") or col.get("field_name")
+                    if isinstance(fieldname, str) and SecurityPolicy._contains_restricted_fields(
+                        ref_doctype, frozenset({fieldname})
+                    ):
+                        sensitive_column_fields.add(fieldname)
+                        continue
+                kept_columns.append(col)
+            debug_info["columns"] = kept_columns
+
+        if sensitive_column_fields:
+            data = debug_info.get("data")
+            if isinstance(data, list):
+                debug_info["data"] = [
+                    {k: v for k, v in row.items() if k not in sensitive_column_fields}
+                    if isinstance(row, dict)
+                    else row
+                    for row in data
+                ]
+
+        # Filters may carry a sensitive value (e.g. a token mistakenly pasted
+        # into a filter). Apply universal redaction.
+        if isinstance(debug_info.get("filters_applied"), dict):
+            debug_info["filters_applied"] = SecurityPolicy.redact_output(
+                ctx, debug_info["filters_applied"]
+            )
+
+        return debug_info
 
     @staticmethod
     def list_reports(module: str = None, report_type: str = None) -> Dict[str, Any]:
@@ -212,6 +308,11 @@ class ReportTools:
                 ref_doctype = report.get("ref_doctype") if hasattr(report, "get") else None
                 if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
                     continue
+                # Native read permission on the report's reference DocType. A
+                # report against ``Customer`` must not be discoverable by an
+                # actor who cannot read ``Customer``.
+                if ref_doctype and not frappe.has_permission(ref_doctype, "read"):
+                    continue
                 accessible_reports.append(report)
 
             return {
@@ -252,6 +353,14 @@ class ReportTools:
                         f"Report '{report_name}' targets restricted DocType "
                         f"'{ref_doctype}'"
                     ),
+                }
+            # Native read permission on the reference DocType. Same
+            # hidden-vs-missing indistinguishability contract as
+            # ``execute_report``.
+            if ref_doctype and not frappe.has_permission(ref_doctype, "read"):
+                return {
+                    "success": False,
+                    "error": f"No permission to access report '{report_name}'",
                 }
 
             columns = []
@@ -692,11 +801,32 @@ class ReportTools:
 
     @staticmethod
     def _validate_filters(filters: Dict[str, Any], report_doc) -> Dict[str, Any]:
-        """Validate filter values against database to catch invalid references early"""
+        """Validate filter values against database to catch invalid references early.
+
+        FAC security hardening Task 7 (rev. 2): the legacy implementation
+        called ``frappe.db.exists(doctype, value)`` and ``frappe.get_all`` for
+        linked business records (Company, Customer, Supplier, Item, ...).
+        ``db.exists`` reveals whether a record exists even when the user
+        cannot read it, and ``get_all`` bypasses row-level permissions. Both
+        are now replaced with a single permission-aware lookup:
+
+          * A hidden record (exists but the user has no ``read`` on it) and a
+            truly missing record MUST produce the same external message —
+            otherwise the difference itself discloses existence.
+          * Suggestions use ``frappe.get_list(ignore_permissions=False)`` so
+            only readable records appear, and only when at least one readable
+            record matches.
+          * Restricted DocTypes are not validated at all — they are rejected
+            earlier by ``execute_report``.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         errors = []
         suggestions = []
 
-        # Common Link field filters to validate
+        # Common Link field filters to validate. Restricted DocTypes are
+        # excluded — they cannot be reached through the report surface after
+        # ``execute_report``'s gate, but defensively skip them here too.
         link_validations = {
             "company": "Company",
             "customer": "Customer",
@@ -708,35 +838,64 @@ class ReportTools:
         }
 
         for filter_key, doctype in link_validations.items():
-            if filter_key in filters and filters[filter_key]:
-                filter_value = filters[filter_key]
+            if filter_key not in filters or not filters[filter_key]:
+                continue
+            filter_value = filters[filter_key]
 
-                # Skip validation for list values (used in group reports)
-                if isinstance(filter_value, list):
-                    continue
+            # Skip validation for list values (used in group reports)
+            if isinstance(filter_value, list):
+                continue
 
-                # Check if the referenced document exists
-                if not frappe.db.exists(doctype, filter_value):
-                    errors.append(f"Invalid {filter_key}: '{filter_value}' does not exist in {doctype}")
+            # Defensive restricted-target skip — these are never reachable
+            # through the report surface but we never want to validate or
+            # disclose them.
+            if SecurityPolicy._is_restricted_target(doctype):
+                continue
 
-                    # Try to find similar names to suggest
-                    try:
-                        similar = frappe.get_all(
-                            doctype, filters={"name": ["like", f"%{filter_value}%"]}, fields=["name"], limit=3
+            # Permission-aware existence check. ``frappe.has_permission(...,
+            # doc=...)`` returns False both for missing records and for
+            # records the user cannot read — that is exactly the
+            # hidden-vs-missing indistinguishability we need.
+            try:
+                visible = frappe.has_permission(doctype, "read", doc=filter_value)
+            except Exception:
+                visible = False
+
+            if visible:
+                continue
+
+            # Same external message for hidden and missing records.
+            errors.append(f"Invalid {filter_key}: '{filter_value}'")
+
+            # Suggestions only from records the user can actually read.
+            try:
+                similar = frappe.get_list(
+                    doctype,
+                    filters={"name": ["like", f"%{filter_value}%"]},
+                    fields=["name"],
+                    limit=3,
+                    ignore_permissions=False,
+                )
+                if similar:
+                    suggestions.append(
+                        f"Did you mean one of these {doctype} names? "
+                        f"{', '.join([s.name for s in similar])}"
+                    )
+                else:
+                    valid_options = frappe.get_list(
+                        doctype,
+                        fields=["name"],
+                        limit=5,
+                        ignore_permissions=False,
+                    )
+                    if valid_options:
+                        suggestions.append(
+                            f"Valid {doctype} names include: "
+                            f"{', '.join([v.name for v in valid_options])}"
                         )
-                        if similar:
-                            suggestions.append(
-                                f"Did you mean one of these {doctype} names? {', '.join([s.name for s in similar])}"
-                            )
-                        else:
-                            # If no similar matches, show first few valid options
-                            valid_options = frappe.get_all(doctype, fields=["name"], limit=5)
-                            if valid_options:
-                                suggestions.append(
-                                    f"Valid {doctype} names include: {', '.join([v.name for v in valid_options])}"
-                                )
-                    except Exception:
-                        pass
+            except Exception:
+                # Never surface internal error text via suggestions.
+                pass
 
         # Validate Select field options
         select_validations = {

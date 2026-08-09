@@ -90,18 +90,42 @@ class MetadataTools:
 
     @staticmethod
     def _serialize_field(field) -> Dict[str, Any]:
-        """Serialize a DocField row into the shape returned by get_doctype_metadata."""
-        return {
-            "fieldname": field.fieldname,
+        """Serialize a DocField row into the shape returned by get_doctype_metadata.
+
+        FAC Task 7 (rev. 2): ``default`` is dropped when the field itself is a
+        sensitive/admin field name. The central redactor inspects mapping keys
+        (it sees ``"default"``, not the original ``fieldname``), so a sensitive
+        default value (e.g. ``password="hunter2"`` on a Custom Field) would
+        otherwise leak straight through the sink.
+        """
+        from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES, SecurityPolicy
+
+        fieldname = field.fieldname
+        # Drop ``default`` for sensitive/admin field names so the value cannot
+        # leak via the ``default`` key (which the central sink treats as a
+        # plain scalar and does not redact by fieldname).
+        include_default = True
+        try:
+            if SecurityPolicy._contains_restricted_fields(
+                None, frozenset({fieldname})
+            ):
+                include_default = False
+        except Exception:
+            include_default = False
+
+        entry = {
+            "fieldname": fieldname,
             "label": field.label,
             "fieldtype": field.fieldtype,
             "options": field.options,
             "reqd": field.reqd,
             "read_only": field.read_only,
             "hidden": field.hidden,
-            "default": field.default,
             "description": field.description,
         }
+        if include_default:
+            entry["default"] = field.default
+        return entry
 
     @staticmethod
     def get_doctype_metadata(doctype: str) -> Dict[str, Any]:
@@ -109,26 +133,32 @@ class MetadataTools:
 
         Restricted DocTypes (parent target) are rejected by the central policy
         before this helper runs — but defensively we re-check here too so a
-        direct call from a non-MCP code path cannot leak schema. Child tables
-        that resolve to a restricted DocType (``DocPerm``, ``DocShare``,
-        ``Custom Field``, ...) are omitted from ``child_tables`` so role→perm
-        metadata of restricted types is not disclosed (FAC security hardening
-        Task 6, 2026-08-09).
+        direct call from a non-MCP code path cannot leak schema. Direct
+        requests for a child DocType (``istable == 1``) are also refused: per
+        the design spec child rows are only ever surfaced inside an allowed
+        parent document. The nested structure of an *allowed parent's*
+        non-restricted child tables IS shown — only the ratified restricted
+        child types (``DocPerm``, ``DocShare``, ``Custom Field``, ...) have
+        their schema hidden (FAC Task 7 rev. 2, 2026-08-09).
 
         The ``permissions`` list (role→perm matrix) is intentionally NOT
         returned: it used to disclose role names and their permission bits to
         any caller with read on the DocType, which is a privilege-escalation
         primitive.
         """
-        from frappe_assistant_core.core.security_policy import SecurityPolicy
+        from frappe_assistant_core.core.security_policy import (
+            RESTRICTED_DOCTYPES,
+            SecurityPolicy,
+        )
 
         try:
             if not frappe.db.exists("DocType", doctype):
                 return {"success": False, "error": f"DocType '{doctype}' not found"}
 
-            # Defensive restricted-target gate. Central policy already enforces
-            # this in ``BaseTool._safe_execute``; this guard covers direct
-            # calls from non-MCP code paths that did not go through the policy.
+            # Defensive restricted-target gate. ``_is_restricted_target``
+            # covers both the ratified RESTRICTED_DOCTYPES baseline and
+            # ``meta.istable == 1`` (direct child DocType requests are not
+            # allowed — child rows surface only inside an allowed parent).
             if SecurityPolicy._is_restricted_target(doctype):
                 return {"success": False, "error": f"DocType '{doctype}' is restricted"}
 
@@ -144,11 +174,14 @@ class MetadataTools:
                 for field in meta.get_link_fields()
             ]
 
-            # Child tables: include the child DocType's own field metadata so the
-            # caller can build nested row objects without a second tool call (#192).
-            # Restricted child DocTypes (DocPerm, DocShare, Custom Field, ...) are
-            # skipped so their role→perm matrix and field schema are not disclosed
-            # (FAC Task 6).
+            # Child tables: include the child DocType's own field metadata so
+            # the caller can build nested row objects without a second tool
+            # call (#192). Two scoping rules:
+            #   * Only the RATIFIED RESTRICTED_DOCTYPES set hides its schema
+            #     (NOT every istable DocType — otherwise every child schema
+            #     would be empty, breaking #192's contract).
+            #   * Sensitive fields inside an otherwise-readable child are
+            #     still stripped by ``_serialize_field``.
             child_tables = []
             for table_field in meta.get_table_fields():
                 child_doctype = table_field.options
@@ -162,7 +195,7 @@ class MetadataTools:
                 }
                 if (
                     child_doctype
-                    and not SecurityPolicy._is_restricted_target(child_doctype)
+                    and child_doctype not in RESTRICTED_DOCTYPES
                     and frappe.db.exists("DocType", child_doctype)
                 ):
                     child_meta = frappe.get_meta(child_doctype)
@@ -170,9 +203,9 @@ class MetadataTools:
                         MetadataTools._serialize_field(f) for f in child_meta.fields
                     ]
                 else:
-                    # Restricted child: keep the structural pointer (fieldname,
-                    # fieldtype) so the caller knows a child row exists, but do
-                    # NOT serialise the restricted child's own field schema.
+                    # Restricted child: keep the structural pointer so the
+                    # caller knows a child row exists, but do NOT serialise
+                    # the restricted child's own field schema.
                     child_entry["fields"] = []
                     child_entry["restricted"] = True
                 child_tables.append(child_entry)
