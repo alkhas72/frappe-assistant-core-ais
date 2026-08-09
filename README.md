@@ -139,19 +139,22 @@ Full specification for each tool is in the
 
 ## Extend with your own tools
 
-If you have a Frappe app and want the LLM to reach into it, use the
-`assistant_tools` hook in your app's `hooks.py`. This is the recommended
-path — tools travel with the app, survive upgrades, and stay scoped to
-your data model. The same pattern works for Skills via the
-`assistant_skills` hook.
+External tools registered through the `assistant_tools` hook or Builder are **not**
+part of the ratified FAC security inventory until they pass a separate security
+review and are added to the trusted external allowlist. Do not assume hook-discovered
+tools are automatically published to LLM clients.
 
-If you need to modify core FAC behaviour instead, write an internal
-plugin.
+If you maintain a Frappe app and plan to expose tools to an LLM, read the
+[External App Development guide](docs/development/EXTERNAL_APP_DEVELOPMENT.md)
+for the hook contract, then coordinate security ratification with your FAC
+administrator. Internal core behaviour changes belong in an internal plugin —
+see the [Plugin Development guide](docs/development/PLUGIN_DEVELOPMENT.md).
 
-See the [External App Development guide](docs/development/EXTERNAL_APP_DEVELOPMENT.md)
-for the hook contract, and the
-[Plugin Development guide](docs/development/PLUGIN_DEVELOPMENT.md) for
-internal plugins.
+For the hardened policy (24 built-in tools, hard-deny set, configuration modes,
+reason codes, and no System Manager / Administrator bypass), see
+[FAC Security Policy](docs/security/fac-security-policy.md).
+Production rollout steps are in the
+[FAC Security Rollout Runbook](docs/security/fac-rollout-runbook.md).
 
 ---
 
@@ -165,8 +168,16 @@ Every call is logged to `Assistant Audit Log` with caller, tool,
 arguments, and result status, so admins always have a full record of
 what the LLM did.
 
+Hardened deployments deny by default: only the 24 ratified built-in tools
+participate in authorization, eight of which are permanently hard-denied.
+System Manager and Administrator have **no policy bypass**. See
+[FAC Security Policy](docs/security/fac-security-policy.md) for inventory,
+configuration modes, reason codes, and external-tool exclusion rules.
+
 For setup and advanced configuration:
 
+- [FAC Security Policy](docs/security/fac-security-policy.md)
+- [FAC Security Rollout Runbook](docs/security/fac-rollout-runbook.md)
 - [OAuth Setup Guide](docs/getting-started/oauth/oauth_setup_guide.md)
 - [Code Execution Security](docs/guides/CODE_EXECUTION_SECURITY.md)
 - [MCP StreamableHTTP Guide](docs/internals/MCP_STREAMABLEHTTP_GUIDE.md)
