@@ -25,6 +25,7 @@ import frappe
 from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.tests.legacy_tool_test_support import legacy_tool_registry_access
 
 
 class TestMetadataTools(BaseAssistantTest):
@@ -36,14 +37,14 @@ class TestMetadataTools(BaseAssistantTest):
 
     def test_get_tools_structure(self):
         """Test that metadata tools are properly registered"""
-        tools = self.registry.get_available_tools()
-        tool_names = [tool["name"] for tool in tools]
+        with legacy_tool_registry_access(["get_doctype_info"]):
+            tools = self.registry.get_available_tools()
+            tool_names = [tool["name"] for tool in tools]
 
-        # Check for metadata tools
-        expected_tools = ["get_doctype_info"]
-        found_tools = [tool for tool in expected_tools if tool in tool_names]
+            expected_tools = ["get_doctype_info"]
+            found_tools = [tool for tool in expected_tools if tool in tool_names]
 
-        self.assertGreater(len(found_tools), 0, f"Should find metadata tools. Available: {tool_names}")
+            self.assertGreater(len(found_tools), 0, f"Should find metadata tools. Available: {tool_names}")
 
     def test_execute_tool_routing(self):
         """Test that tool routing works correctly"""

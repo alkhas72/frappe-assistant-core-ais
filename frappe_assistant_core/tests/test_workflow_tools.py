@@ -25,6 +25,7 @@ import frappe
 from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+from frappe_assistant_core.tests.legacy_tool_test_support import legacy_tool_registry_access
 
 
 class TestWorkflowTools(BaseAssistantTest):
@@ -36,14 +37,14 @@ class TestWorkflowTools(BaseAssistantTest):
 
     def test_get_tools_structure(self):
         """Test that workflow tools are properly registered"""
-        tools = self.registry.get_available_tools()
-        tool_names = [tool["name"] for tool in tools]
+        with legacy_tool_registry_access(["run_workflow"]):
+            tools = self.registry.get_available_tools()
+            tool_names = [tool["name"] for tool in tools]
 
-        # Check for workflow tools
-        expected_tools = ["run_workflow"]
-        found_tools = [tool for tool in expected_tools if tool in tool_names]
+            expected_tools = ["run_workflow"]
+            found_tools = [tool for tool in expected_tools if tool in tool_names]
 
-        self.assertGreater(len(found_tools), 0, f"Should find workflow tools. Available: {tool_names}")
+            self.assertGreater(len(found_tools), 0, f"Should find workflow tools. Available: {tool_names}")
 
     def test_execute_tool_routing(self):
         """Test that tool routing works correctly"""
