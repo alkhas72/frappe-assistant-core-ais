@@ -6,10 +6,10 @@ sync semantics, the canonical tool registry import in migration hooks, the
 fail-closed ``FAC Tool Configuration.user_has_access`` contract, the hardened
 admin endpoints, and the admin UI/API mode contract.
 
-Isolation: tests only touch synthetic ``__test_*`` rows and rely on the
-FrappeTestCase transaction rollback. No test commits; code under test that
-commits internally is run with ``frappe.db.commit`` patched to a no-op, so
-nothing escapes the test transaction.
+Isolation: each mutating test snapshots and restores the complete FAC tool,
+role-access, and plugin configuration tables. Commit suppression and the
+FrappeTestCase transaction rollback are secondary safeguards, not the only
+isolation mechanism.
 """
 
 import importlib
@@ -83,9 +83,9 @@ def _delete_config(tool_name):
 def _seed_config(tool_name, enabled, mode, role_rows, plugin_name="core"):
     """Create a config row, including legacy states the new schema rejects.
 
-    Child rows are inserted directly into the child table and legacy modes are
-    forced via ``frappe.db.set_value`` so controller validation never blocks
-    seeding a state that could exist on a pre-migration site.
+    Legacy child values and modes are forced via ``frappe.db.set_value`` after
+    inserting a valid row, so controller validation never blocks seeding a
+    state that could exist on a pre-migration site.
     """
     _delete_config(tool_name)
 
@@ -101,16 +101,23 @@ def _seed_config(tool_name, enabled, mode, role_rows, plugin_name="core"):
     doc.insert(ignore_permissions=True)
 
     for role, allow_access in role_rows:
-        frappe.get_doc(
+        # A pre-hardening database can contain invalid Link values. Insert a
+        # valid child through Frappe, then replace just the legacy role value
+        # through the DB API so production validation remains intact.
+        seeded_role = role if frappe.db.exists("Role", role) else "System Manager"
+        child = frappe.get_doc(
             {
                 "doctype": ROLE_ACCESS_DOCTYPE,
                 "parent": tool_name,
                 "parenttype": TOOL_CONFIG_DOCTYPE,
                 "parentfield": "role_access",
-                "role": role,
+                "role": seeded_role,
                 "allow_access": allow_access,
             }
-        ).insert(ignore_permissions=True)
+        )
+        child.insert(ignore_permissions=True)
+        if seeded_role != role:
+            frappe.db.set_value(ROLE_ACCESS_DOCTYPE, child.name, "role", role)
 
     if mode != "Deny All":
         frappe.db.set_value(TOOL_CONFIG_DOCTYPE, tool_name, "role_access_mode", mode)
@@ -142,15 +149,68 @@ def _no_commit():
     return patch.object(frappe.db, "commit", lambda *args, **kwargs: None)
 
 
-class TestHardenFacToolAccessDefaults(FrappeTestCase):
+class FACSecuritySnapshotTestCase(FrappeTestCase):
+    """Restore FAC security rows exactly, even when a test raises.
+
+    Migration tests intentionally exercise canonical configurations. A
+    transaction rollback alone is insufficient because code under test can
+    commit or alter singleton-backed state; take explicit low-level snapshots
+    of every parent, child, and plugin row before the test and restore them in
+    ``tearDown``.
+    """
+
+    _snapshot_tables = (
+        "tabFAC Tool Role Access",
+        "tabFAC Tool Configuration",
+        "tabFAC Plugin Configuration",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self._fac_security_snapshot = {
+            table: frappe.db.sql(f"SELECT * FROM `{table}` ORDER BY name", as_dict=True)
+            for table in self._snapshot_tables
+        }
+
+    def _restore_table(self, table, rows):
+        columns = [
+            column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)
+        ]
+        frappe.db.sql(f"DELETE FROM `{table}`")
+        if not rows:
+            return
+        placeholders = ", ".join(["%s"] * len(columns))
+        quoted_columns = ", ".join(f"`{column}`" for column in columns)
+        statement = f"INSERT INTO `{table}` ({quoted_columns}) VALUES ({placeholders})"
+        for row in rows:
+            frappe.db.sql(statement, tuple(row.get(column) for column in columns))
+
+    def _restore_fac_security_snapshot(self):
+        # Child rows must be removed first and restored after their parents.
+        for table in self._snapshot_tables:
+            self._restore_table(table, self._fac_security_snapshot[table])
+
     def tearDown(self):
-        # Best-effort cleanup of synthetic rows; no commit — FrappeTestCase
-        # rolls the transaction back after each test.
-        for tool_name in {case[0] for case in CASES} | {"__test_mixed_tool"}:
-            _delete_config(tool_name)
-        frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": ("like", "__test_%")})
-        frappe.db.delete("Role", {"name": ("like", "__test_%")})
-        super().tearDown()
+        try:
+            self._restore_fac_security_snapshot()
+            restored = {
+                table: frappe.db.sql(f"SELECT * FROM `{table}` ORDER BY name", as_dict=True)
+                for table in self._snapshot_tables
+            }
+            self.assertEqual(restored, self._fac_security_snapshot)
+        finally:
+            super().tearDown()
+
+
+class TestHardenFacToolAccessDefaults(FACSecuritySnapshotTestCase):
+    def tearDown(self):
+        try:
+            for tool_name in {case[0] for case in CASES} | {"__test_mixed_tool"}:
+                _delete_config(tool_name)
+            frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": ("like", "__test_%")})
+            frappe.db.delete("Role", {"name": ("like", "__test_%")})
+        finally:
+            super().tearDown()
 
     def test_migration_matrix(self):
         for tool_name, enabled, mode, role_rows, exp_enabled, exp_mode, exp_roles in CASES:
@@ -252,11 +312,18 @@ class TestHardenFacToolAccessDefaults(FrappeTestCase):
         self.assertEqual(remaining, [])
 
 
-class TestSyncToolConfigurationDefaults(FrappeTestCase):
+class TestSyncToolConfigurationDefaults(FACSecuritySnapshotTestCase):
     def tearDown(self):
-        for tool_name in ("__test_sync_keep_tool", "__test_sync_ghost_tool", "__test_sync_ext_tool"):
-            _delete_config(tool_name)
-        super().tearDown()
+        try:
+            for tool_name in (
+                "__test_sync_keep_tool",
+                "__test_sync_ghost_tool",
+                "__test_sync_ext_tool",
+                "__test_declared_unimportable",
+            ):
+                _delete_config(tool_name)
+        finally:
+            super().tearDown()
 
     def _run_sync(self, tools, external=None):
         with (
@@ -314,7 +381,14 @@ class TestSyncToolConfigurationDefaults(FrappeTestCase):
         # Tool belongs to a plugin that is later disabled: the config must not
         # be deleted while the tool is absent from discovery, and re-enabling
         # the plugin must not recreate a permissive record.
-        _seed_config("__test_sync_ghost_tool", 1, "Restrict to Listed Roles", [("Assistant User", 1)])
+        _seed_plugin_config("__test_plugin", 0)
+        _seed_config(
+            "__test_sync_ghost_tool",
+            1,
+            "Restrict to Listed Roles",
+            [("Assistant User", 1)],
+            plugin_name="__test_plugin",
+        )
 
         self._run_sync({})  # plugin disabled -> tool absent from discovery
         self.assertEqual(
@@ -322,14 +396,54 @@ class TestSyncToolConfigurationDefaults(FrappeTestCase):
             (1, "Restrict to Listed Roles", ["Assistant User"]),
         )
 
+        frappe.db.set_value(PLUGIN_CONFIG_DOCTYPE, "__test_plugin", "enabled", 1)
         self._run_sync({"__test_sync_ghost_tool": self._tool_info("__test_plugin")})
         self.assertEqual(
             _config_state("__test_sync_ghost_tool"),
             (1, "Restrict to Listed Roles", ["Assistant User"]),
         )
 
+    def test_declared_tool_with_import_error_gets_safe_configuration(self):
+        """Declared inventory remains deny-by-default when an optional import fails."""
+        from frappe_assistant_core.utils import migration_hooks
 
-class TestSyncDiscoversDisabledPluginTools(FrappeTestCase):
+        discovery = MagicMock()
+        discovery.discover_plugins.return_value = {
+            "__test_broken_plugin": SimpleNamespace(
+                tools=["__test_declared_unimportable"],
+                description="Declared tool whose optional dependency is unavailable",
+            )
+        }
+        with (
+            patch(
+                "frappe_assistant_core.utils.plugin_manager.PluginDiscovery",
+                return_value=discovery,
+            ),
+            patch(
+                "frappe_assistant_core.utils.plugin_manager.PluginConfig.PLUGIN_BASE_PATH",
+                "__test_optional_dependency_missing__",
+            ),
+            _no_commit(),
+        ):
+            migration_hooks._sync_tool_configurations()
+
+        self.assertEqual(_config_state("__test_declared_unimportable"), (0, "Deny All", []))
+        fallback = frappe.db.get_value(
+            TOOL_CONFIG_DOCTYPE,
+            "__test_declared_unimportable",
+            ["plugin_name", "tool_category", "source_app", "module_path"],
+            as_dict=True,
+        )
+        self.assertEqual(fallback.plugin_name, "__test_broken_plugin")
+        self.assertTrue(fallback.tool_category)
+        self.assertEqual(fallback.source_app, "frappe_assistant_core")
+        self.assertEqual(
+            fallback.module_path,
+            "__test_optional_dependency_missing__.__test_broken_plugin.tools.__test_declared_unimportable",
+        )
+
+
+class TestSyncDiscoversDisabledPluginTools(FACSecuritySnapshotTestCase):
     """Unmocked discovery contract: disabled plugins still get tool configs.
 
     ``plugin_manager.get_all_tools()`` only returns tools of enabled plugins;
@@ -365,10 +479,12 @@ class TestSyncDiscoversDisabledPluginTools(FrappeTestCase):
                 self.assertEqual(_config_state(tool_name), (0, "Deny All", []))
 
 
-class TestSyncPluginConfigurationDefaults(FrappeTestCase):
+class TestSyncPluginConfigurationDefaults(FACSecuritySnapshotTestCase):
     def tearDown(self):
-        frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": ("like", "__test_%")})
-        super().tearDown()
+        try:
+            frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": ("like", "__test_%")})
+        finally:
+            super().tearDown()
 
     def _run_sync(self, discovered):
         discovery = MagicMock()
@@ -419,9 +535,20 @@ class TestCanonicalRegistryImport(FrappeTestCase):
             importlib.import_module("frappe_assistant_core.core.enhanced_tool_registry")
 
     def test_migration_status_uses_canonical_registry(self):
+        from frappe_assistant_core.core import tool_registry
+        from frappe_assistant_core.utils import plugin_manager
         from frappe_assistant_core.utils.migration_hooks import get_migration_status
 
-        status = get_migration_status()
+        # Earlier tests can leave singleton objects holding test doubles.
+        # Exercise the real canonical API from a clean boundary and restore
+        # both globals afterwards so this assertion cannot depend on order.
+        fresh_plugin_manager = plugin_manager.PluginManager()
+        fresh_registry = tool_registry.ToolRegistry()
+        with (
+            patch.object(tool_registry, "get_plugin_manager", return_value=fresh_plugin_manager),
+            patch.object(tool_registry, "get_tool_registry", return_value=fresh_registry),
+        ):
+            status = get_migration_status()
         self.assertTrue(status.get("migration_hooks_active"), status)
         self.assertIn("registry_stats", status)
 
@@ -460,13 +587,66 @@ class TestCanonicalRegistryImport(FrappeTestCase):
         registry.get_stats.assert_called_once_with()
 
 
-class TestAdminEndpointHardening(FrappeTestCase):
+class TestAfterInstallDenyByDefault(FACSecuritySnapshotTestCase):
+    """Actual repair flow creates only safe configuration end states."""
+
+    def test_after_install_repairs_to_safe_idempotent_end_state(self):
+        from frappe_assistant_core.utils import migration_hooks
+
+        frappe.db.delete(ROLE_ACCESS_DOCTYPE)
+        frappe.db.delete(TOOL_CONFIG_DOCTYPE)
+        frappe.db.delete(PLUGIN_CONFIG_DOCTYPE)
+
+        with (
+            patch.object(migration_hooks, "_install_system_prompt_categories"),
+            patch.object(migration_hooks, "_install_system_prompt_templates"),
+            patch.object(migration_hooks, "_install_system_skills"),
+            patch.object(migration_hooks, "_install_app_skills"),
+            patch.object(migration_hooks, "_set_settings_defaults"),
+            _no_commit(),
+        ):
+            migration_hooks.after_install()
+            first = frappe.get_all(
+                TOOL_CONFIG_DOCTYPE,
+                fields=["name", "enabled", "role_access_mode"],
+                order_by="name",
+            )
+            migration_hooks.after_install()
+            second = frappe.get_all(
+                TOOL_CONFIG_DOCTYPE,
+                fields=["name", "enabled", "role_access_mode"],
+                order_by="name",
+            )
+
+        self.assertEqual(first, second)
+        self.assertTrue(first)
+        self.assertTrue(
+            all(not row.enabled and row.role_access_mode == "Deny All" for row in first)
+        )
+        self.assertEqual(
+            frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "core", "enabled"),
+            1,
+        )
+        self.assertEqual(
+            frappe.get_all(
+                PLUGIN_CONFIG_DOCTYPE,
+                filters={"enabled": 1, "plugin_name": ("!=", "core")},
+                pluck="name",
+            ),
+            [],
+        )
+        self.assertEqual(_config_state("get_document"), (0, "Deny All", []))
+
+
+class TestAdminEndpointHardening(FACSecuritySnapshotTestCase):
     """Endpoint-level tests for the hardened admin API (runs as Administrator)."""
 
     def tearDown(self):
-        for tool_name in ("__test_toggle_tool", "run_python_code", "__test_role_tool"):
-            _delete_config(tool_name)
-        super().tearDown()
+        try:
+            for tool_name in ("__test_toggle_tool", "run_python_code", "__test_role_tool"):
+                _delete_config(tool_name)
+        finally:
+            super().tearDown()
 
     def _mock_tool_inventory(self, *tool_names):
         tools = {
@@ -597,17 +777,24 @@ class TestAdminUIContract(FrappeTestCase):
             return f.read()
 
     def test_js_has_no_allow_all_and_offers_deny_all(self):
-        js = self._read_admin_js()
-        self.assertNotIn("Allow All", js)
-        self.assertIn('value="Deny All"', js)
-        self.assertIn('value="Restrict to Listed Roles"', js)
+        role_select = self._role_mode_select()
+        self.assertNotIn("Allow All", role_select)
+        self.assertIn('value="Deny All"', role_select)
+        self.assertIn('value="Restrict to Listed Roles"', role_select)
+
+    def _role_mode_select(self):
+        match = re.search(
+            r'<select class="fac-config-select fac-role-mode-select".*?</select>',
+            self._read_admin_js(),
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match, "role mode select is missing")
+        return match.group(0)
 
     def test_js_role_mode_options_match_api_contract(self):
-        js = self._read_admin_js()
-        option_values = set(re.findall(r'<option value="([^"]+)"', js))
-        # Role access modes are the non-category options the select can submit.
-        category_values = {"read_only", "write", "read_write", "privileged"}
-        js_role_modes = option_values - category_values
+        js_role_modes = set(
+            re.findall(r'<option value="([^"]+)"', self._role_mode_select())
+        )
         self.assertEqual(js_role_modes, {"Deny All", "Restrict to Listed Roles"})
 
         # Every mode the UI can submit is accepted by the API (fails later on

@@ -955,6 +955,7 @@ def _discover_all_plugin_tools() -> dict:
 
         for declared_module in plugin_info.tools or []:
             module_name = f"{PluginConfig.PLUGIN_BASE_PATH}.{plugin_name}.tools.{declared_module}"
+            loaded_tool = False
             try:
                 module = importlib.import_module(module_name)
                 candidates = {
@@ -974,9 +975,23 @@ def _discover_all_plugin_tools() -> dict:
                         description=getattr(instance, "description", ""),
                         instance=instance,
                     )
+                    loaded_tool = True
             except Exception as e:
                 frappe.logger("migration_hooks").warning(
                     f"Failed to load tool module {module_name} during sync: {e}"
+                )
+
+            # ``PluginInfo.tools`` is the authoritative inventory. Optional
+            # dependencies (for example pandas in data_science) can make a
+            # module or constructor unavailable, but that must not make its
+            # configuration disappear: create a safe, disabled placeholder.
+            if not loaded_tool and declared_module not in tools:
+                tools[declared_module] = SimpleNamespace(
+                    plugin_name=plugin_name,
+                    description=getattr(plugin_info, "description", ""),
+                    instance=None,
+                    source_app="frappe_assistant_core",
+                    module_path=module_name,
                 )
 
     return tools
@@ -1039,9 +1054,16 @@ def _sync_tool_configurations():
             config.auto_detected_category = category
             config.category_override = 0
             config.role_access_mode = "Deny All"
-            config.source_app = getattr(tool_info.instance, "source_app", "frappe_assistant_core")
-            config.module_path = (
-                f"{tool_info.instance.__class__.__module__}.{tool_info.instance.__class__.__name__}"
+            instance = getattr(tool_info, "instance", None)
+            config.source_app = getattr(
+                tool_info,
+                "source_app",
+                getattr(instance, "source_app", "frappe_assistant_core"),
+            )
+            config.module_path = getattr(tool_info, "module_path", "") or (
+                f"{instance.__class__.__module__}.{instance.__class__.__name__}"
+                if instance is not None
+                else ""
             )
 
             config.flags.ignore_permissions = True
