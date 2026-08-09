@@ -32,11 +32,13 @@ def capture_tool_configs_snapshot(tool_names: Iterable[str]) -> dict:
         return {"tool_names": (), "parents": [], "children": []}
 
     placeholders = ", ".join(["%s"] * len(existing))
+    # nosemgrep: frappe-sql-format-injection — fixed test table; values stay parameterized
     parents = frappe.db.sql(
         f"SELECT * FROM `{TOOL_CONFIG_TABLE}` WHERE name IN ({placeholders}) ORDER BY name",
         tuple(existing),
         as_dict=True,
     )
+    # nosemgrep: frappe-sql-format-injection — fixed test table; values stay parameterized
     children = frappe.db.sql(
         f"SELECT * FROM `{ROLE_ACCESS_TABLE}` WHERE parent IN ({placeholders}) " "ORDER BY parent, idx, name",
         tuple(existing),
@@ -55,6 +57,7 @@ def tool_configs_snapshot_hash(snapshot: dict) -> str:
 
 
 def _table_columns(table: str) -> list[str]:
+    # nosemgrep: frappe-sql-format-injection — caller supplies one of two fixed test tables
     return [column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)]
 
 
@@ -64,6 +67,7 @@ def _insert_rows(table: str, rows: list[dict]) -> None:
     columns = _table_columns(table)
     placeholders = ", ".join(["%s"] * len(columns))
     quoted_columns = ", ".join(f"`{column}`" for column in columns)
+    # nosemgrep: frappe-sql-format-injection — table/columns come from fixed schema metadata; values are bound
     statement = f"INSERT INTO `{table}` ({quoted_columns}) VALUES ({placeholders})"
     for row in rows:
         frappe.db.sql(statement, tuple(row.get(column) for column in columns))
@@ -79,10 +83,12 @@ def restore_tool_configs_snapshot(snapshot: dict | None) -> None:
         return
 
     placeholders = ", ".join(["%s"] * len(tool_names))
+    # nosemgrep: frappe-sql-format-injection — fixed test table; values stay parameterized
     frappe.db.sql(
         f"DELETE FROM `{ROLE_ACCESS_TABLE}` WHERE parent IN ({placeholders})",
         tuple(tool_names),
     )
+    # nosemgrep: frappe-sql-format-injection — fixed test table; values stay parameterized
     frappe.db.sql(
         f"DELETE FROM `{TOOL_CONFIG_TABLE}` WHERE name IN ({placeholders})",
         tuple(tool_names),
@@ -136,7 +142,7 @@ class LegacyToolRegistryAccess:
     def __enter__(self) -> LegacyToolRegistryAccess:
         self._previous_user = frappe.session.user
         try:
-            frappe.set_user("Administrator")
+            frappe.set_user("Administrator")  # nosemgrep: frappe-setuser — isolated fixture actor switch
             self._snapshot = capture_tool_configs_snapshot(self.tool_names)
             self._cleanup_needed = bool(self._snapshot.get("tool_names"))
 
@@ -146,7 +152,7 @@ class LegacyToolRegistryAccess:
             create_disposable_system_manager_user(self.email)
             self._user_created = True
             ToolRegistry().clear_cache()
-            frappe.set_user(self.email)
+            frappe.set_user(self.email)  # nosemgrep: frappe-setuser — disposable isolated test actor
             return self
         except Exception:
             self._restore_and_cleanup()
@@ -162,7 +168,7 @@ class LegacyToolRegistryAccess:
         self._restored = True
 
         try:
-            frappe.set_user("Administrator")
+            frappe.set_user("Administrator")  # nosemgrep: frappe-setuser — fixture cleanup authority
         except Exception:
             pass
 
@@ -184,7 +190,7 @@ class LegacyToolRegistryAccess:
 
         if self._previous_user:
             try:
-                frappe.set_user(self._previous_user)
+                frappe.set_user(self._previous_user)  # nosemgrep: frappe-setuser — restore prior test actor
             except Exception:
                 pass
 
