@@ -14,6 +14,7 @@ from frappe_assistant_core.core.security_policy import (
     ToolContext,
 )
 from frappe_assistant_core.core.tool_registry import ToolRegistry
+from frappe_assistant_core.mcp.server import MCPServer
 from frappe_assistant_core.mcp.tool_adapter import build_tool_dict
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
 from frappe_assistant_core.utils.plugin_manager import get_plugin_manager
@@ -247,6 +248,49 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
             update_modified=False,
         )
         self._assert_execute_denied()
+
+    def test_saved_mcp_publication_denies_once_after_tool_is_disabled(self):
+        self._assert_published()
+        tool = self.registry.get_tool(self.tool_name)
+        published_tool = build_tool_dict(
+            tool,
+            executor=self.registry.execute_tool,
+        )
+        frappe.db.set_value(
+            "FAC Tool Configuration",
+            self.tool_name,
+            "enabled",
+            0,
+            update_modified=False,
+        )
+
+        server = MCPServer("task4-toctou")
+        with ExitStack() as stack:
+            body = stack.enter_context(patch.object(tool, "execute"))
+            execution_audit = stack.enter_context(
+                patch.object(BaseTool, "log_execution")
+            )
+            boundary_audit = stack.enter_context(
+                patch(
+                    "frappe_assistant_core.mcp.server.audit_unavailable_tool_call"
+                )
+            )
+            result = server._handle_tools_call(
+                {
+                    "name": self.tool_name,
+                    "arguments": {
+                        "doctype": "ToDo",
+                        "name": "TD-DOES-NOT-MATTER",
+                    },
+                },
+                {self.tool_name: published_tool},
+            )
+
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["content"][0]["text"], "Tool is not available")
+        body.assert_not_called()
+        execution_audit.assert_called_once()
+        boundary_audit.assert_not_called()
 
     def test_plugin_disabled_after_publication_is_classified_and_audited_once(self):
         self._assert_published()

@@ -22,7 +22,6 @@ and integrates seamlessly with Frappe's existing tool infrastructure.
 """
 
 import frappe
-from frappe import _
 
 from frappe_assistant_core.mcp.server import MCPServer
 
@@ -107,7 +106,10 @@ def _build_tool_registry():
         frappe.logger().info(f"Built {len(registry_dict)} enabled tools for user {frappe.session.user}")
 
     except Exception as e:
-        frappe.log_error(title="Tool Import Error", message=f"Error importing tools: {str(e)}")
+        frappe.log_error(
+            title="Tool Import Error",
+            message=f"Type: {type(e).__name__}",
+        )
 
     return registry_dict
 
@@ -146,7 +148,9 @@ def _resolve_tool_categories(tool_names: list, registry) -> dict:
             if row.get("tool_category"):
                 categories[row["tool_name"]] = row["tool_category"]
     except Exception as e:
-        frappe.logger().warning(f"Could not batch-fetch tool categories: {e}")
+        frappe.logger().warning(
+            f"Could not batch-fetch tool categories: type={type(e).__name__}"
+        )
 
     # 2 & 3. Fill gaps via auto-detection, defaulting to read_write.
     for tool_name in tool_names:
@@ -161,6 +165,41 @@ def _resolve_tool_categories(tool_names: list, registry) -> dict:
     return categories
 
 
+def _denied_response(
+    reason_code: str,
+    user: str = "Guest",
+    status_code: int = 401,
+    error: str = "unauthorized",
+    message: str = "Authentication required",
+):
+    """Return a stable denial response and audit reason-only metadata."""
+    from werkzeug.wrappers import Response
+
+    from frappe_assistant_core.api.oauth_discovery import get_public_base_url
+    from frappe_assistant_core.utils.audit_trail import log_security_event
+
+    log_security_event(
+        event_type="permission_denied",
+        user=user,
+        details={"reason_code": reason_code},
+        severity="High",
+    )
+
+    response = Response()
+    response.status_code = status_code
+    response.headers["Content-Type"] = "application/json"
+    response.data = frappe.as_json({"error": error, "message": message})
+    if status_code == 401:
+        metadata_url = (
+            f"{get_public_base_url()}/.well-known/oauth-protected-resource"
+        )
+        response.headers["WWW-Authenticate"] = (
+            f'Bearer realm="Frappe Assistant Core", '
+            f'resource_metadata="{metadata_url}"'
+        )
+    return response
+
+
 def _authenticate_mcp_request():
     """
     Authenticate MCP requests using OAuth Bearer tokens or API key/secret.
@@ -173,10 +212,6 @@ def _authenticate_mcp_request():
         str: Authenticated username
         None: Authentication failed (returns 401 response directly)
     """
-    from werkzeug.wrappers import Response
-
-    from frappe_assistant_core.api.oauth_discovery import get_public_base_url
-
     auth_header = frappe.request.headers.get("Authorization", "")
 
     # Try OAuth Bearer token authentication first
@@ -210,42 +245,33 @@ def _authenticate_mcp_request():
 
         except frappe.DoesNotExistError:
             frappe.logger().error("OAuth Bearer Token not found")
-            # Token not found - return 401
-            frappe_url = get_public_base_url()
-            metadata_url = f"{frappe_url}/.well-known/oauth-protected-resource"
-
-            response = Response()
-            response.status_code = 401
-            response.headers["WWW-Authenticate"] = (
-                f'Bearer realm="Frappe Assistant Core", '
-                f'error="invalid_token", '
-                f'error_description="Token not found", '
-                f'resource_metadata="{metadata_url}"'
+            return _denied_response(
+                "TOKEN_NOT_FOUND",
+                error="invalid_token",
+                message="Invalid authentication credentials",
             )
-            response.headers["Content-Type"] = "application/json"
-            response.data = frappe.as_json({"error": "invalid_token", "message": "Token not found"})
-            return response
+
+        except frappe.AuthenticationError:
+            frappe.logger().warning("OAuth token rejected")
+            return _denied_response(
+                "TOKEN_INVALID",
+                error="invalid_token",
+                message="Invalid authentication credentials",
+            )
 
         except Exception as e:
-            # Log the error for debugging
-            frappe.logger().error(f"OAuth token validation error: {type(e).__name__}: {str(e)}")
-            frappe.log_error(title="OAuth Token Validation Error", message=f"{type(e).__name__}: {str(e)}")
-
-            # Return 401 for invalid/expired tokens
-            frappe_url = get_public_base_url()
-            metadata_url = f"{frappe_url}/.well-known/oauth-protected-resource"
-
-            response = Response()
-            response.status_code = 401
-            response.headers["WWW-Authenticate"] = (
-                f'Bearer realm="Frappe Assistant Core", '
-                f'error="invalid_token", '
-                f'error_description="{str(e)}", '
-                f'resource_metadata="{metadata_url}"'
+            frappe.logger().error(
+                f"OAuth token validation error: type={type(e).__name__}"
             )
-            response.headers["Content-Type"] = "application/json"
-            response.data = frappe.as_json({"error": "invalid_token", "message": str(e)})
-            return response
+            frappe.log_error(
+                title="OAuth Token Validation Error",
+                message=f"Type: {type(e).__name__}",
+            )
+            return _denied_response(
+                "AUTHENTICATION_ERROR",
+                error="invalid_token",
+                message="Invalid authentication credentials",
+            )
 
     # Try API Key/Secret authentication (for STDIO clients)
     elif auth_header.startswith("token "):
@@ -284,50 +310,30 @@ def _authenticate_mcp_request():
                 frappe.logger().warning("Invalid API key format - missing colon separator")
                 raise frappe.AuthenticationError("Invalid API key format")
 
-        except frappe.AuthenticationError as e:
-            # Return 401 for invalid API credentials
-            frappe_url = get_public_base_url()
-            metadata_url = f"{frappe_url}/.well-known/oauth-protected-resource"
-
-            response = Response()
-            response.status_code = 401
-            response.headers["WWW-Authenticate"] = (
-                f'Bearer realm="Frappe Assistant Core", ' f'resource_metadata="{metadata_url}"'
+        except frappe.AuthenticationError:
+            return _denied_response(
+                "API_CREDENTIALS_INVALID",
+                error="invalid_credentials",
+                message="Invalid authentication credentials",
             )
-            response.headers["Content-Type"] = "application/json"
-            response.data = frappe.as_json({"error": "invalid_credentials", "message": str(e)})
-            return response
 
         except Exception as e:
-            frappe.logger().error(f"API key authentication error: {type(e).__name__}: {str(e)}")
-            frappe.log_error(title="API Key Authentication Error", message=f"{type(e).__name__}: {str(e)}")
-
-            # Return 401 for other errors
-            frappe_url = get_public_base_url()
-            metadata_url = f"{frappe_url}/.well-known/oauth-protected-resource"
-
-            response = Response()
-            response.status_code = 401
-            response.headers["WWW-Authenticate"] = (
-                f'Bearer realm="Frappe Assistant Core", ' f'resource_metadata="{metadata_url}"'
+            frappe.logger().error(
+                f"API key authentication error: type={type(e).__name__}"
             )
-            response.headers["Content-Type"] = "application/json"
-            response.data = frappe.as_json({"error": "authentication_error", "message": str(e)})
-            return response
+            frappe.log_error(
+                title="API Key Authentication Error",
+                message=f"Type: {type(e).__name__}",
+            )
+            return _denied_response(
+                "AUTHENTICATION_ERROR",
+                error="authentication_error",
+                message="Invalid authentication credentials",
+            )
 
     # No valid authentication method found
     frappe.logger().warning("No valid authentication method found in request")
-    frappe_url = get_public_base_url()
-    metadata_url = f"{frappe_url}/.well-known/oauth-protected-resource"
-
-    response = Response()
-    response.status_code = 401
-    response.headers["WWW-Authenticate"] = (
-        f'Bearer realm="Frappe Assistant Core", ' f'resource_metadata="{metadata_url}"'
-    )
-    response.headers["Content-Type"] = "application/json"
-    response.data = frappe.as_json({"error": "unauthorized", "message": "Authentication required"})
-    return response
+    return _denied_response("AUTH_MISSING")
 
 
 @mcp.register(allow_guest=True, xss_safe=True, methods=["GET", "POST", "HEAD"])
@@ -347,20 +353,9 @@ def handle_mcp():
     """
     from werkzeug.wrappers import Response
 
-    from frappe_assistant_core.api.oauth_discovery import get_public_base_url
-
     # Handle HEAD request for connectivity check (Claude Web uses this)
     if frappe.request.method == "HEAD":
-        # Return 401 with WWW-Authenticate header to indicate auth is required
-        frappe_url = get_public_base_url()
-        metadata_url = f"{frappe_url}/.well-known/oauth-protected-resource"
-
-        response = Response()
-        response.status_code = 401
-        response.headers["WWW-Authenticate"] = (
-            f'Bearer realm="Frappe Assistant Core", ' f'resource_metadata="{metadata_url}"'
-        )
-        return response
+        return _denied_response("AUTH_REQUIRED_HEAD")
 
     # Authenticate the request (supports both OAuth and API key)
     auth_result = _authenticate_mcp_request()
@@ -372,10 +367,17 @@ def handle_mcp():
     # Authentication successful - auth_result is the username
     authenticated_user = auth_result
 
+    if not authenticated_user or authenticated_user == "Guest":
+        return _denied_response("ACTOR_UNAUTHENTICATED")
+
     # Check if user has assistant access enabled
     if not _check_assistant_enabled(authenticated_user):
-        frappe.throw(
-            _("Assistant access is disabled for user {0}").format(authenticated_user), frappe.PermissionError
+        return _denied_response(
+            "ASSISTANT_DISABLED",
+            user=authenticated_user,
+            status_code=403,
+            error="access_denied",
+            message="Assistant access is disabled",
         )
 
     # Build a per-request tool registry (isolated from concurrent requests) and

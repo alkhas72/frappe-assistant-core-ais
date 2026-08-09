@@ -32,8 +32,8 @@ With concurrent ``tools/call`` requests handled in the same worker, one request
 could ``clear()`` the registry while another was validating or executing a tool
 against it. Symptoms reported in #197:
 
-  * an in-flight call failing with "Tool '<name>' not found. Available tools:
-    [...]" even though the tool exists, and
+  * an in-flight call failing because the tool disappeared from the shared
+    registry even though it exists, and
   * only one of several concurrent executions making it into Assistant Audit
     Log.
 
@@ -200,7 +200,10 @@ class TestMCPRegistryIsolation(BaseAssistantTest):
         # A's registry must not expose B's tool, and vice versa.
         cross = _handle(server, _make_request("tool_b", "X", 3), _registry_with(tool_a))
         self.assertTrue(_result_of(cross).get("isError"))
-        self.assertIn("not found", _result_of(cross)["content"][0]["text"])
+        cross_text = _result_of(cross)["content"][0]["text"]
+        self.assertEqual(cross_text, "Tool is not available")
+        self.assertNotIn("tool_a", cross_text)
+        self.assertNotIn("tool_b", cross_text)
 
 
 class TestMCPConcurrentToolsCall(BaseAssistantTest):
