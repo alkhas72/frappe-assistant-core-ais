@@ -169,7 +169,9 @@ def toggle_tool(tool_name: str, enabled: bool):
                 config.enabled = enabled
                 config.save(ignore_permissions=True)
             else:
-                # Create new configuration (deny-by-default role mode)
+                # Create new configuration deny-by-default: even when the
+                # caller asked to enable, a fresh config starts disabled and
+                # 'Deny All' until roles are explicitly configured.
                 tool_info = all_tools[tool_name]
                 category = detect_tool_category(tool_info.instance)
 
@@ -177,12 +179,32 @@ def toggle_tool(tool_name: str, enabled: bool):
                 config.tool_name = tool_name
                 config.plugin_name = tool_info.plugin_name
                 config.description = tool_info.description
-                config.enabled = enabled
+                config.enabled = 0
                 config.role_access_mode = "Deny All"
                 config.tool_category = category
                 config.auto_detected_category = category
                 config.source_app = getattr(tool_info.instance, "source_app", "frappe_assistant_core")
                 config.insert(ignore_permissions=True)
+
+                frappe.db.release_savepoint("toggle_tool")
+                frappe.db.commit()
+
+                # Clear caches
+                tool_registry = get_tool_registry()
+                tool_registry.clear_cache()
+
+                cache = frappe.cache()
+                cache.delete_keys("fac_tool_*")
+
+                return {
+                    "success": True,
+                    "enabled": False,
+                    "requires_configuration": True,
+                    "message": _(
+                        f"Tool '{tool_name}' configuration created disabled with 'Deny All'. "
+                        "Configure role access first, then enable the tool."
+                    ),
+                }
 
             frappe.db.release_savepoint("toggle_tool")
             frappe.db.commit()

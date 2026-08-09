@@ -1,54 +1,76 @@
-"""Idempotent migration: FAC Tool Configuration -> deny by default.
+"""Idempotent migration: FAC tool/plugin access -> deny by default.
 
-For every existing FAC Tool Configuration row:
+Tool configurations (FAC Tool Configuration):
 
-1. Hard-denied tools (``core.security_policy.HARD_DENY_TOOLS``, including known
-   legacy aliases) are forced to ``enabled=0`` / ``Deny All`` and their child
-   role rows are deleted.
+1. A valid ``Restrict to Listed Roles`` config is preserved only for tools in
+   ``core.security_policy.CONFIGURABLE_TOOLS`` (the ratified inventory minus
+   hard-denied tools). Hard-denied tools, known legacy aliases, unknown tools
+   and external tools are forced to ``enabled=0`` / ``Deny All``.
 2. ``Allow All``, empty/unknown ``role_access_mode`` values and restricted
    configs without at least one valid role row are converted to
    ``enabled=0`` / ``Deny All``.
-3. A valid ``Restrict to Listed Roles`` config (non-empty list of existing
-   roles with ``allow_access=1``) for a tool that is not hard-denied is
-   preserved unchanged.
+3. For preserved restricted configs, invalid child role rows (empty role
+   name, ``allow_access=0``, role no longer exists or is disabled) are
+   pruned; working rows are kept.
 
-The patch only writes via ``frappe.db.set_value`` on the exact ``enabled`` and
-``role_access_mode`` fields and deletes invalid child rows via
-``frappe.db.delete`` — no ``doc.save()`` (so it does not depend on controller
-or schema validation mid-migration) and no raw SQL. No roles are assigned.
-Only aggregate counts are logged, caches are cleared once after the batch,
-and nothing is committed per row: the patch runs as a single transaction.
+Plugin configurations (FAC Plugin Configuration):
 
-Idempotent: after one run every row is either preserved-valid or already
-``enabled=0`` / ``Deny All`` with no child rows, so a second run performs no
+4. Every non-core plugin is disabled (``enabled=0``). Only ``core`` may stay
+   enabled; its tools remain governed by their own deny-by-default configs.
+
+The patch only writes via ``frappe.db.set_value`` on exact fields and deletes
+invalid child rows via ``frappe.db.delete`` — no ``doc.save()`` (so it does
+not depend on controller or schema validation mid-migration) and no raw SQL.
+No roles are assigned. Only aggregate counts are logged, caches are cleared
+once after the batch, and nothing is committed per row: the patch runs as a
+single transaction.
+
+Idempotent: after one run every tool row is either preserved-valid (with only
+valid role rows) or already ``enabled=0`` / ``Deny All`` with no child rows,
+and every non-core plugin is already disabled, so a second run performs no
 writes and can never reintroduce ``Allow All``.
 """
 
 import frappe
 
-from frappe_assistant_core.core.security_policy import HARD_DENY_TOOLS
+from frappe_assistant_core.core.security_policy import CONFIGURABLE_TOOLS
 
 TOOL_CONFIG_DOCTYPE = "FAC Tool Configuration"
 ROLE_ACCESS_DOCTYPE = "FAC Tool Role Access"
+PLUGIN_CONFIG_DOCTYPE = "FAC Plugin Configuration"
+CORE_PLUGIN = "core"
 
 
-def _valid_role_rows(parent: str) -> list:
-    """Roles that actually grant access: listed, allowed and still existing."""
-    roles = frappe.get_all(
+def _classify_role_rows(parent: str) -> tuple:
+    """Split child role rows into (valid, invalid) name lists.
+
+    A row is valid only when it grants access (``allow_access=1``) to a
+    non-empty role that still exists and is not disabled.
+    """
+    rows = frappe.get_all(
         ROLE_ACCESS_DOCTYPE,
-        filters={"parent": parent, "allow_access": 1},
-        pluck="role",
+        filters={"parent": parent},
+        fields=["name", "role", "allow_access"],
     )
-    return [role for role in roles if role and frappe.db.exists("Role", role)]
+    valid, invalid = [], []
+    for row in rows:
+        role = row.role
+        if (
+            frappe.utils.cint(row.allow_access)
+            and role
+            and frappe.db.exists("Role", {"name": role, "disabled": 0})
+        ):
+            valid.append(row.name)
+        else:
+            invalid.append(row.name)
+    return valid, invalid
 
 
-def execute():
+def _harden_tool_configurations() -> dict:
+    counts = {"hardened": 0, "preserved": 0, "role_rows_deleted": 0}
+
     if not frappe.db.table_exists(TOOL_CONFIG_DOCTYPE):
-        return
-
-    hardened_count = 0
-    preserved_count = 0
-    role_rows_deleted = 0
+        return counts
 
     configs = frappe.get_all(
         TOOL_CONFIG_DOCTYPE,
@@ -59,13 +81,17 @@ def execute():
         # DocType is autonamed by tool_name, so name == tool_name.
         tool_name = config.name
         mode = config.role_access_mode
+        is_configurable = tool_name in CONFIGURABLE_TOOLS
 
-        is_hard_denied = tool_name in HARD_DENY_TOOLS
-        has_valid_restricted_roles = (not is_hard_denied) and bool(_valid_role_rows(tool_name))
+        valid_rows, invalid_rows = _classify_role_rows(tool_name)
 
-        if not is_hard_denied and mode == "Restrict to Listed Roles" and has_valid_restricted_roles:
-            # Valid restricted config for a configurable tool: keep as is.
-            preserved_count += 1
+        if is_configurable and mode == "Restrict to Listed Roles" and valid_rows:
+            # Valid restricted config for a configurable tool: keep the row,
+            # prune only the invalid child role rows.
+            for row_name in invalid_rows:
+                frappe.db.delete(ROLE_ACCESS_DOCTYPE, {"name": row_name})
+            counts["role_rows_deleted"] += len(invalid_rows)
+            counts["preserved"] += 1
             continue
 
         already_hardened = not frappe.utils.cint(config.enabled) and mode == "Deny All"
@@ -75,16 +101,37 @@ def execute():
                 tool_name,
                 {"enabled": 0, "role_access_mode": "Deny All"},
             )
-            hardened_count += 1
+            counts["hardened"] += 1
 
         # Deny All keeps no role rows; also clears stale rows on rows that
         # were already hardened but still carry child entries.
-        stale_rows = frappe.db.count(ROLE_ACCESS_DOCTYPE, {"parent": tool_name})
-        if stale_rows:
+        if valid_rows or invalid_rows:
             frappe.db.delete(ROLE_ACCESS_DOCTYPE, {"parent": tool_name})
-            role_rows_deleted += stale_rows
+            counts["role_rows_deleted"] += len(valid_rows) + len(invalid_rows)
 
-    # Clear registry/config caches once after the batch, not per row.
+    return counts
+
+
+def _disable_non_core_plugins() -> int:
+    if not frappe.db.table_exists(PLUGIN_CONFIG_DOCTYPE):
+        return 0
+
+    disabled = 0
+    plugins = frappe.get_all(
+        PLUGIN_CONFIG_DOCTYPE,
+        fields=["name", "enabled"],
+    )
+    for plugin in plugins:
+        # DocType is autonamed by plugin_name, so name == plugin_name.
+        if plugin.name == CORE_PLUGIN:
+            continue
+        if frappe.utils.cint(plugin.enabled):
+            frappe.db.set_value(PLUGIN_CONFIG_DOCTYPE, plugin.name, "enabled", 0)
+            disabled += 1
+    return disabled
+
+
+def _clear_caches_once():
     try:
         from frappe_assistant_core.core.tool_registry import get_tool_registry
 
@@ -96,12 +143,21 @@ def execute():
         cache.delete_keys("fac_tool_config_*")
         cache.delete_keys("fac_tool_configurations")
         cache.delete_keys("fac_tool_registry_*")
+        cache.delete_keys("fac_plugin_config_*")
+        cache.delete_keys("fac_plugin_configurations")
     except Exception:
         pass
 
+
+def execute():
+    counts = _harden_tool_configurations()
+    plugins_disabled = _disable_non_core_plugins()
+    _clear_caches_once()
+
     frappe.logger("fac_security_migration").info(
         "harden_fac_tool_access_defaults: "
-        f"{hardened_count} config(s) hardened to deny-by-default, "
-        f"{preserved_count} valid restricted config(s) preserved, "
-        f"{role_rows_deleted} role access row(s) removed"
+        f"{counts['hardened']} tool config(s) hardened to deny-by-default, "
+        f"{counts['preserved']} valid restricted config(s) preserved, "
+        f"{counts['role_rows_deleted']} role access row(s) removed, "
+        f"{plugins_disabled} non-core plugin(s) disabled"
     )

@@ -821,14 +821,16 @@ def _sync_plugin_configurations():
     2. Creates FAC Plugin Configuration records for new plugins
        (deny by default: only the technically required "core" plugin starts
        enabled; every other new plugin starts disabled)
-    3. Never deletes configurations for plugins that are absent from
-       discovery (absence cannot prove a config is obsolete)
+    3. Removes orphan configurations for plugins that no longer exist
+       (plugin discovery is independent of enabled state, so absence from
+       discovery does prove the plugin is gone — unlike tool discovery)
     4. Preserves existing plugin enabled/disabled states
     5. Does NOT modify existing configurations (preserves user changes)
     """
     try:
         # Check if FAC Plugin Configuration table exists
-        if not frappe.db.table_exists("tabFAC Plugin Configuration"):
+        # (table_exists expects the DocType name; it adds the `tab` prefix itself)
+        if not frappe.db.table_exists("FAC Plugin Configuration"):
             frappe.logger("migration_hooks").info(
                 "FAC Plugin Configuration table not yet created, skipping plugin sync"
             )
@@ -838,9 +840,11 @@ def _sync_plugin_configurations():
 
         discovery = PluginDiscovery()
         discovered_plugins = discovery.discover_plugins()
+        discovered_plugin_names = set(discovered_plugins.keys())
 
         created_count = 0
         skipped_count = 0
+        deleted_count = 0
 
         # Create new plugin configurations
         for plugin_name, plugin_info in discovered_plugins.items():
@@ -864,10 +868,30 @@ def _sync_plugin_configurations():
             config.insert()
             created_count += 1
 
+        # Cleanup orphan plugin configurations (plugins that no longer exist)
+        existing_configs = frappe.get_all("FAC Plugin Configuration", pluck="plugin_name")
+        for config_name in existing_configs:
+            if config_name not in discovered_plugin_names:
+                try:
+                    frappe.delete_doc(
+                        "FAC Plugin Configuration",
+                        config_name,
+                        force=True,
+                        ignore_permissions=True,
+                    )
+                    deleted_count += 1
+                    frappe.logger("migration_hooks").info(
+                        f"Removed orphan plugin configuration: {config_name}"
+                    )
+                except Exception as e:
+                    frappe.logger("migration_hooks").warning(
+                        f"Failed to delete orphan plugin config '{config_name}': {e}"
+                    )
+
         frappe.db.commit()
 
         frappe.logger("migration_hooks").info(
-            f"Plugin configurations synced: {created_count} created, {skipped_count} already exist"
+            f"Plugin configurations synced: {created_count} created, {skipped_count} already exist, {deleted_count} removed"
         )
 
     except Exception as e:
@@ -897,19 +921,81 @@ def _set_settings_defaults():
             pass
 
 
+def _discover_all_plugin_tools() -> dict:
+    """Discover tool instances from all plugins, regardless of enabled state.
+
+    Uses the same mechanism as ``security_policy.discover_builtin_tool_names``
+    (PluginDiscovery declarations + module import + BaseTool inspection), but
+    stays tolerant: a plugin or module that fails to load is skipped with a
+    warning instead of aborting the sync. ``plugin_manager.get_all_tools()``
+    cannot be used here because it only returns tools of *enabled* plugins —
+    a disabled plugin must not make its tools' configurations disappear.
+    """
+    import importlib
+    import inspect
+    from types import SimpleNamespace
+
+    from frappe_assistant_core.core.base_tool import BaseTool
+    from frappe_assistant_core.utils.plugin_manager import PluginConfig, PluginDiscovery
+
+    tools = {}
+
+    try:
+        discovered_plugins = PluginDiscovery().discover_plugins()
+    except Exception as e:
+        frappe.logger("migration_hooks").warning(f"Plugin discovery failed during tool sync: {e}")
+        return tools
+
+    for plugin_name, plugin_info in discovered_plugins.items():
+        if getattr(plugin_info, "error_message", None):
+            frappe.logger("migration_hooks").warning(
+                f"Skipping plugin '{plugin_name}' during tool sync: {plugin_info.error_message}"
+            )
+            continue
+
+        for declared_module in plugin_info.tools or []:
+            module_name = f"{PluginConfig.PLUGIN_BASE_PATH}.{plugin_name}.tools.{declared_module}"
+            try:
+                module = importlib.import_module(module_name)
+                candidates = {
+                    value
+                    for _, value in inspect.getmembers(module, inspect.isclass)
+                    if issubclass(value, BaseTool)
+                    and value is not BaseTool
+                    and value.__module__ == module.__name__
+                }
+                for tool_class in candidates:
+                    instance = tool_class()
+                    tool_name = getattr(instance, "name", None)
+                    if not tool_name or tool_name in tools:
+                        continue
+                    tools[tool_name] = SimpleNamespace(
+                        plugin_name=plugin_name,
+                        description=getattr(instance, "description", ""),
+                        instance=instance,
+                    )
+            except Exception as e:
+                frappe.logger("migration_hooks").warning(
+                    f"Failed to load tool module {module_name} during sync: {e}"
+                )
+
+    return tools
+
+
 def _sync_tool_configurations():
     """
     Sync tool configurations from discovered plugins.
 
     This function:
-    1. Discovers all tools from enabled plugins
+    1. Discovers all tools from all discovered plugins, including disabled
+       ones (discovery is independent of enabled state)
     2. Creates FAC Tool Configuration records for new tools, deny by default
        (disabled + 'Deny All'), including external tools
     3. Auto-detects tool categories
     4. Never deletes configurations for tools that are absent from discovery:
-       a disabled plugin temporarily excludes its tools from discovery, so
-       absence cannot prove a config is obsolete, and re-enabling a plugin
-       must not recreate a permissive record
+       a disabled or broken plugin temporarily excludes its tools from
+       discovery, so absence cannot prove a config is obsolete, and
+       re-enabling a plugin must not recreate a permissive record
     5. Does NOT modify existing configurations (preserves user changes)
     """
     try:
@@ -920,13 +1006,10 @@ def _sync_tool_configurations():
             )
             return
 
-        from frappe_assistant_core.utils.plugin_manager import get_plugin_manager
         from frappe_assistant_core.utils.tool_category_detector import detect_tool_category
 
-        plugin_manager = get_plugin_manager()
-
-        # Get all tools from all discovered plugins (not just enabled)
-        all_tools = plugin_manager.get_all_tools()
+        # Get tools from all discovered plugins, including disabled ones
+        all_tools = _discover_all_plugin_tools()
 
         # Also get external tools from hooks
         external_tools = _get_external_tools_for_sync()
