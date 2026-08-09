@@ -22,6 +22,10 @@ Queries Workflow Actions to find documents awaiting the current user's approval.
 from typing import Any, Dict
 
 import frappe
+from frappe import _
+from frappe.query_builder import DocType
+
+from frappe_assistant_core.core.base_tool import BaseTool
 
 
 def _log_safe(tag: str, exc=None) -> None:
@@ -33,11 +37,6 @@ def _log_safe(tag: str, exc=None) -> None:
             frappe.logger("fac.get_pending_approvals").warning(f"{tag}: {type(exc).__name__}")
     except Exception:
         pass
-
-from frappe import _
-from frappe.query_builder import DocType
-
-from frappe_assistant_core.core.base_tool import BaseTool
 
 MAX_TRANSITION_DOCS = 20
 

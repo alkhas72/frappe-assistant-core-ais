@@ -17,6 +17,8 @@
 from typing import Any, Dict, List
 
 import frappe
+from frappe import _
+from frappe.desk.search import search_widget
 
 
 def _log_safe(tag: str, exc=None) -> None:
@@ -28,9 +30,6 @@ def _log_safe(tag: str, exc=None) -> None:
             frappe.logger("fac.search_tools").warning(f"{tag}: {type(exc).__name__}")
     except Exception:
         pass
-
-from frappe import _
-from frappe.desk.search import search_widget
 
 
 class SearchTools:
