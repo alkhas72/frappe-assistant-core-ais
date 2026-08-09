@@ -16,6 +16,7 @@ from frappe_assistant_core.core.security_policy import (
 from frappe_assistant_core.core.tool_registry import ToolRegistry
 from frappe_assistant_core.mcp.server import MCPServer
 from frappe_assistant_core.mcp.tool_adapter import build_tool_dict
+from frappe_assistant_core.plugins.core.tools.get_document import DocumentGet
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
 from frappe_assistant_core.utils.plugin_manager import get_plugin_manager
 
@@ -367,3 +368,70 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
         finally:
             frappe.set_user("Administrator")
             frappe.delete_doc("User", actor, force=True)
+
+    def test_disabled_role_after_publication_is_denied_without_resaving_config(self):
+        actor = "fac-task-role-disabled@example.com"
+        role_name = "FAC Task Disabled Role"
+        self.assertFalse(frappe.db.exists("User", actor))
+        self.assertFalse(frappe.db.exists("Role", role_name))
+        frappe.get_doc(
+            {"doctype": "Role", "role_name": role_name, "disabled": 0}
+        ).insert(ignore_permissions=True)
+        frappe.get_doc(
+            {
+                "doctype": "User",
+                "email": actor,
+                "first_name": "FAC Task Disabled Role",
+                "enabled": 1,
+                "user_type": "System User",
+                "assistant_enabled": 1,
+                "roles": [{"role": role_name}],
+            }
+        ).insert(ignore_permissions=True)
+
+        config = frappe.get_doc("FAC Tool Configuration", self.tool_name)
+        config.set("role_access", [])
+        config.append("role_access", {"role": role_name, "allow_access": 1})
+        config.save(ignore_permissions=True)
+
+        try:
+            # The fac-test image intentionally lacks pandas, so inventory
+            # discovery of unrelated optional plugins fails closed. Isolate the
+            # test to get_document while retaining real Frappe DB role/config
+            # reads and the canonical execution path.
+            with patch.object(SecurityPolicy, "inventory", return_value=frozenset({self.tool_name})):
+                published = SecurityPolicy.authorize(
+                    actor=actor,
+                    tool_name=self.tool_name,
+                    arguments=None,
+                    phase="publish",
+                )
+                self.assertTrue(published.allowed)
+                frappe.db.set_value("Role", role_name, "disabled", 1, update_modified=False)
+
+                self.assertNotIn(
+                    role_name,
+                    SecurityPolicy._load_access_config(self.tool_name, fresh=True)["roles"],
+                )
+                self.assertNotIn(
+                    role_name,
+                    SecurityPolicy._get_actor_roles(actor, fresh=True),
+                )
+
+                frappe.set_user(actor)
+                tool = DocumentGet()
+                with patch.object(self.registry, "get_tool", return_value=tool), patch.object(
+                    BaseTool, "log_execution"
+                ) as execution_audit:
+                    with self.assertRaises(PolicyDenied) as raised:
+                        self.registry.execute_tool(
+                            self.tool_name,
+                            {"doctype": "ToDo", "name": "TD-DOES-NOT-MATTER"},
+                        )
+
+            self.assertEqual(raised.exception.reason_code, "ROLE_NOT_ALLOWED")
+            execution_audit.assert_called_once()
+        finally:
+            frappe.set_user("Administrator")
+            frappe.delete_doc("User", actor, force=True)
+            frappe.db.delete("Role", role_name)

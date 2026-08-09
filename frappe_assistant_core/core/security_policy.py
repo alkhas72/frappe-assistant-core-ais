@@ -567,7 +567,11 @@ class SecurityPolicy:
         return {
             "enabled": bool(config.get("enabled")),
             "role_access_mode": config.get("role_access_mode"),
-            "roles": set(roles),
+            "roles": {
+                role
+                for role in roles
+                if role and frappe.db.exists("Role", {"name": role, "disabled": 0})
+            },
         }
 
     @staticmethod
@@ -585,15 +589,20 @@ class SecurityPolicy:
         if actor == "Guest":
             return {GUEST_ROLE}
         if actor == "Administrator":
-            return set(frappe.get_all("Role", pluck="name"))
+            return set(frappe.get_all("Role", filters={"disabled": 0}, pluck="name"))
 
-        roles = set(
+        assigned_roles = set(
             frappe.get_all(
                 "Has Role",
                 filters={"parenttype": "User", "parent": actor},
                 pluck="role",
             )
         )
+        roles = {
+            role
+            for role in assigned_roles
+            if frappe.db.exists("Role", {"name": role, "disabled": 0})
+        }
         roles.difference_update(AUTOMATIC_ROLES)
         roles.update({ALL_USER_ROLE, GUEST_ROLE})
         if frappe.db.get_value("User", actor, "user_type") == "System User":
