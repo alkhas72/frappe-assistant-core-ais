@@ -2,11 +2,20 @@
 
 Covers the idempotent ``harden_fac_tool_access_defaults`` patch, the
 ``_sync_tool_configurations``/``_sync_plugin_configurations`` deny-by-default
-sync semantics, the canonical tool registry import in migration hooks, and the
-fail-closed ``FAC Tool Configuration.user_has_access`` contract.
+sync semantics, the canonical tool registry import in migration hooks, the
+fail-closed ``FAC Tool Configuration.user_has_access`` contract, the hardened
+admin endpoints, and the admin UI/API mode contract.
+
+Isolation: tests only touch synthetic ``__test_*`` rows and rely on the
+FrappeTestCase transaction rollback. No test commits; code under test that
+commits internally is run with ``frappe.db.commit`` patched to a no-op, so
+nothing escapes the test transaction.
 """
 
 import importlib
+import inspect as pyinspect
+import os
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,33 +28,51 @@ TOOL_CONFIG_DOCTYPE = "FAC Tool Configuration"
 ROLE_ACCESS_DOCTYPE = "FAC Tool Role Access"
 PLUGIN_CONFIG_DOCTYPE = "FAC Plugin Configuration"
 
-# (tool_name, enabled, role_access_mode, roles) -> expected (enabled, mode, roles)
+PATCH_MODULE = "frappe_assistant_core.patches.v2_5.harden_fac_tool_access_defaults"
+
+# Synthetic inventory used when running the migration patch: exactly one
+# configurable tool; every other name is unknown/hard-denied/external and
+# must harden to deny-by-default.
+TEST_CONFIGURABLE_TOOLS = frozenset({"__test_configurable_tool"})
+
+CONFIGURABLE = "__test_configurable_tool"
+HARD_DENIED = "__test_hard_denied_tool"
+UNKNOWN = "__test_unknown_tool"
+EXTERNAL = "__test_external_tool"
+
+# (tool_name, enabled, role_access_mode, role_rows) -> expected (enabled, mode, roles)
+# role_rows are (role, allow_access) tuples.
 CASES = (
     # hard-denied tool: hardened even with a valid restricted allowlist
-    ("run_python_code", 1, "Restrict to Listed Roles", ["System Manager"], 0, "Deny All", []),
+    (HARD_DENIED, 1, "Restrict to Listed Roles", [("System Manager", 1)], 0, "Deny All", []),
     # legacy Allow All: hardened
-    ("get_document", 1, "Allow All", [], 0, "Deny All", []),
+    (CONFIGURABLE, 1, "Allow All", [], 0, "Deny All", []),
     # valid restricted config for a configurable tool: preserved untouched
     (
-        "get_document",
+        CONFIGURABLE,
         1,
         "Restrict to Listed Roles",
-        ["Assistant User"],
+        [("Assistant User", 1)],
         1,
         "Restrict to Listed Roles",
         ["Assistant User"],
     ),
+    # unknown tool with a valid restricted allowlist: hardened (not in inventory)
+    (UNKNOWN, 1, "Restrict to Listed Roles", [("Assistant User", 1)], 0, "Deny All", []),
+    # external tool config (tool not in builtin inventory): hardened
+    (EXTERNAL, 1, "Restrict to Listed Roles", [("Assistant User", 1)], 0, "Deny All", []),
+    # empty/unknown modes harden
+    (CONFIGURABLE, 1, "", [], 0, "Deny All", []),
+    (CONFIGURABLE, 1, "Some Future Mode", [], 0, "Deny All", []),
+    # restricted mode with an empty role list hardens
+    (CONFIGURABLE, 1, "Restrict to Listed Roles", [], 0, "Deny All", []),
 )
 
-EXTRA_CASES = (
-    # hard-denied tool under legacy Allow All
-    ("delete_document", 1, "Allow All", [], 0, "Deny All", []),
-    # empty/unknown mode hardens
-    ("list_documents", 1, "", [], 0, "Deny All", []),
-    ("list_documents", 1, "Some Future Mode", [], 0, "Deny All", []),
-    # restricted mode with an empty role list hardens
-    ("list_documents", 1, "Restrict to Listed Roles", [], 0, "Deny All", []),
-)
+
+def _run_patch():
+    """Run the migration patch against the synthetic test inventory."""
+    with patch(f"{PATCH_MODULE}.CONFIGURABLE_TOOLS", TEST_CONFIGURABLE_TOOLS):
+        execute()
 
 
 def _delete_config(tool_name):
@@ -53,8 +80,13 @@ def _delete_config(tool_name):
     frappe.db.delete(TOOL_CONFIG_DOCTYPE, {"tool_name": tool_name})
 
 
-def _seed_config(tool_name, enabled, mode, roles, plugin_name="core"):
-    """Create a config row, including legacy states the new schema rejects."""
+def _seed_config(tool_name, enabled, mode, role_rows, plugin_name="core"):
+    """Create a config row, including legacy states the new schema rejects.
+
+    Child rows are inserted directly into the child table and legacy modes are
+    forced via ``frappe.db.set_value`` so controller validation never blocks
+    seeding a state that could exist on a pre-migration site.
+    """
     _delete_config(tool_name)
 
     doc = frappe.get_doc(
@@ -63,16 +95,24 @@ def _seed_config(tool_name, enabled, mode, roles, plugin_name="core"):
             "tool_name": tool_name,
             "plugin_name": plugin_name,
             "enabled": enabled,
-            # Insert a schema-valid mode first; legacy modes are forced below
-            # via frappe.db.set_value, which bypasses controller validation.
-            "role_access_mode": "Restrict to Listed Roles" if roles else "Deny All",
+            "role_access_mode": "Deny All",
         }
     )
-    for role in roles:
-        doc.append("role_access", {"role": role, "allow_access": 1})
     doc.insert(ignore_permissions=True)
 
-    if mode != doc.role_access_mode:
+    for role, allow_access in role_rows:
+        frappe.get_doc(
+            {
+                "doctype": ROLE_ACCESS_DOCTYPE,
+                "parent": tool_name,
+                "parenttype": TOOL_CONFIG_DOCTYPE,
+                "parentfield": "role_access",
+                "role": role,
+                "allow_access": allow_access,
+            }
+        ).insert(ignore_permissions=True)
+
+    if mode != "Deny All":
         frappe.db.set_value(TOOL_CONFIG_DOCTYPE, tool_name, "role_access_mode", mode)
 
 
@@ -84,51 +124,126 @@ def _config_state(tool_name):
     return int(enabled or 0), mode, sorted(roles)
 
 
-class TestHardenFacToolAccessDefaults(FrappeTestCase):
-    touched_tools = tuple({case[0] for case in CASES + EXTRA_CASES})
+def _seed_plugin_config(plugin_name, enabled):
+    frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": plugin_name})
+    doc = frappe.get_doc(
+        {
+            "doctype": PLUGIN_CONFIG_DOCTYPE,
+            "plugin_name": plugin_name,
+            "display_name": plugin_name.replace("_", " ").title(),
+            "enabled": enabled,
+        }
+    )
+    doc.insert(ignore_permissions=True)
 
+
+def _no_commit():
+    """Keep committing code inside the test transaction (rollback isolates)."""
+    return patch.object(frappe.db, "commit", lambda *args, **kwargs: None)
+
+
+class TestHardenFacToolAccessDefaults(FrappeTestCase):
     def tearDown(self):
-        for tool_name in self.touched_tools:
+        # Best-effort cleanup of synthetic rows; no commit — FrappeTestCase
+        # rolls the transaction back after each test.
+        for tool_name in {case[0] for case in CASES} | {"__test_mixed_tool"}:
             _delete_config(tool_name)
-        frappe.db.commit()
+        frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": ("like", "__test_%")})
+        frappe.db.delete("Role", {"name": ("like", "__test_%")})
         super().tearDown()
 
     def test_migration_matrix(self):
-        for tool_name, enabled, mode, roles, exp_enabled, exp_mode, exp_roles in CASES + EXTRA_CASES:
-            with self.subTest(tool_name=tool_name, mode=mode, roles=roles):
-                _seed_config(tool_name, enabled, mode, roles)
-                execute()
+        for tool_name, enabled, mode, role_rows, exp_enabled, exp_mode, exp_roles in CASES:
+            with self.subTest(tool_name=tool_name, mode=mode, role_rows=role_rows):
+                _seed_config(tool_name, enabled, mode, role_rows)
+                _run_patch()
                 self.assertEqual(_config_state(tool_name), (exp_enabled, exp_mode, exp_roles))
 
+    def test_mixed_restricted_config_prunes_only_invalid_rows(self):
+        frappe.get_doc(
+            {"doctype": "Role", "role_name": "__test_disabled_role", "disabled": 1}
+        ).insert(ignore_permissions=True)
+
+        _seed_config(
+            "__test_mixed_tool",
+            1,
+            "Restrict to Listed Roles",
+            [
+                ("Assistant User", 1),  # valid: kept
+                ("System Manager", 1),  # valid: kept
+                ("__test_no_such_role", 1),  # role does not exist: pruned
+                ("__test_disabled_role", 1),  # role disabled: pruned
+                ("Assistant User", 0),  # allow_access=0: pruned
+            ],
+        )
+        with patch(f"{PATCH_MODULE}.CONFIGURABLE_TOOLS", frozenset({"__test_mixed_tool"})):
+            execute()
+
+        self.assertEqual(
+            _config_state("__test_mixed_tool"),
+            (1, "Restrict to Listed Roles", ["Assistant User", "System Manager"]),
+        )
+
+    def test_patch_disables_non_core_plugins(self):
+        _seed_plugin_config("__test_plugin_enabled", 1)
+        _seed_plugin_config("__test_plugin_disabled", 0)
+
+        core_enabled_before = None
+        if frappe.db.exists(PLUGIN_CONFIG_DOCTYPE, "core"):
+            core_enabled_before = frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "core", "enabled")
+
+        _run_patch()
+
+        self.assertEqual(
+            int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "__test_plugin_enabled", "enabled") or 0),
+            0,
+        )
+        self.assertEqual(
+            int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "__test_plugin_disabled", "enabled") or 0),
+            0,
+        )
+        if core_enabled_before is not None:
+            self.assertEqual(
+                frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "core", "enabled"),
+                core_enabled_before,
+            )
+
     def test_second_run_is_semantically_empty(self):
-        for tool_name, enabled, mode, roles, *_ in CASES + EXTRA_CASES:
-            _seed_config(tool_name, enabled, mode, roles)
-        execute()
+        for tool_name, enabled, mode, role_rows, *_ in CASES:
+            _seed_config(tool_name, enabled, mode, role_rows)
+        _seed_plugin_config("__test_plugin_enabled", 1)
+        _run_patch()
 
         def snapshot():
             configs = frappe.get_all(
                 TOOL_CONFIG_DOCTYPE,
-                filters={"tool_name": ("in", self.touched_tools)},
+                filters={"tool_name": ("like", "__test_%")},
                 fields=["name", "enabled", "role_access_mode"],
                 order_by="name",
             )
             rows = frappe.get_all(
                 ROLE_ACCESS_DOCTYPE,
-                filters={"parent": ("in", self.touched_tools)},
+                filters={"parent": ("like", "__test_%")},
                 fields=["parent", "role", "allow_access"],
                 order_by="parent, role",
             )
-            return configs, rows
+            plugins = frappe.get_all(
+                PLUGIN_CONFIG_DOCTYPE,
+                filters={"plugin_name": ("like", "__test_%")},
+                fields=["name", "enabled"],
+                order_by="name",
+            )
+            return configs, rows, plugins
 
         before = snapshot()
-        execute()
+        _run_patch()
         after = snapshot()
         self.assertEqual(before, after)
 
     def test_no_allow_all_remains(self):
-        for tool_name, enabled, mode, roles, *_ in CASES:
-            _seed_config(tool_name, enabled, mode, roles)
-        execute()
+        for tool_name, enabled, mode, role_rows, *_ in CASES:
+            _seed_config(tool_name, enabled, mode, role_rows)
+        _run_patch()
         remaining = frappe.get_all(
             TOOL_CONFIG_DOCTYPE,
             filters={"role_access_mode": "Allow All"},
@@ -138,36 +253,16 @@ class TestHardenFacToolAccessDefaults(FrappeTestCase):
 
 
 class TestSyncToolConfigurationDefaults(FrappeTestCase):
-    created_tools = (
-        "TEST_sync_new_tool",
-        "TEST_sync_ext_tool",
-        "TEST_sync_keep_tool",
-        "TEST_sync_ghost_tool",
-    )
-
     def tearDown(self):
-        for tool_name in self.created_tools:
+        for tool_name in ("__test_sync_keep_tool", "__test_sync_ghost_tool", "__test_sync_ext_tool"):
             _delete_config(tool_name)
-        frappe.db.commit()
         super().tearDown()
 
-    def _tool_info(self, plugin_name):
-        return SimpleNamespace(
-            plugin_name=plugin_name,
-            description="Sync test tool",
-            instance=SimpleNamespace(source_app="frappe_assistant_core"),
-        )
-
     def _run_sync(self, tools, external=None):
-        manager = MagicMock()
-        manager.get_all_tools.return_value = tools
-        manager.get_enabled_plugins.return_value = {
-            info.plugin_name for info in tools.values()
-        }
         with (
             patch(
-                "frappe_assistant_core.utils.plugin_manager.get_plugin_manager",
-                return_value=manager,
+                "frappe_assistant_core.utils.migration_hooks._discover_all_plugin_tools",
+                return_value=tools,
             ),
             patch(
                 "frappe_assistant_core.utils.migration_hooks._get_external_tools_for_sync",
@@ -177,33 +272,41 @@ class TestSyncToolConfigurationDefaults(FrappeTestCase):
                 "frappe_assistant_core.utils.tool_category_detector.detect_tool_category",
                 return_value="read_only",
             ),
+            _no_commit(),
         ):
             from frappe_assistant_core.utils.migration_hooks import _sync_tool_configurations
 
             _sync_tool_configurations()
 
+    def _tool_info(self, plugin_name):
+        return SimpleNamespace(
+            plugin_name=plugin_name,
+            description="Sync test tool",
+            instance=SimpleNamespace(source_app="frappe_assistant_core"),
+        )
+
     def test_new_plugin_tool_created_disabled_deny_all(self):
-        self._run_sync({"TEST_sync_new_tool": self._tool_info("TEST_plugin")})
-        self.assertEqual(_config_state("TEST_sync_new_tool"), (0, "Deny All", []))
+        self._run_sync({"__test_sync_keep_tool": self._tool_info("__test_plugin")})
+        self.assertEqual(_config_state("__test_sync_keep_tool"), (0, "Deny All", []))
 
     def test_new_external_tool_created_disabled_deny_all(self):
         self._run_sync(
             {},
             external={
-                "TEST_sync_ext_tool": {
+                "__test_sync_ext_tool": {
                     "description": "External sync test tool",
                     "source_app": "external_app",
                     "module_path": "external_app.tools.TestTool",
                 }
             },
         )
-        self.assertEqual(_config_state("TEST_sync_ext_tool"), (0, "Deny All", []))
+        self.assertEqual(_config_state("__test_sync_ext_tool"), (0, "Deny All", []))
 
     def test_existing_restricted_config_not_overwritten(self):
-        _seed_config("TEST_sync_keep_tool", 1, "Restrict to Listed Roles", ["Assistant User"])
-        self._run_sync({"TEST_sync_keep_tool": self._tool_info("TEST_plugin")})
+        _seed_config("__test_sync_keep_tool", 1, "Restrict to Listed Roles", [("Assistant User", 1)])
+        self._run_sync({"__test_sync_keep_tool": self._tool_info("__test_plugin")})
         self.assertEqual(
-            _config_state("TEST_sync_keep_tool"),
+            _config_state("__test_sync_keep_tool"),
             (1, "Restrict to Listed Roles", ["Assistant User"]),
         )
 
@@ -211,36 +314,71 @@ class TestSyncToolConfigurationDefaults(FrappeTestCase):
         # Tool belongs to a plugin that is later disabled: the config must not
         # be deleted while the tool is absent from discovery, and re-enabling
         # the plugin must not recreate a permissive record.
-        _seed_config("TEST_sync_ghost_tool", 1, "Restrict to Listed Roles", ["Assistant User"])
+        _seed_config("__test_sync_ghost_tool", 1, "Restrict to Listed Roles", [("Assistant User", 1)])
 
         self._run_sync({})  # plugin disabled -> tool absent from discovery
         self.assertEqual(
-            _config_state("TEST_sync_ghost_tool"),
+            _config_state("__test_sync_ghost_tool"),
             (1, "Restrict to Listed Roles", ["Assistant User"]),
         )
 
-        self._run_sync({"TEST_sync_ghost_tool": self._tool_info("TEST_plugin")})
+        self._run_sync({"__test_sync_ghost_tool": self._tool_info("__test_plugin")})
         self.assertEqual(
-            _config_state("TEST_sync_ghost_tool"),
+            _config_state("__test_sync_ghost_tool"),
             (1, "Restrict to Listed Roles", ["Assistant User"]),
         )
+
+
+class TestSyncDiscoversDisabledPluginTools(FrappeTestCase):
+    """Unmocked discovery contract: disabled plugins still get tool configs.
+
+    ``plugin_manager.get_all_tools()`` only returns tools of enabled plugins;
+    the sync must instead discover tools independently of enabled state.
+    Runs the real sync with real builtin plugins; only ``frappe.db.commit``
+    is neutralised so the test transaction rolls everything back.
+    """
+
+    DATA_SCIENCE_TOOLS = (
+        "run_python_code",
+        "run_database_query",
+        "analyze_business_data",
+        "extract_file_content",
+    )
+
+    def test_sync_creates_deny_all_configs_for_disabled_plugin_tools(self):
+        from frappe_assistant_core.utils import migration_hooks
+
+        # Ensure data_science is disabled (default after hardening).
+        if frappe.db.exists(PLUGIN_CONFIG_DOCTYPE, "data_science"):
+            frappe.db.set_value(PLUGIN_CONFIG_DOCTYPE, "data_science", "enabled", 0)
+        else:
+            _seed_plugin_config("data_science", 0)
+
+        for tool_name in self.DATA_SCIENCE_TOOLS:
+            _delete_config(tool_name)
+
+        with _no_commit():
+            migration_hooks._sync_tool_configurations()
+
+        for tool_name in self.DATA_SCIENCE_TOOLS:
+            with self.subTest(tool_name=tool_name):
+                self.assertEqual(_config_state(tool_name), (0, "Deny All", []))
 
 
 class TestSyncPluginConfigurationDefaults(FrappeTestCase):
-    created_plugins = ("TEST_new_plugin", "TEST_ghost_plugin")
-
     def tearDown(self):
-        for plugin_name in self.created_plugins:
-            frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": plugin_name})
-        frappe.db.commit()
+        frappe.db.delete(PLUGIN_CONFIG_DOCTYPE, {"plugin_name": ("like", "__test_%")})
         super().tearDown()
 
     def _run_sync(self, discovered):
         discovery = MagicMock()
         discovery.discover_plugins.return_value = discovered
-        with patch(
-            "frappe_assistant_core.utils.plugin_manager.PluginDiscovery",
-            return_value=discovery,
+        with (
+            patch(
+                "frappe_assistant_core.utils.plugin_manager.PluginDiscovery",
+                return_value=discovery,
+            ),
+            _no_commit(),
         ):
             from frappe_assistant_core.utils.migration_hooks import _sync_plugin_configurations
 
@@ -254,30 +392,25 @@ class TestSyncPluginConfigurationDefaults(FrappeTestCase):
         self._run_sync(
             {
                 "core": self._plugin_info("Core"),
-                "TEST_new_plugin": self._plugin_info("Test Plugin"),
+                "__test_new_plugin": self._plugin_info("Test Plugin"),
             }
         )
         self.assertEqual(
             int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "core", "enabled") or 0), 1
         )
         self.assertEqual(
-            int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "TEST_new_plugin", "enabled") or 0),
+            int(frappe.db.get_value(PLUGIN_CONFIG_DOCTYPE, "__test_new_plugin", "enabled") or 0),
             0,
         )
 
-    def test_missing_plugin_config_not_deleted(self):
-        doc = frappe.get_doc(
-            {
-                "doctype": PLUGIN_CONFIG_DOCTYPE,
-                "plugin_name": "TEST_ghost_plugin",
-                "display_name": "Ghost Plugin",
-                "enabled": 0,
-            }
-        )
-        doc.insert(ignore_permissions=True)
+    def test_orphan_plugin_config_is_deleted(self):
+        # Plugin discovery is independent of enabled state, so a plugin that
+        # is absent from discovery is genuinely gone and its config is an
+        # orphan. (Tool configs, in contrast, are never auto-deleted.)
+        _seed_plugin_config("__test_ghost_plugin", 0)
 
         self._run_sync({})
-        self.assertTrue(frappe.db.exists(PLUGIN_CONFIG_DOCTYPE, "TEST_ghost_plugin"))
+        self.assertFalse(frappe.db.exists(PLUGIN_CONFIG_DOCTYPE, "__test_ghost_plugin"))
 
 
 class TestCanonicalRegistryImport(FrappeTestCase):
@@ -292,11 +425,209 @@ class TestCanonicalRegistryImport(FrappeTestCase):
         self.assertTrue(status.get("migration_hooks_active"), status)
         self.assertIn("registry_stats", status)
 
+    def test_after_install_calls_canonical_registry_api(self):
+        """after_install must call the real ToolRegistry API contract.
+
+        Fails if the import path breaks again or if the registry API changes
+        (e.g. refresh_tools gaining a required argument or returning a dict).
+        """
+        from frappe_assistant_core.core import tool_registry as registry_module
+        from frappe_assistant_core.utils import migration_hooks
+
+        # Verify the real API surface the hook relies on.
+        self.assertTrue(hasattr(registry_module, "get_tool_registry"))
+        refresh_sig = pyinspect.signature(registry_module.ToolRegistry.refresh_tools)
+        self.assertEqual(list(refresh_sig.parameters), ["self"])
+        self.assertTrue(callable(getattr(registry_module.ToolRegistry, "get_stats", None)))
+
+        registry = MagicMock()
+        registry.refresh_tools.return_value = True
+        registry.get_stats.return_value = {"total_tools": 7}
+
+        with (
+            patch.object(registry_module, "get_tool_registry", return_value=registry),
+            patch.object(migration_hooks, "_install_system_prompt_categories"),
+            patch.object(migration_hooks, "_install_system_prompt_templates"),
+            patch.object(migration_hooks, "_install_system_skills"),
+            patch.object(migration_hooks, "_install_app_skills"),
+            patch.object(migration_hooks, "_sync_plugin_configurations"),
+            patch.object(migration_hooks, "_sync_tool_configurations"),
+            patch.object(migration_hooks, "_set_settings_defaults"),
+        ):
+            migration_hooks.after_install()
+
+        registry.refresh_tools.assert_called_once_with()  # no force kwarg
+        registry.get_stats.assert_called_once_with()
+
+
+class TestAdminEndpointHardening(FrappeTestCase):
+    """Endpoint-level tests for the hardened admin API (runs as Administrator)."""
+
+    def tearDown(self):
+        for tool_name in ("__test_toggle_tool", "run_python_code", "__test_role_tool"):
+            _delete_config(tool_name)
+        super().tearDown()
+
+    def _mock_tool_inventory(self, *tool_names):
+        tools = {
+            name: SimpleNamespace(
+                plugin_name="core",
+                description="Test tool",
+                instance=SimpleNamespace(source_app="frappe_assistant_core"),
+            )
+            for name in tool_names
+        }
+        plugin_manager = MagicMock()
+        plugin_manager.get_all_tools.return_value = tools
+        plugin_manager.get_enabled_plugins.return_value = {"core"}
+
+        registry = MagicMock()
+        registry._get_external_tools.return_value = {}
+
+        return patch(
+            "frappe_assistant_core.utils.plugin_manager.get_plugin_manager",
+            return_value=plugin_manager,
+        ), patch(
+            "frappe_assistant_core.core.tool_registry.get_tool_registry",
+            return_value=registry,
+        ), patch(
+            "frappe_assistant_core.utils.tool_category_detector.detect_tool_category",
+            return_value="read_only",
+        )
+
+    def test_toggle_tool_cannot_enable_hard_denied(self):
+        from frappe_assistant_core.api.admin.tools import toggle_tool
+
+        # Start from a clean slate (in-transaction; rolled back after the test)
+        _delete_config("run_python_code")
+
+        pm, reg, cat = self._mock_tool_inventory("run_python_code")
+        with pm, reg, cat, _no_commit():
+            result = toggle_tool("run_python_code", True)
+
+        self.assertFalse(result.get("success"))
+        self.assertIn("hard-denied", result.get("message", ""))
+        self.assertFalse(frappe.db.exists(TOOL_CONFIG_DOCTYPE, "run_python_code"))
+
+    def test_toggle_tool_enable_without_config_creates_disabled_and_marks(self):
+        from frappe_assistant_core.api.admin.tools import toggle_tool
+
+        pm, reg, cat = self._mock_tool_inventory("__test_toggle_tool")
+        with pm, reg, cat, _no_commit():
+            result = toggle_tool("__test_toggle_tool", True)
+
+        self.assertTrue(result.get("success"))
+        self.assertTrue(result.get("requires_configuration"))
+        self.assertFalse(result.get("enabled"))
+        self.assertEqual(_config_state("__test_toggle_tool"), (0, "Deny All", []))
+
+    def test_update_tool_role_access_rejects_allow_all(self):
+        from frappe_assistant_core.api.admin.tools import update_tool_role_access
+
+        pm, reg, cat = self._mock_tool_inventory("__test_role_tool")
+        with pm, reg, cat, _no_commit():
+            result = update_tool_role_access("__test_role_tool", "Allow All")
+
+        self.assertFalse(result.get("success"))
+        self.assertIn("Invalid mode", result.get("message", ""))
+
+    def test_update_tool_role_access_rejects_empty_and_unknown_roles(self):
+        from frappe_assistant_core.api.admin.tools import update_tool_role_access
+
+        pm, reg, cat = self._mock_tool_inventory("__test_role_tool")
+        with pm, reg, cat, _no_commit():
+            empty = update_tool_role_access("__test_role_tool", "Restrict to Listed Roles", roles=[])
+            unknown = update_tool_role_access(
+                "__test_role_tool",
+                "Restrict to Listed Roles",
+                roles=[{"role": "__test_no_such_role"}],
+            )
+
+        self.assertFalse(empty.get("success"))
+        self.assertIn("at least one role", empty.get("message", ""))
+        self.assertFalse(unknown.get("success"))
+        self.assertIn("Invalid role", unknown.get("message", ""))
+
+    def test_deny_all_clears_stale_role_rows_and_keeps_enabled_state(self):
+        from frappe_assistant_core.api.admin.tools import update_tool_role_access
+
+        _seed_config("__test_role_tool", 0, "Restrict to Listed Roles", [("Assistant User", 1)])
+
+        pm, reg, cat = self._mock_tool_inventory("__test_role_tool")
+        with pm, reg, cat, _no_commit():
+            result = update_tool_role_access("__test_role_tool", "Deny All")
+
+        self.assertTrue(result.get("success"), result)
+        # Stale role rows cleared; enabled untouched by the role change.
+        self.assertEqual(_config_state("__test_role_tool"), (0, "Deny All", []))
+
+    def test_role_change_does_not_implicitly_enable_tool(self):
+        from frappe_assistant_core.api.admin.tools import update_tool_role_access
+
+        _seed_config("__test_role_tool", 0, "Deny All", [])
+
+        pm, reg, cat = self._mock_tool_inventory("__test_role_tool")
+        with pm, reg, cat, _no_commit():
+            result = update_tool_role_access(
+                "__test_role_tool",
+                "Restrict to Listed Roles",
+                roles=[{"role": "Assistant User"}],
+            )
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(
+            _config_state("__test_role_tool"),
+            (0, "Restrict to Listed Roles", ["Assistant User"]),
+        )
+
+
+class TestAdminUIContract(FrappeTestCase):
+    """UI/API contract: modes the admin page can submit vs. modes the API accepts."""
+
+    def _read_admin_js(self):
+        import frappe_assistant_core
+
+        js_path = os.path.join(
+            os.path.dirname(frappe_assistant_core.__file__),
+            "public",
+            "js",
+            "fac_admin_tools.js",
+        )
+        with open(js_path) as f:
+            return f.read()
+
+    def test_js_has_no_allow_all_and_offers_deny_all(self):
+        js = self._read_admin_js()
+        self.assertNotIn("Allow All", js)
+        self.assertIn('value="Deny All"', js)
+        self.assertIn('value="Restrict to Listed Roles"', js)
+
+    def test_js_role_mode_options_match_api_contract(self):
+        js = self._read_admin_js()
+        option_values = set(re.findall(r'<option value="([^"]+)"', js))
+        # Role access modes are the non-category options the select can submit.
+        category_values = {"read_only", "write", "read_write", "privileged"}
+        js_role_modes = option_values - category_values
+        self.assertEqual(js_role_modes, {"Deny All", "Restrict to Listed Roles"})
+
+        # Every mode the UI can submit is accepted by the API (fails later on
+        # tool existence, not on mode validation); 'Allow All' is rejected.
+        from frappe_assistant_core.api.admin.tools import update_tool_role_access
+
+        for mode in js_role_modes:
+            with self.subTest(mode=mode):
+                result = update_tool_role_access("__test_no_such_tool", mode)
+                self.assertNotIn("Invalid mode", result.get("message", ""))
+
+        result = update_tool_role_access("__test_no_such_tool", "Allow All")
+        self.assertFalse(result.get("success"))
+        self.assertIn("Invalid mode", result.get("message", ""))
+
 
 class TestToolConfigurationAccess(FrappeTestCase):
     def _doc(self, enabled, mode, roles=()):
         doc = frappe.new_doc(TOOL_CONFIG_DOCTYPE)
-        doc.tool_name = "TEST_access_tool"
+        doc.tool_name = "__test_access_tool"
         doc.plugin_name = "core"
         doc.enabled = enabled
         doc.role_access_mode = mode
@@ -314,8 +645,10 @@ class TestToolConfigurationAccess(FrappeTestCase):
             self.assertFalse(self._doc(1, "Allow All").user_has_access(user))
             self.assertFalse(self._doc(1, "").user_has_access(user))
             # Restricted mode with empty role list denies
+            self.assertFalse(self._doc(1, "Restrict to Listed Roles").user_has_access(user))
+            # No bypass: System Manager without a listed role is denied
             self.assertFalse(
-                self._doc(1, "Restrict to Listed Roles").user_has_access(user)
+                self._doc(1, "Restrict to Listed Roles", ["Assistant User"]).user_has_access(user)
             )
 
         with patch("frappe.get_roles", return_value=["Assistant User"]):
@@ -325,12 +658,6 @@ class TestToolConfigurationAccess(FrappeTestCase):
             )
             # Valid restricted config grants only a listed role
             self.assertTrue(
-                self._doc(1, "Restrict to Listed Roles", ["Assistant User"]).user_has_access(user)
-            )
-
-        with patch("frappe.get_roles", return_value=["System Manager"]):
-            # No bypass: System Manager without a listed role is denied
-            self.assertFalse(
                 self._doc(1, "Restrict to Listed Roles", ["Assistant User"]).user_has_access(user)
             )
 
