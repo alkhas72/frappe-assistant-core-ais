@@ -528,4 +528,3 @@ class TestMCPHandleLogging(BaseAssistantTest):
         payload = json.loads(result.get_data(as_text=True))
         self.assertEqual(payload["error"]["message"], "Internal error")
         audit.assert_called_once_with(0, status="Error")
-

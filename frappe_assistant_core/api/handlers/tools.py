@@ -19,12 +19,18 @@ Clean tools handlers using the new plugin manager architecture.
 Replaces workarounds with proper state management and error handling.
 """
 
+import json
 from typing import Any, Dict, Optional
 
 import frappe
 
 from frappe_assistant_core.constants.definitions import ErrorCodes, ErrorMessages, LogMessages
+from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
+from frappe_assistant_core.mcp.server import (
+    audit_tools_list_summary,
+    audit_unavailable_tool_call,
+)
 from frappe_assistant_core.utils.logger import api_logger
 from frappe_assistant_core.utils.plugin_manager import PluginError, PluginNotFoundError, PluginValidationError
 
@@ -36,6 +42,7 @@ def handle_tools_list(request_id: Optional[Any]) -> Dict[str, Any]:
 
         registry = get_tool_registry()
         tools = registry.get_available_tools(user=frappe.session.user)
+        audit_tools_list_summary(len(tools))
 
         response = {"jsonrpc": "2.0", "result": {"tools": tools}}
 
@@ -48,14 +55,16 @@ def handle_tools_list(request_id: Optional[Any]) -> Dict[str, Any]:
         return response
 
     except Exception as e:
-        api_logger.error(f"Error in handle_tools_list: {e}")
+        api_logger.error(
+            f"Error in handle_tools_list: type={type(e).__name__}"
+        )
+        audit_tools_list_summary(0, status="Error")
 
         response = {
             "jsonrpc": "2.0",
             "error": {
                 "code": ErrorCodes.INTERNAL_ERROR,
                 "message": ErrorMessages.INTERNAL_ERROR,
-                "data": str(e),
             },
         }
 
@@ -68,12 +77,26 @@ def handle_tools_list(request_id: Optional[Any]) -> Dict[str, Any]:
 def handle_tool_call(params: Dict[str, Any], request_id: Optional[Any]) -> Dict[str, Any]:
     """Handle tools/call request - execute specific tool"""
     try:
-        api_logger.debug(LogMessages.TOOL_CALL_REQUEST.format(params))
+        api_logger.debug(LogMessages.TOOL_CALL_REQUEST.format("<sanitized>"))
+
+        if not isinstance(params, dict):
+            audit_unavailable_tool_call(None, None, "ARGUMENTS_INVALID")
+            response = {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": ErrorCodes.INVALID_PARAMS,
+                    "message": "Invalid tool arguments",
+                },
+            }
+            if request_id is not None:
+                response["id"] = request_id
+            return response
 
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
 
         if not tool_name:
+            audit_unavailable_tool_call(tool_name, arguments, "TOOL_UNKNOWN")
             response = {
                 "jsonrpc": "2.0",
                 "error": {"code": ErrorCodes.INVALID_PARAMS, "message": ErrorMessages.MISSING_TOOL_NAME},
@@ -82,30 +105,31 @@ def handle_tool_call(params: Dict[str, Any], request_id: Optional[Any]) -> Dict[
                 response["id"] = request_id
             return response
 
-        # Execute tool using registry
-        registry = get_tool_registry()
-        api_logger.info(f"Executing tool {tool_name} for user {frappe.session.user}")
-
-        try:
-            result = registry.execute_tool(tool_name, arguments)
-        except ValueError as e:
-            # Tool not found
-            api_logger.warning(f"Tool {tool_name} not available for user {frappe.session.user}: {str(e)}")
+        if not isinstance(arguments, dict):
+            audit_unavailable_tool_call(
+                tool_name,
+                None,
+                "ARGUMENTS_INVALID",
+            )
             response = {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": ErrorCodes.INVALID_PARAMS,
-                    "message": ErrorMessages.UNKNOWN_TOOL.format(tool_name),
+                    "message": "Invalid tool arguments",
                 },
             }
             if request_id is not None:
                 response["id"] = request_id
             return response
-        except PermissionError as e:
-            # Permission denied
-            api_logger.warning(
-                f"Permission denied for tool {tool_name} and user {frappe.session.user}: {str(e)}"
-            )
+
+        # Execute tool using registry
+        registry = get_tool_registry()
+        api_logger.info("Executing canonical tool request")
+
+        try:
+            result = registry.execute_tool(tool_name, arguments)
+        except (PolicyDenied, PermissionError):
+            api_logger.warning("Tool execution denied")
             response = {
                 "jsonrpc": "2.0",
                 "error": {"code": ErrorCodes.AUTHENTICATION_REQUIRED, "message": ErrorMessages.ACCESS_DENIED},
@@ -113,32 +137,27 @@ def handle_tool_call(params: Dict[str, Any], request_id: Optional[Any]) -> Dict[
             if request_id is not None:
                 response["id"] = request_id
             return response
-        except frappe.ValidationError as e:
-            # Validation error - provide more specific details
-            api_logger.error(f"Validation error in tool {tool_name} for user {frappe.session.user}: {str(e)}")
+        except frappe.ValidationError:
+            api_logger.warning("Tool validation failed")
             response = {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": ErrorCodes.INVALID_PARAMS,
-                    "message": f"Tool validation failed: {str(e)}",
-                    "data": {"tool_name": tool_name, "error_type": "ValidationError", "details": str(e)},
+                    "message": "Tool validation failed",
                 },
             }
             if request_id is not None:
                 response["id"] = request_id
             return response
         except Exception as e:
-            # All other execution errors - provide detailed logging
             api_logger.error(
-                f"Tool execution failed for {tool_name} (user: {frappe.session.user}): {str(e)}",
-                exc_info=True,
+                f"Tool execution failed: type={type(e).__name__}"
             )
             response = {
                 "jsonrpc": "2.0",
                 "error": {
                     "code": ErrorCodes.INTERNAL_ERROR,
-                    "message": f"Tool execution failed: {str(e)}",
-                    "data": {"tool_name": tool_name, "error_type": type(e).__name__, "details": str(e)},
+                    "message": "Tool execution failed",
                 },
             }
             if request_id is not None:
@@ -147,25 +166,26 @@ def handle_tool_call(params: Dict[str, Any], request_id: Optional[Any]) -> Dict[
 
         # Ensure result is a string for Claude Desktop compatibility
         if not isinstance(result, str):
-            result = str(result)
+            result = json.dumps(result, default=str)
 
         response = {"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": result}]}}
 
         if request_id is not None:
             response["id"] = request_id
 
-        api_logger.info(f"Tool call completed successfully: {tool_name}")
+        api_logger.info("Canonical tool request completed successfully")
         return response
 
     except Exception as e:
-        api_logger.error(f"Error in handle_tool_call: {e}")
+        api_logger.error(
+            f"Error in handle_tool_call: type={type(e).__name__}"
+        )
 
         response = {
             "jsonrpc": "2.0",
             "error": {
                 "code": ErrorCodes.INTERNAL_ERROR,
                 "message": ErrorMessages.INTERNAL_ERROR,
-                "data": str(e),
             },
         }
 
