@@ -108,13 +108,9 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
 
         tool = RunWorkflow()
         with patch(
-            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.db.exists",
-            return_value=True,
-        ), \
-         patch(
              "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
              side_effect=AssertionError("restricted target must not reach get_doc"),
-         ):
+         ) as get_doc:
             result = tool.execute(
                 {
                     "doctype": "User",
@@ -124,7 +120,8 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
             )
 
         self.assertFalse(result.get("success"), result)
-        self.assertIn("restricted", (result.get("error") or "").lower())
+        self.assertEqual(result.get("error"), "Workflow action not available")
+        get_doc.assert_not_called()
 
     def test_get_pending_approvals_excludes_restricted_and_unreadable(self):
         """``get_pending_approvals`` must drop actions whose reference DocType
@@ -180,6 +177,10 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
             def run(self, as_dict=False):
                 return [customer_action, user_action]
 
+        fake_qb = MagicMock()
+        fake_qb.from_.side_effect = lambda *args, **kwargs: _FakeQuery()
+        fake_qb.desc = "desc"
+
         with patch(
             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.session"
         ) as session, \
@@ -188,8 +189,9 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
              return_value=["Assistant User"],
          ), \
          patch(
-             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb"
-         ) as qb, \
+             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb",
+             fake_qb,
+         ), \
          patch(
              "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.has_permission",
              side_effect=lambda dt, ptype="read", doc=None, **kw: (
@@ -203,9 +205,8 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
          patch(
              "frappe_assistant_core.plugins.core.tools.get_pending_approvals.DocType",
              return_value=MagicMock(),
-         ):
+        ):
             session.user = "user@example.com"
-            qb.from_.return_value = _FakeQuery()
 
             result = tool.execute({"doctype": None, "include_actions": False})
 
@@ -217,3 +218,139 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
             grouped,
             "Restricted reference DocType leaked into pending approvals",
         )
+
+
+# ---------------------------------------------------------------------------
+# FAC v2.3 committed regression tests for workflow hardening.
+# ---------------------------------------------------------------------------
+
+
+class TestFacV23WorkflowRowPermission(BaseAssistantTest):
+    """FAC v2.3: row-level permission runs BEFORE ``frappe.get_doc``. Hidden
+    and missing records yield one stable refusal; ``get_doc`` is not called
+    on an unreadable row."""
+
+    def test_restricted_target_refused_before_get_doc(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.run_workflow import RunWorkflow
+
+        tool = RunWorkflow()
+        with patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission",
+                   return_value=True), \
+             patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
+                   side_effect=AssertionError("restricted target must not reach get_doc")):
+            result = tool.execute({
+                "doctype": "User",
+                "name": "admin@example.com",
+                "action": "Approve",
+            })
+        self.assertFalse(result.get("success"))
+        self.assertEqual(result.get("error"), "Workflow action not available")
+
+    def test_unreadable_business_row_get_doc_not_called(self):
+        """Allowed DocType (Customer) + unreadable row → stable refusal and
+        ``get_doc`` MUST NOT be called."""
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.run_workflow import RunWorkflow
+
+        tool = RunWorkflow()
+        # ``has_permission(doc=...)`` returns False for the unreadable row.
+        def perm_gate(doctype, ptype="read", doc=None, **kw):
+            if doc == "CUST-PRIVATE":
+                return False
+            return True
+
+        with patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission",
+                   side_effect=perm_gate), \
+             patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
+                   side_effect=AssertionError("get_doc must NOT be called for unreadable row")):
+            result = tool.execute({
+                "doctype": "Customer",
+                "name": "CUST-PRIVATE",
+                "action": "Approve",
+            })
+        self.assertFalse(result.get("success"))
+        self.assertEqual(result.get("error"), "Workflow action not available")
+
+    def test_missing_row_same_answer_as_unreadable(self):
+        """A truly missing record (has_permission returns False) and an
+        unreadable record produce the SAME stable answer."""
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.run_workflow import RunWorkflow
+
+        tool = RunWorkflow()
+        with patch("frappe_assistant_core.plugins.core.tools.run_workflow.frappe.has_permission",
+                   return_value=False):
+            missing = tool.execute({
+                "doctype": "Customer",
+                "name": "TRULY-MISSING",
+                "action": "Approve",
+            })
+            unreadable = tool.execute({
+                "doctype": "Customer",
+                "name": "CUST-PRIVATE",
+                "action": "Approve",
+            })
+        self.assertEqual(missing.get("error"), unreadable.get("error"))
+        self.assertEqual(missing.get("error"), "Workflow action not available")
+
+
+class TestFacV23PendingApprovalsActiveRoles(BaseAssistantTest):
+    """FAC v2.3: pending approvals filter the user's roles against
+    ``Role.disabled = 0`` before the role subquery."""
+
+    def test_disabled_role_filtered_out_of_subquery(self):
+        from unittest.mock import MagicMock, patch
+
+        from frappe_assistant_core.plugins.core.tools.get_pending_approvals import (
+            GetPendingApprovals,
+        )
+
+        tool = GetPendingApprovals()
+
+        class _FakeQuery:
+            def join(self, *args, **kwargs):
+                return self
+
+            def on(self, *args, **kwargs):
+                return self
+
+            def select(self, *args, **kwargs):
+                return self
+
+            def where(self, *args, **kwargs):
+                return self
+
+            def orderby(self, *args, **kwargs):
+                return self
+
+            def limit(self, *args, **kwargs):
+                return self
+
+            def run(self, as_dict=False):
+                return []
+
+        fake_qb = MagicMock()
+        fake_qb.from_.side_effect = lambda *args, **kwargs: _FakeQuery()
+        fake_qb.desc = "desc"
+
+        with patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_roles",
+                   return_value=["Active Role", "Disabled Role"]), \
+             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.db.get_list",
+                   return_value=["Active Role"]) as get_list, \
+             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.session") as session, \
+             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb",
+                   fake_qb), \
+             patch("frappe_assistant_core.plugins.core.tools.get_pending_approvals.DocType",
+                   return_value=MagicMock()):
+            session.user = "user@example.com"
+            result = tool.execute({"doctype": None, "include_actions": False})
+
+        self.assertTrue(result.get("success"))
+        self.assertTrue(get_list.called)
+        call = get_list.call_args
+        filters = call.kwargs.get("filters") or (call.args[1] if len(call.args) > 1 else {})
+        self.assertEqual(filters.get("disabled"), 0)

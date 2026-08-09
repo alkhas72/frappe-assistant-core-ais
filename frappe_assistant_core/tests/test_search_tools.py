@@ -108,6 +108,12 @@ class TestSearchTools(BaseAssistantTest):
                     side_effect=lambda doctype, *a, **k: doctype == "Employee",
                 )
             )
+            stack.enter_context(
+                patch(
+                    "frappe_assistant_core.core.security_policy.SecurityPolicy._is_restricted_target",
+                    side_effect=lambda doctype: doctype != "Employee",
+                )
+            )
             get_list = stack.enter_context(patch.object(search_tools.frappe, "get_list"))
             get_list.return_value = [{"name": "EMP-0001"}]
 
@@ -115,11 +121,16 @@ class TestSearchTools(BaseAssistantTest):
 
         self.assertTrue(result.get("success"), result)
         self.assertTrue(get_list.called, "global_search must query via frappe.get_list")
-        for call in get_list.call_args_list:
-            self.assertFalse(
-                call.kwargs.get("ignore_permissions", True),
-                "global_search must pass ignore_permissions=False",
-            )
+        fac_calls = [
+            call
+            for call in get_list.call_args_list
+            if call.args and call.args[0] == "Employee"
+        ]
+        self.assertEqual(len(fac_calls), 1, get_list.call_args_list)
+        self.assertFalse(
+            fac_calls[0].kwargs.get("ignore_permissions", True),
+            "global_search must pass ignore_permissions=False",
+        )
 
     def test_search_doctype_uses_permission_aware_query(self):
         """Regression guard for #189: search_doctype (behind the search_doctype

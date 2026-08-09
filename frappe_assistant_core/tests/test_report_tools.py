@@ -188,10 +188,11 @@ class TestReportTools(BaseAssistantTest):
         report_doc = MagicMock()
         report_doc.ref_doctype = "User"
         report_doc.report_type = "Query Report"
+        report_doc.disabled = 0
 
         with patch.object(report_tools.frappe, "has_permission", return_value=True), \
-             patch.object(report_tools.frappe, "get_doc", return_value=report_doc), \
-             patch.object(
+             patch("frappe.desk.query_report.get_report_doc", return_value=report_doc), \
+             patch(
                  "frappe.desk.query_report.run",
                  side_effect=AssertionError("restricted-target report must not execute"),
              ) as run:
@@ -214,9 +215,10 @@ class TestReportTools(BaseAssistantTest):
         report_doc = MagicMock()
         report_doc.ref_doctype = "File"
         report_doc.report_type = "Query Report"
+        report_doc.disabled = 0
 
         with patch.object(report_tools.frappe, "has_permission", return_value=True), \
-             patch.object(report_tools.frappe, "get_doc", return_value=report_doc):
+             patch("frappe.desk.query_report.get_report_doc", return_value=report_doc):
             result = report_tools.ReportTools.get_report_columns(report_name="File Report")
 
         self.assertFalse(result.get("success"), result)
@@ -231,32 +233,22 @@ class TestReportTools(BaseAssistantTest):
         """A hidden report (exists, caller lacks ``read``) and a missing one
         MUST yield the same stable public answer — otherwise the difference
         discloses existence."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
 
         from frappe_assistant_core.plugins.core.tools import report_tools
 
-        # Hidden: doctype-level permission yes, doc-level no.
-        def hidden_perm(doctype, ptype="read", doc=None, **kw):
-            if doctype == "Report" and doc == "Hidden":
-                return False
-            return True
+        def hidden_get_report_doc(name):
+            raise frappe.PermissionError("hidden")
 
-        # Missing: doctype-level yes, doc-level True, but get_doc raises.
-        def missing_perm(doctype, ptype="read", doc=None, **kw):
-            return True
-
-        def hidden_get_doc(doctype, name):
-            return MagicMock(name=name, ref_doctype="Customer", report_type="Query Report")
-
-        def missing_get_doc(doctype, name):
+        def missing_get_report_doc(name):
             raise frappe.DoesNotExistError("missing")
 
-        with patch.object(report_tools.frappe, "has_permission", side_effect=hidden_perm), \
-             patch.object(report_tools.frappe, "get_doc", side_effect=hidden_get_doc):
+        with patch("frappe.desk.query_report.get_report_doc",
+                   side_effect=hidden_get_report_doc):
             hidden = report_tools.ReportTools.execute_report("Hidden", {})
 
-        with patch.object(report_tools.frappe, "has_permission", side_effect=missing_perm), \
-             patch.object(report_tools.frappe, "get_doc", side_effect=missing_get_doc):
+        with patch("frappe.desk.query_report.get_report_doc",
+                   side_effect=missing_get_report_doc):
             missing = report_tools.ReportTools.execute_report("Truly Missing", {})
 
         self.assertFalse(hidden.get("success"))
@@ -275,6 +267,7 @@ class TestReportTools(BaseAssistantTest):
         report_doc.ref_doctype = "Customer"
         report_doc.report_type = "Query Report"
         report_doc.name = "Sensitive Report"
+        report_doc.disabled = 0
 
         sensitive_message = "secret_value_leaked_in_SQL: password='hunter2'"
 
@@ -282,7 +275,7 @@ class TestReportTools(BaseAssistantTest):
             raise RuntimeError(sensitive_message)
 
         with patch.object(report_tools.frappe, "has_permission", return_value=True), \
-             patch.object(report_tools.frappe, "get_doc", return_value=report_doc), \
+             patch("frappe.desk.query_report.get_report_doc", return_value=report_doc), \
              patch.object(report_tools.frappe, "logger"), \
              patch("frappe.desk.query_report.run", side_effect=boom):
             result = report_tools.ReportTools.execute_report("Sensitive Report", {})
@@ -395,3 +388,347 @@ class TestReportToolsIntegration(BaseAssistantTest):
             except Exception:
                 # Exceptions are acceptable for invalid input
                 pass
+
+
+# ---------------------------------------------------------------------------
+# FAC v2.3 committed regression tests for Task 6/7 hardening.
+#
+# These tests are bench-runnable (use ``unittest.mock.patch`` against real
+# Frappe entry points). Each test is self-contained and does not require a
+# live site beyond the BaseAssistantTest bootstrap. When run under
+# ``bench run-tests`` they prove the v2.2/v2.3 contracts:
+#   * report authorization parity (missing/hidden/disabled/restricted);
+#   * prepared-report binding runs BEFORE retrieval on both cached and
+#     polling paths;
+#   * one safe log record per prepared failure (no exc_info, no secret);
+#   * column descriptors in string form classify as sensitive;
+#   * nested positional ``doctype`` override cannot downgrade redaction.
+# ---------------------------------------------------------------------------
+
+
+class TestFacV23ReportAuthorization(BaseAssistantTest):
+    """Missing, hidden, disabled and restricted-target reports all produce
+    the same stable public answer ``"Report not available"``."""
+
+    def _report_doc(self, name="R", ref_doctype="Customer", disabled=0):
+        from unittest.mock import MagicMock
+
+        rd = MagicMock()
+        rd.name = name
+        rd.ref_doctype = ref_doctype
+        rd.report_type = "Query Report"
+        rd.disabled = disabled
+        rd.prepared_report = False
+        rd.timeout = 30
+        return rd
+
+    def test_missing_report_stable_answer(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        def raises_missing(name):
+            raise frappe.DoesNotExistError("missing")
+
+        with patch("frappe.desk.query_report.get_report_doc", side_effect=raises_missing):
+            result = report_tools.ReportTools.execute_report("Truly Missing", {})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Report not available")
+
+    def test_hidden_report_same_answer_as_missing(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        def raises_hidden(name):
+            raise frappe.PermissionError("role-hidden")
+
+        def raises_missing(name):
+            raise frappe.DoesNotExistError("missing")
+
+        with patch("frappe.desk.query_report.get_report_doc", side_effect=raises_hidden):
+            hidden = report_tools.ReportTools.execute_report("Hidden", {})
+        with patch("frappe.desk.query_report.get_report_doc", side_effect=raises_missing):
+            missing = report_tools.ReportTools.execute_report("Missing", {})
+
+        self.assertEqual(hidden["error"], missing["error"])
+        self.assertEqual(hidden["error"], "Report not available")
+
+    def test_disabled_report_same_answer(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        rd = self._report_doc(disabled=1)
+        with patch("frappe.desk.query_report.get_report_doc", return_value=rd):
+            result = report_tools.ReportTools.execute_report("Disabled", {})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Report not available")
+
+    def test_restricted_ref_doctype_same_answer_and_no_run(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        rd = self._report_doc(ref_doctype="User")  # restricted
+        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), \
+             patch("frappe.desk.query_report.run",
+                   side_effect=AssertionError("must not execute")) as run:
+            result = report_tools.ReportTools.execute_report("R", {})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "Report not available")
+        run.assert_not_called()
+
+
+class TestFacV23PreparedBindingOrder(BaseAssistantTest):
+    """FAC v2.3: binding check runs BEFORE retrieval on both cached and
+    polling paths. ``get_prepared_report_result`` MUST NOT be called when
+    owner or report_name does not match."""
+
+    def _setup_prepared(self, owner_mismatch=True, report_mismatch=False,
+                        status="Completed"):
+        from unittest.mock import MagicMock
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        rd = MagicMock()
+        rd.name = "Allowed"
+        rd.ref_doctype = "Customer"
+        rd.report_type = "Query Report"
+        rd.disabled = 0
+        rd.prepared_report = True
+        rd.disable_prepared_report = False
+        rd.timeout = 30
+
+        session_user = frappe.session.user
+        prepared_doc = MagicMock(
+            owner=("someone-else@example.com" if owner_mismatch else session_user),
+            report_name=("Other Report" if report_mismatch else "Allowed"),
+            status=status,
+            modified="2026-08-09",
+        )
+        return rd, prepared_doc
+
+    def test_cached_path_retrieval_not_called_on_owner_mismatch(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        rd, prepared_doc = self._setup_prepared(owner_mismatch=True)
+
+        with patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc), \
+             patch(
+                 "frappe.core.doctype.prepared_report.prepared_report.get_completed_prepared_report",
+                 return_value="PR-001",
+             ), \
+             patch(
+                 "frappe.desk.query_report.get_prepared_report_result",
+                 side_effect=AssertionError(
+                     "get_prepared_report_result must NOT be called on owner mismatch"
+                 ),
+             ) as retrieval:
+            result = report_tools.ReportTools._handle_prepared_report_execution(rd, {})
+
+        self.assertFalse(result.get("success"))
+        self.assertEqual(result.get("error"), "Prepared report not available")
+        retrieval.assert_not_called()
+
+    def test_polling_path_retrieval_not_called_on_report_mismatch(self):
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        rd, prepared_doc = self._setup_prepared(
+            owner_mismatch=False,
+            report_mismatch=True,
+            status="Completed",
+        )
+
+        with patch(
+            "frappe.core.doctype.prepared_report.prepared_report.get_completed_prepared_report",
+            return_value=None,
+        ), patch(
+            "frappe.core.doctype.prepared_report.prepared_report.make_prepared_report",
+            return_value={"name": "PR-POLL"},
+        ), patch(
+            "frappe.desk.query_report.get_prepared_report_result",
+            side_effect=AssertionError(
+                "get_prepared_report_result must NOT be called on report mismatch"
+            ),
+        ) as retrieval, patch.object(
+            report_tools.frappe, "get_value", return_value=60
+        ), patch.object(
+            report_tools.frappe, "get_doc", return_value=prepared_doc
+        ), patch(
+            "time.sleep", return_value=None
+        ):
+            result = report_tools.ReportTools._handle_prepared_report_execution(rd, {})
+
+        self.assertFalse(result.get("success"))
+        self.assertEqual(result.get("error"), "Prepared report not available")
+        retrieval.assert_not_called()
+
+    def test_outer_execute_preserves_prepared_failure(self):
+        """If the prepared helper returns ``{"success": False, ...}`` the
+        outer ``execute_report`` MUST propagate it, not re-wrap as success."""
+        from unittest.mock import MagicMock, patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        rd = MagicMock()
+        rd.name = "Allowed"
+        rd.ref_doctype = "Customer"
+        rd.report_type = "Query Report"
+        rd.disabled = 0
+        rd.prepared_report = True
+        rd.disable_prepared_report = False
+        rd.timeout = 30
+
+        prepared_doc = MagicMock(
+            owner="someone-else@example.com",
+            report_name="Allowed",
+            status="Completed",
+            modified="2026-08-09",
+        )
+
+        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), \
+             patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc):
+            # Force cached-path entry; prepared_report True routes through
+            # the prepared handler.
+            from frappe.core.doctype.prepared_report import prepared_report as pr_module
+            with patch.object(pr_module, "get_completed_prepared_report",
+                              return_value="PR-001"):
+                result = report_tools.ReportTools.execute_report("Allowed", {})
+
+        self.assertFalse(result.get("success"))
+        self.assertEqual(result.get("error"), "Prepared report not available")
+
+
+class TestFacV23SingleSafeLogOnPreparedFailure(BaseAssistantTest):
+    """One safe log record per prepared failure: helper does NOT log, outer
+    ``execute_report`` logs exactly once with no exc_info and no secret."""
+
+    def test_logger_called_once_no_secret_no_exc_info(self):
+        from unittest.mock import MagicMock, patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        rd = MagicMock()
+        rd.name = "Allowed"
+        rd.ref_doctype = "Customer"
+        rd.report_type = "Query Report"
+        rd.disabled = 0
+        rd.prepared_report = True
+        rd.disable_prepared_report = False
+        rd.timeout = 30
+
+        prepared_doc = MagicMock(
+            owner=frappe.session.user,
+            report_name="Allowed",
+            status="Completed",
+            modified="2026-08-09",
+        )
+
+        secret = "password='hunter2' in traceback"
+        capturing_logger = MagicMock()
+        with patch("frappe.desk.query_report.get_report_doc", return_value=rd), \
+             patch("frappe.desk.query_report.get_prepared_report_result",
+                   side_effect=RuntimeError(secret)), \
+             patch.object(report_tools.frappe, "get_doc", return_value=prepared_doc), \
+             patch.object(report_tools.frappe, "has_permission", return_value=True), \
+             patch.object(report_tools.frappe, "logger",
+                          return_value=capturing_logger):
+            from frappe.core.doctype.prepared_report import prepared_report as pr_module
+            with patch.object(pr_module, "get_completed_prepared_report",
+                              return_value="PR-001"):
+                result = report_tools.ReportTools.execute_report("Allowed", {})
+
+        self.assertFalse(result.get("success"))
+        self.assertEqual(result.get("error"), "Report execution failed")
+        self.assertEqual(capturing_logger.warning.call_count, 1)
+        for call in capturing_logger.warning.call_args_list:
+            args, kwargs = call
+            self.assertNotIn("exc_info", kwargs)
+            joined = " ".join(str(a) for a in args)
+            self.assertNotIn("hunter2", joined)
+
+
+class TestFacV23ColumnDescriptors(BaseAssistantTest):
+    """FAC v2.3: string-form column descriptors classify as sensitive."""
+
+    def _redact(self, columns, ref_doctype="Customer"):
+        from frappe_assistant_core.plugins.core.tools.report_tools import ReportTools
+        debug = {"data": [["x"]], "columns": columns}
+        return ReportTools._redact_report_output(debug, ref_doctype)
+
+    def test_password_string_descriptor(self):
+        out = self._redact(["password:Data:120"])
+        self.assertEqual(out["columns"], [])
+
+    def test_api_key_string_descriptor(self):
+        out = self._redact(["api_key:Data:120"])
+        self.assertEqual(out["columns"], [])
+
+    def test_encryption_key_string_descriptor(self):
+        out = self._redact(["encryption_key:Data:120"])
+        self.assertEqual(out["columns"], [])
+
+    def test_api_key_with_spaces_string_descriptor(self):
+        # "API Key:Data:120" → label "API Key" → "api_key"
+        out = self._redact(["API Key:Data:120"])
+        self.assertEqual(out["columns"], [])
+
+    def test_login_after_string_descriptor_for_user(self):
+        # login_after is sensitive specifically for User
+        out = self._redact(["login_after:Data:120"], ref_doctype="User")
+        self.assertEqual(out["columns"], [])
+
+    def test_non_sensitive_string_descriptor_kept(self):
+        out = self._redact(["customer_name:Data:120"])
+        self.assertEqual(out["columns"], ["customer_name:Data:120"])
+
+
+class TestFacV23NestedPositionalDoctype(BaseAssistantTest):
+    """FAC v2.3: positional cells (list/tuple) cannot carry a malicious
+    nested ``doctype`` to downgrade ref_doctype redaction."""
+
+    def test_list_cell_with_nested_doctype_stripped(self):
+        from frappe_assistant_core.plugins.core.tools.report_tools import ReportTools
+        debug = {
+            "data": [
+                [
+                    "C1",
+                    {"doctype": "Customer", "connected_user": "secret-leak"},
+                ]
+            ],
+            "columns": [
+                {"fieldname": "name"},
+                {"fieldname": "metadata"},
+            ],
+        }
+        out = ReportTools._redact_report_output(debug, "Email Account")
+        # Email Account: connected_user is sensitive → redacted in nested cell.
+        nested = out["data"][0][1]
+        self.assertNotIn("doctype", nested)
+        self.assertEqual(nested["connected_user"], "***REDACTED***")
+
+    def test_tuple_cell_with_nested_doctype_stripped(self):
+        from frappe_assistant_core.plugins.core.tools.report_tools import ReportTools
+        debug = {
+            "data": [
+                (
+                    "C1",
+                    {"doctype": "Customer", "auth_method": "Bearer secret"},
+                )
+            ],
+            "columns": [
+                {"fieldname": "name"},
+                {"fieldname": "metadata"},
+            ],
+        }
+        out = ReportTools._redact_report_output(debug, "Email Account")
+        row = out["data"][0]
+        self.assertIsInstance(row, tuple)
+        nested = row[1]
+        self.assertNotIn("doctype", nested)
+        self.assertEqual(nested["auth_method"], "***REDACTED***")
