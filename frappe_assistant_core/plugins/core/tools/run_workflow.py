@@ -81,12 +81,32 @@ class RunWorkflow(BaseTool):
         }
 
     def execute(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute workflow action using Frappe's workflow system"""
+        """Execute workflow action using Frappe's workflow system.
+
+        FAC security hardening Task 7 (2026-08-09): the central policy in
+        ``BaseTool._safe_execute`` already authorized this call (restricted
+        DocType, role config, native permission). We defensively re-check the
+        target here so a direct call into ``RunWorkflow.execute`` from
+        non-MCP code cannot bypass that gate. Frappe's ``apply_workflow`` and
+        ``get_transitions`` remain the mandatory second locks for transitions.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             doctype = arguments.get("doctype")
             name = arguments.get("name")
             action = arguments.get("action")
             workflow_name = arguments.get("workflow")
+
+            # Defensive restricted-target gate for direct calls. Central policy
+            # already enforces this for the MCP path; this covers any internal
+            # caller that invokes RunWorkflow.execute without going through
+            # ``_safe_execute``.
+            if SecurityPolicy._is_restricted_target(doctype):
+                return {
+                    "success": False,
+                    "error": f"DocType '{doctype}' is restricted",
+                }
 
             # Validate document exists
             if not frappe.db.exists(doctype, name):

@@ -130,6 +130,102 @@ class TestReportTools(BaseAssistantTest):
         """Test report format functionality"""
         self.skipTest("Report format test placeholder")
 
+    # --- FAC security hardening Task 7 (2026-08-09) ---
+    #
+    # ``Report`` itself is not in ``RESTRICTED_DOCTYPES`` (operators need to
+    # discover and run reports). The leak vector is ``ref_doctype``: a report
+    # built on top of ``User`` / ``File`` / FAC config types would disclose
+    # restricted data through the report surface. ``list_reports`` also used
+    # ``frappe.get_all`` (permission-bypassing) for discovery.
+
+    def test_list_reports_uses_permission_aware_query(self):
+        """Regression: ``list_reports`` must call ``frappe.get_list`` with
+        ``ignore_permissions=False`` and must NOT call ``frappe.get_all``."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(report_tools.frappe.db, "exists", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(report_tools.frappe, "has_permission", return_value=True)
+            )
+            get_all = stack.enter_context(
+                patch.object(
+                    report_tools.frappe,
+                    "get_all",
+                    side_effect=AssertionError(
+                        "frappe.get_all bypasses Report discovery permissions"
+                    ),
+                )
+            )
+            get_list = stack.enter_context(patch.object(report_tools.frappe, "get_list"))
+            # ``list_reports`` now also reads ``ref_doctype`` so it can filter
+            # restricted-target reports.
+            get_list.return_value = [
+                {"name": "Allowed Report", "ref_doctype": "Customer"},
+            ]
+
+            result = report_tools.ReportTools.list_reports()
+
+        self.assertTrue(result.get("success"), result)
+        get_all.assert_not_called()
+        self.assertTrue(get_list.called, "list_reports must use frappe.get_list")
+        call = get_list.call_args_list[0]
+        self.assertFalse(
+            call.kwargs.get("ignore_permissions", True),
+            "list_reports must pass ignore_permissions=False",
+        )
+
+    def test_execute_report_rejects_restricted_ref_doctype(self):
+        """A report whose ``ref_doctype`` is restricted must be refused before
+        any filter validation or execution runs."""
+        from unittest.mock import MagicMock, patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        report_doc = MagicMock()
+        report_doc.ref_doctype = "User"
+        report_doc.report_type = "Query Report"
+
+        with patch.object(report_tools.frappe.db, "exists", return_value=True), \
+             patch.object(report_tools.frappe, "has_permission", return_value=True), \
+             patch.object(report_tools.frappe, "get_doc", return_value=report_doc), \
+             patch.object(
+                 "frappe.desk.query_report.run",
+                 side_effect=AssertionError("restricted-target report must not execute"),
+             ) as run:
+            result = report_tools.ReportTools.execute_report(
+                report_name="User Report", filters={}
+            )
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("restricted", (result.get("error") or "").lower())
+        run.assert_not_called()
+
+    def test_get_report_columns_rejects_restricted_ref_doctype(self):
+        """``get_report_columns`` mirrors ``execute_report`` and must refuse a
+        report whose ``ref_doctype`` is restricted before any column
+        extraction."""
+        from unittest.mock import MagicMock, patch
+
+        from frappe_assistant_core.plugins.core.tools import report_tools
+
+        report_doc = MagicMock()
+        report_doc.ref_doctype = "File"
+        report_doc.report_type = "Query Report"
+
+        with patch.object(report_tools.frappe.db, "exists", return_value=True), \
+             patch.object(report_tools.frappe, "has_permission", return_value=True), \
+             patch.object(report_tools.frappe, "get_doc", return_value=report_doc):
+            result = report_tools.ReportTools.get_report_columns(report_name="File Report")
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("restricted", (result.get("error") or "").lower())
+
 
 class TestReportToolsIntegration(BaseAssistantTest):
     """Integration tests for report tools"""

@@ -94,3 +94,126 @@ class TestWorkflowToolsIntegration(BaseAssistantTest):
 
     def test_workflow_error_scenarios(self):
         self.skipTest("Workflow error test placeholder")
+
+    # --- FAC security hardening Task 7 (2026-08-09) ---
+
+    def test_run_workflow_rejects_restricted_target_directly(self):
+        """A direct call to ``RunWorkflow.execute`` for a restricted DocType
+        (``User``, ``DocType``, ``File``, ...) must refuse before any
+        ``frappe.get_doc`` or workflow lookup. Central policy already blocks
+        this on the MCP path; this guard covers non-MCP callers."""
+        from unittest.mock import patch
+
+        from frappe_assistant_core.plugins.core.tools.run_workflow import RunWorkflow
+
+        tool = RunWorkflow()
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.db.exists",
+            return_value=True,
+        ), \
+         patch(
+             "frappe_assistant_core.plugins.core.tools.run_workflow.frappe.get_doc",
+             side_effect=AssertionError("restricted target must not reach get_doc"),
+         ):
+            result = tool.execute(
+                {
+                    "doctype": "User",
+                    "name": "admin@example.com",
+                    "action": "Approve",
+                }
+            )
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("restricted", (result.get("error") or "").lower())
+
+    def test_get_pending_approvals_excludes_restricted_and_unreadable(self):
+        """``get_pending_approvals`` must drop actions whose reference DocType
+        is restricted OR whose underlying document the user cannot read, even
+        when the Workflow Action row itself matches the role subquery."""
+        from unittest.mock import MagicMock, patch
+
+        from frappe_assistant_core.plugins.core.tools.get_pending_approvals import (
+            GetPendingApprovals,
+        )
+
+        tool = GetPendingApprovals()
+
+        customer_action = MagicMock(
+            name="WA-CUST-1",
+            reference_doctype="Customer",
+            reference_name="CUST-001",
+            workflow_state="Pending",
+            user=None,
+            creation="2026-08-09 00:00:00",
+        )
+        user_action = MagicMock(
+            name="WA-USER-1",
+            reference_doctype="User",
+            reference_name="admin@example.com",
+            workflow_state="Pending",
+            user=None,
+            creation="2026-08-09 00:00:00",
+        )
+
+        class _FakeQuery:
+            def where(self, *a, **kw):
+                return self
+
+            def orderby(self, *a, **kw):
+                return self
+
+            def limit(self, *a, **kw):
+                return self
+
+            def select(self, *a, **kw):
+                return self
+
+            def join(self, *a, **kw):
+                return self
+
+            def on(self, *a, **kw):
+                return self
+
+            def from_(self, *a, **kw):
+                return self
+
+            def run(self, as_dict=False):
+                return [customer_action, user_action]
+
+        with patch(
+            "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.session"
+        ) as session, \
+         patch(
+             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_roles",
+             return_value=["Assistant User"],
+         ), \
+         patch(
+             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.qb"
+         ) as qb, \
+         patch(
+             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.has_permission",
+             side_effect=lambda dt, ptype="read", doc=None, **kw: (
+                 dt == "Customer" and doc == "CUST-001"
+             ),
+         ), \
+         patch(
+             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.frappe.get_all",
+             return_value=[],
+         ), \
+         patch(
+             "frappe_assistant_core.plugins.core.tools.get_pending_approvals.DocType",
+             return_value=MagicMock(),
+         ):
+            session.user = "user@example.com"
+            qb.from_.return_value = _FakeQuery()
+
+            result = tool.execute({"doctype": None, "include_actions": False})
+
+        self.assertTrue(result.get("success"), result)
+        grouped = result.get("pending_approvals", {})
+        self.assertIn("Customer", grouped)
+        self.assertNotIn(
+            "User",
+            grouped,
+            "Restricted reference DocType leaked into pending approvals",
+        )

@@ -41,7 +41,17 @@ class ReportTools:
     def execute_report(
         report_name: str, filters: Dict[str, Any] = None, format: str = "json"
     ) -> Dict[str, Any]:
-        """Execute a Frappe report"""
+        """Execute a Frappe report.
+
+        FAC security hardening Task 7 (2026-08-09): a report whose
+        ``ref_doctype`` resolves to a restricted DocType is refused before any
+        filter validation or execution runs. Central policy already gates the
+        ``Report`` DocType itself; this is the second lock that prevents a
+        report built on top of ``User`` / ``File`` / FAC config types from
+        leaking their data through the report surface.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             # Check if report exists
             if not frappe.db.exists("Report", report_name):
@@ -53,6 +63,20 @@ class ReportTools:
 
             # Get report document
             report_doc = frappe.get_doc("Report", report_name)
+
+            # Restricted-target gate on the report's reference DocType. Without
+            # this, a report authored against ``User`` or ``File`` would bypass
+            # the central policy because the tool target is ``Report``, not
+            # ``ref_doctype``.
+            ref_doctype = getattr(report_doc, "ref_doctype", None)
+            if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
+                return {
+                    "success": False,
+                    "error": (
+                        f"Report '{report_name}' targets restricted DocType "
+                        f"'{ref_doctype}'"
+                    ),
+                }
 
             # Validate filters before execution
             validation_result = ReportTools._validate_filters(filters or {}, report_doc)
@@ -137,7 +161,18 @@ class ReportTools:
 
     @staticmethod
     def list_reports(module: str = None, report_type: str = None) -> Dict[str, Any]:
-        """Get list of available reports"""
+        """Get list of available reports.
+
+        FAC security hardening Task 7 (2026-08-09): discovery now uses
+        ``frappe.get_list(ignore_permissions=False)`` instead of
+        ``frappe.get_all`` (the latter bypasses Frappe's DocType and row-level
+        permission filters and would surface reports the user cannot read).
+        Reports whose ``ref_doctype`` is a restricted DocType are also
+        dropped, because their result set would disclose restricted data even
+        though ``Report`` itself is not in ``RESTRICTED_DOCTYPES``.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             filters = {}
             if module:
@@ -145,18 +180,39 @@ class ReportTools:
             if report_type:
                 filters["report_type"] = report_type
 
-            reports = frappe.get_all(
+            # Permission-aware lookup. ``frappe.get_all`` would silently include
+            # reports the user cannot read and was the legacy discovery path.
+            reports = frappe.get_list(
                 "Report",
                 filters=filters,
-                fields=["name", "report_name", "report_type", "module", "is_standard", "disabled"],
+                fields=[
+                    "name",
+                    "report_name",
+                    "report_type",
+                    "module",
+                    "is_standard",
+                    "disabled",
+                    "ref_doctype",
+                ],
                 order_by="report_name",
+                ignore_permissions=False,
             )
 
-            # Filter by permissions
             accessible_reports = []
             for report in reports:
-                if frappe.has_permission("Report", "read", report.name):
-                    accessible_reports.append(report)
+                # ``frappe.get_list`` returns dict-like rows; use ``.get`` so
+                # both frappe._dict and plain dict work without AttributeError.
+                report_name = report.get("name") if hasattr(report, "get") else None
+                if not report_name:
+                    continue
+                # Row-level permission on the Report document itself.
+                if not frappe.has_permission("Report", "read", report_name):
+                    continue
+                # Restricted-target gate on the report's reference DocType.
+                ref_doctype = report.get("ref_doctype") if hasattr(report, "get") else None
+                if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
+                    continue
+                accessible_reports.append(report)
 
             return {
                 "success": True,
@@ -171,7 +227,14 @@ class ReportTools:
 
     @staticmethod
     def get_report_columns(report_name: str) -> Dict[str, Any]:
-        """Get column information for a report"""
+        """Get column information for a report.
+
+        FAC security hardening Task 7 (2026-08-09): a report whose
+        ``ref_doctype`` is restricted is refused before any column extraction
+        runs, mirroring ``execute_report``.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             if not frappe.db.exists("Report", report_name):
                 return {"success": False, "error": f"Report '{report_name}' not found"}
@@ -180,6 +243,17 @@ class ReportTools:
                 return {"success": False, "error": f"No permission to access report '{report_name}'"}
 
             report_doc = frappe.get_doc("Report", report_name)
+
+            ref_doctype = getattr(report_doc, "ref_doctype", None)
+            if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
+                return {
+                    "success": False,
+                    "error": (
+                        f"Report '{report_name}' targets restricted DocType "
+                        f"'{ref_doctype}'"
+                    ),
+                }
+
             columns = []
 
             if report_doc.report_type == "Query Report":
