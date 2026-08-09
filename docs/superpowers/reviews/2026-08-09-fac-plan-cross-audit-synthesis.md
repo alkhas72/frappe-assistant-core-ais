@@ -1,7 +1,10 @@
 ---
 title: "FAC security hardening plan: cross-audit synthesis"
 date: 2026-08-09
-status: awaiting-arbiter-approval
+status: approved
+approved_by: Alkhas Tkhagushev
+approved_date: 2026-08-09
+approved_revision: 642191d
 auditors:
   - Claude/Fable + Opus 4.8
   - Antigravity

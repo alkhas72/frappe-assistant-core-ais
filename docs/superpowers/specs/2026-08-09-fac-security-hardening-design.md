@@ -1,7 +1,10 @@
 ---
 title: "FAC security hardening for AIS"
 date: 2026-08-09
-status: review-required
+status: approved
+approved_by: Alkhas Tkhagushev
+approved_date: 2026-08-09
+approved_revision: 642191d
 upstream: buildswithpaul/Frappe_Assistant_Core
 upstream_version: 2.5.0
 upstream_commit: e50c5c32bc7d28f10842c5779e0aec61d5b77bbb

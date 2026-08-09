@@ -1,5 +1,7 @@
 # FAC Security Hardening Implementation Plan
 
+**Approval:** Алхас Тхагушев утвердил ревизию `642191d` 2026-08-09. Это утверждение ratifies exact `RESTRICTED_DOCTYPES` baseline из design spec и открывает Tasks 1–8; production gate Tasks 9–10 остаётся отдельным решением.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Построить fail-closed fork FAC 2.5.0, в котором каждый опубликованный и исполняемый tool проходит одну центральную policy, все отказы аудируются, а старые `Allow All` безопасно мигрируют в deny.
