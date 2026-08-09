@@ -283,8 +283,8 @@ def _collect_requested_fields(arguments: Mapping[str, Any], *payload_keys: str) 
 
 
 @lru_cache(maxsize=1)
-def discover_builtin_tool_names() -> frozenset[str]:
-    """Discover tool names from built-in plugin source declarations.
+def discover_builtin_tool_classes() -> Mapping[str, type[BaseTool]]:
+    """Discover tool classes from built-in plugin source declarations.
 
     Enabled state and dependency validation are intentionally not consulted.
     Every declared module must resolve to exactly one locally-defined
@@ -292,7 +292,7 @@ def discover_builtin_tool_names() -> frozenset[str]:
     """
 
     discovered_plugins = PluginDiscovery().discover_plugins()
-    names: set[str] = set()
+    classes = {}
 
     for plugin_name in sorted(_BUILTIN_PLUGINS):
         plugin_info = discovered_plugins.get(plugin_name)
@@ -315,12 +315,27 @@ def discover_builtin_tool_names() -> frozenset[str]:
                 raise RuntimeError(
                     f"Expected one BaseTool class in {module_name}, found {len(candidates)}"
                 )
-            tool_name = next(iter(candidates))().name
-            if not tool_name or tool_name in names:
+            tool_class = next(iter(candidates))
+            tool_name = tool_class().name
+            if not tool_name or tool_name in classes:
                 raise RuntimeError(f"Invalid or duplicate tool name in {module_name}")
-            names.add(tool_name)
+            classes[tool_name] = tool_class
 
-    return frozenset(names)
+    return MappingProxyType(classes)
+
+
+@lru_cache(maxsize=1)
+def discover_builtin_tool_names() -> frozenset[str]:
+    """Return the immutable built-in name inventory."""
+    return frozenset(discover_builtin_tool_classes())
+
+
+def resolve_builtin_tool(tool_name: str) -> BaseTool | None:
+    """Instantiate a known built-in independently of mutable enable state."""
+    if not isinstance(tool_name, str):
+        return None
+    tool_class = discover_builtin_tool_classes().get(tool_name)
+    return tool_class() if tool_class is not None else None
 
 
 class SecurityPolicy:
@@ -367,11 +382,20 @@ class SecurityPolicy:
                 return cls._deny("CONFIG_MODE_DENIED", empty_context)
 
             allowed_roles = {role for role in config.get("roles", set()) if role}
-            if not allowed_roles.intersection(cls._get_actor_roles(actor)):
+            if not allowed_roles.intersection(
+                cls._get_actor_roles(actor, fresh=fresh)
+            ):
                 return cls._deny("ROLE_NOT_ALLOWED", empty_context)
 
             if tool_name not in EXPECTED_BUILTIN_TOOL_NAMES and tool_name not in TRUSTED_EXTERNAL_TOOLS:
                 return cls._deny("EXTERNAL_TOOL_DENIED", empty_context)
+
+            if phase == "publish":
+                return PolicyDecision(
+                    allowed=True,
+                    reason_code="ALLOWED",
+                    context=ToolContext(operation="publish"),
+                )
 
             context = cls.extract_context(tool_name, arguments)
             if context is None:
@@ -547,8 +571,34 @@ class SecurityPolicy:
         }
 
     @staticmethod
-    def _get_actor_roles(actor: str) -> set[str]:
-        return set(frappe.get_roles(actor))
+    def _get_actor_roles(actor: str, fresh: bool = False) -> set[str]:
+        if not fresh:
+            return set(frappe.get_roles(actor))
+
+        from frappe.permissions import (
+            ALL_USER_ROLE,
+            AUTOMATIC_ROLES,
+            GUEST_ROLE,
+            SYSTEM_USER_ROLE,
+        )
+
+        if actor == "Guest":
+            return {GUEST_ROLE}
+        if actor == "Administrator":
+            return set(frappe.get_all("Role", pluck="name"))
+
+        roles = set(
+            frappe.get_all(
+                "Has Role",
+                filters={"parenttype": "User", "parent": actor},
+                pluck="role",
+            )
+        )
+        roles.difference_update(AUTOMATIC_ROLES)
+        roles.update({ALL_USER_ROLE, GUEST_ROLE})
+        if frappe.db.get_value("User", actor, "user_type") == "System User":
+            roles.add(SYSTEM_USER_ROLE)
+        return roles
 
     @staticmethod
     def _is_restricted_target(doctype: str | None) -> bool:

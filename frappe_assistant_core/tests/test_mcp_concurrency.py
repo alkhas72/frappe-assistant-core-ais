@@ -130,7 +130,10 @@ def _registry_with(*tools) -> "OrderedDict[str, dict]":
     """Build a per-request registry dict from BaseTool instances."""
     reg = OrderedDict()
     for tool in tools:
-        reg[tool.name] = build_tool_dict(tool)
+        reg[tool.name] = build_tool_dict(
+            tool,
+            executor=lambda _name, arguments, instance=tool: instance.execute(arguments),
+        )
     return reg
 
 

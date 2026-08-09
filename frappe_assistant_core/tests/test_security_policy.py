@@ -321,3 +321,39 @@ class TestSecurityPolicy(FrappeTestCase):
                 self.assertTrue(decision.allowed)
                 plugin_check.assert_called_once_with("core", fresh=fresh)
                 config.assert_called_once_with("get_document", fresh=fresh)
+
+    def test_publish_does_not_require_call_arguments(self):
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(SecurityPolicy, "_is_actor_enabled", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(SecurityPolicy, "_is_plugin_enabled", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    SecurityPolicy,
+                    "_load_access_config",
+                    return_value=ALLOW_ASSISTANT_USER,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    SecurityPolicy,
+                    "_get_actor_roles",
+                    return_value={"Assistant User"},
+                )
+            )
+            native = stack.enter_context(
+                patch.object(SecurityPolicy, "_has_native_permissions")
+            )
+            decision = SecurityPolicy.authorize(
+                "agent@example.com",
+                "get_document",
+                None,
+                "publish",
+            )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.context.operation, "publish")
+        native.assert_not_called()

@@ -495,17 +495,20 @@ The [mcp/tool_adapter.py](../frappe_assistant_core/mcp/tool_adapter.py) provides
 ```python
 from frappe_assistant_core.mcp.tool_adapter import register_base_tool
 from frappe_assistant_core.api.fac_endpoint import mcp
+from frappe_assistant_core.core.tool_registry import get_tool_registry
 
-# Register an existing BaseTool with MCP server
-register_base_tool(mcp, tool_instance)
+# Registration requires the canonical policy/audit executor.
+registry = get_tool_registry()
+register_base_tool(mcp, tool_instance, registry.execute_tool)
 ```
 
 **How it works:**
 
-1. Creates a wrapper function that calls `tool_instance._safe_execute()`
+1. Creates a wrapper that calls the canonical registry executor
 2. Extracts tool metadata (name, description, inputSchema)
 3. Registers with MCPServer using `mcp.add_tool()`
-4. All BaseTool features work automatically (validation, permissions, audit, etc.)
+4. The registry routes into `BaseTool._safe_execute()` for fresh policy,
+   validation, permissions and one audit outcome
 
 ### JSON Serialization Fix
 

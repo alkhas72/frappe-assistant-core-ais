@@ -21,10 +21,13 @@ Allows existing BaseTool-based tools to work with the new MCP server
 without rewriting them. This is a compatibility layer.
 """
 
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 
-def build_tool_dict(tool_instance) -> Dict[str, Any]:
+def build_tool_dict(
+    tool_instance,
+    executor: Callable[[str, Dict[str, Any]], Any],
+) -> Dict[str, Any]:
     """
     Build the MCP tool dict for a BaseTool instance.
 
@@ -35,14 +38,16 @@ def build_tool_dict(tool_instance) -> Dict[str, Any]:
 
     Args:
         tool_instance: Instance of BaseTool or compatible class
+        executor: Canonical registry executor. It must perform authorization
+            and auditing immediately before tool execution.
 
     Returns:
         Dict with keys: name, description, inputSchema, annotations, fn
     """
 
     def tool_wrapper(**arguments):
-        """Wrapper that calls BaseTool.execute()"""
-        return tool_instance._safe_execute(arguments)
+        """Route every MCP invocation through the canonical executor."""
+        return executor(tool_instance.name, arguments)
 
     return {
         "name": tool_instance.name,
@@ -53,7 +58,7 @@ def build_tool_dict(tool_instance) -> Dict[str, Any]:
     }
 
 
-def register_base_tool(mcp_server, tool_instance):
+def register_base_tool(mcp_server, tool_instance, executor):
     """
     Register a BaseTool instance with the MCP server.
 
@@ -63,6 +68,7 @@ def register_base_tool(mcp_server, tool_instance):
     Args:
         mcp_server: MCPServer instance
         tool_instance: Instance of BaseTool or compatible class
+        executor: Canonical registry executor
 
     Example:
         ```python
@@ -70,21 +76,22 @@ def register_base_tool(mcp_server, tool_instance):
         from frappe_assistant_core.api.mcp_endpoint import mcp
 
         # Register existing tool
-        register_base_tool(mcp, DocumentList())
+        register_base_tool(mcp, DocumentList(), registry.execute_tool)
         ```
     """
 
     # Register with MCP server
-    mcp_server.add_tool(build_tool_dict(tool_instance))
+    mcp_server.add_tool(build_tool_dict(tool_instance, executor=executor))
 
 
-def register_all_base_tools(mcp_server, tool_instances):
+def register_all_base_tools(mcp_server, tool_instances, executor):
     """
     Register multiple BaseTool instances.
 
     Args:
         mcp_server: MCPServer instance
         tool_instances: List of BaseTool instances
+        executor: Canonical registry executor
     """
     for tool in tool_instances:
-        register_base_tool(mcp_server, tool)
+        register_base_tool(mcp_server, tool, executor)

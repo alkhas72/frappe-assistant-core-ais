@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 
+from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
 
@@ -291,14 +292,9 @@ class TestDocumentTools(BaseAssistantTest):
 
     def test_execute_tool_invalid_tool(self):
         """Test handling of invalid tool names"""
-        try:
-            result = self.registry.execute_tool("nonexistent_tool", {})
-            # Should return error, not raise exception
-            self.assertIsInstance(result, dict)
-            self.assertIn("error", result)
-        except Exception as e:
-            # If it raises exception, it should be a known type
-            self.assertIsInstance(e, (ValueError, KeyError, AttributeError))
+        with self.assertRaises(PolicyDenied) as raised:
+            self.registry.execute_tool("nonexistent_tool", {})
+        self.assertEqual(raised.exception.reason_code, "TOOL_UNKNOWN")
 
     def test_create_document_with_submit(self):
         """Test document creation with submission"""

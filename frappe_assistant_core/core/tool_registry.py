@@ -28,6 +28,13 @@ from typing import Any, Dict, List, Optional
 import frappe
 
 from frappe_assistant_core.core.base_tool import BaseTool
+from frappe_assistant_core.core.security_policy import (
+    PolicyDecision,
+    PolicyDenied,
+    SecurityPolicy,
+    ToolContext,
+    resolve_builtin_tool,
+)
 from frappe_assistant_core.utils.plugin_manager import ToolInfo, get_plugin_manager
 
 
@@ -213,17 +220,16 @@ class ToolRegistry:
         # Check external tools
         external_tools = self._get_external_tools()
         external_tool_info = external_tools.get(tool_name)
-        return external_tool_info.instance if external_tool_info else None
+        if external_tool_info:
+            return external_tool_info.instance
+
+        # Resolve ratified built-ins independently of plugin/config enablement.
+        # Authorization remains exclusively in BaseTool._safe_execute.
+        return resolve_builtin_tool(tool_name)
 
     def get_available_tools(self, user: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Get list of available tools for user with permission checking.
-
-        Filtering order:
-        1. Plugin-level: Only tools from enabled plugins (handled by plugin_manager)
-        2. Tool-level: Only enabled tools (from FAC Tool Configuration)
-        3. Role-level: Only tools user has role access to
-        4. Permission-level: Only tools user has Frappe permission for
+        Get the policy-approved publication list for a user.
 
         Args:
             user: Username to check permissions for
@@ -245,13 +251,13 @@ class ToolRegistry:
         for tool_info in tools.values():
             try:
                 tool_name = tool_info.name
-
-                # Step 2 & 3: Check FAC Tool Configuration (enabled + role access)
-                if not self._is_tool_accessible(tool_name, effective_user):
-                    continue
-
-                # Step 4: Check Frappe permissions for the tool
-                if not self._check_tool_permission(tool_info.instance, effective_user):
+                decision = SecurityPolicy.authorize(
+                    actor=effective_user,
+                    tool_name=tool_name,
+                    arguments=None,
+                    phase="publish",
+                )
+                if not decision.allowed:
                     continue
 
                 available_tools.append(tool_info.instance.get_metadata())
@@ -262,20 +268,13 @@ class ToolRegistry:
         return available_tools
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
-        """Execute a tool with given arguments"""
-        user = frappe.session.user
-
-        # Check FAC Tool Configuration (enabled + role access) first
-        if not self._is_tool_accessible(tool_name, user):
-            raise PermissionError(f"Tool '{tool_name}' is not accessible")
+        """Resolve a tool and execute it through its policy-enforcing boundary."""
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            self._raise_unknown_tool(tool_name, arguments)
 
         tool = self.get_tool(tool_name)
         if not tool:
-            raise ValueError(f"Tool '{tool_name}' not found")
-
-        # Check Frappe permissions
-        if not self._check_tool_permission(tool, user):
-            raise PermissionError(f"Permission denied for tool '{tool_name}'")
+            self._raise_unknown_tool(tool_name, arguments)
 
         # Use _safe_execute to ensure audit logging, timing, and error handling
         result = tool._safe_execute(arguments)
@@ -284,23 +283,58 @@ class ToolRegistry:
         if isinstance(result, dict) and "success" in result:
             if result.get("success"):
                 return result.get("result", result)
-            else:
-                # Raise appropriate exception based on error type
-                error_type = result.get("error_type", "ExecutionError")
-                error_message = result.get("error", "Tool execution failed")
+            # Raise appropriate exception based on error type.
+            error_type = result.get("error_type", "ExecutionError")
+            error_message = result.get("error", "Tool execution failed")
 
-                if error_type == "PermissionError":
-                    raise PermissionError(error_message)
-                elif error_type == "ValidationError":
-                    raise frappe.ValidationError(error_message)
-                elif error_type == "DependencyError":
-                    raise Exception(f"Dependency error: {error_message}")
-                else:
-                    # Include error type and execution time in the message for better debugging
-                    execution_time = result.get("execution_time", "unknown")
-                    raise Exception(f"[{error_type}] {error_message} (execution_time: {execution_time}s)")
+            if error_type == "PolicyDenied":
+                reason_code = result.get("reason_code") or "POLICY_DENIED"
+                context = SecurityPolicy.extract_context(tool_name, arguments)
+                decision = PolicyDecision(
+                    allowed=False,
+                    reason_code=reason_code,
+                    context=context or ToolContext(operation="authorize"),
+                )
+                # BaseTool already wrote the single denial audit row.
+                raise PolicyDenied(decision)
+            if error_type == "PermissionError":
+                raise PermissionError(error_message)
+            if error_type == "ValidationError":
+                raise frappe.ValidationError(error_message)
+            if error_type == "DependencyError":
+                raise Exception(f"Dependency error: {error_message}")
+
+            # Include safe structured diagnostics for non-policy execution errors.
+            execution_time = result.get("execution_time", "unknown")
+            raise Exception(
+                f"[{error_type}] {error_message} (execution_time: {execution_time}s)"
+            )
 
         return result
+
+    @staticmethod
+    def _raise_unknown_tool(tool_name: Any, arguments: Any) -> None:
+        from frappe_assistant_core.utils.audit_trail import (
+            log_denied_tool_attempt,
+        )
+
+        if isinstance(tool_name, str) and tool_name.strip():
+            audit_tool_name = tool_name[:140]
+        else:
+            audit_tool_name = "<invalid-tool-name>"
+        decision = PolicyDecision(
+            allowed=False,
+            reason_code="TOOL_UNKNOWN",
+            context=ToolContext(operation="authorize"),
+        )
+        log_denied_tool_attempt(
+            tool_name=audit_tool_name,
+            user=frappe.session.user,
+            reason_code=decision.reason_code,
+            arguments=arguments,
+            operation=decision.context.operation,
+        )
+        raise PolicyDenied(decision)
 
     def has_tool(self, tool_name: str) -> bool:
         """Check if a tool is available"""

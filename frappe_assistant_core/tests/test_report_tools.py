@@ -23,6 +23,7 @@ import unittest
 
 import frappe
 
+from frappe_assistant_core.core.security_policy import PolicyDenied
 from frappe_assistant_core.core.tool_registry import get_tool_registry
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
 
@@ -54,12 +55,9 @@ class TestReportTools(BaseAssistantTest):
 
     def test_execute_tool_invalid_tool(self):
         """Test handling of invalid tool names"""
-        try:
-            result = self.registry.execute_tool("nonexistent_report_tool", {})
-            self.assertIsInstance(result, dict)
-            self.assertIn("error", result)
-        except Exception as e:
-            self.assertIsInstance(e, (ValueError, KeyError, AttributeError))
+        with self.assertRaises(PolicyDenied) as raised:
+            self.registry.execute_tool("nonexistent_report_tool", {})
+        self.assertEqual(raised.exception.reason_code, "TOOL_UNKNOWN")
 
     def test_list_reports_basic(self):
         """Test basic report listing - placeholder for now"""

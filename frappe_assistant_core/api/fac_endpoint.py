@@ -94,7 +94,10 @@ def _build_tool_registry():
             if tool_name:
                 tool_instance = registry.get_tool(tool_name)
                 if tool_instance:
-                    tool_dict = build_tool_dict(tool_instance)
+                    tool_dict = build_tool_dict(
+                        tool_instance,
+                        executor=registry.execute_tool,
+                    )
                     annotations = category_to_annotations(categories.get(tool_name, "read_write"))
                     if annotations:
                         # Merge with any annotations the tool already declared.

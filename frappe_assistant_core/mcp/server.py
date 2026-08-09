@@ -49,13 +49,15 @@ class MCPServer:
         from frappe_assistant_core.mcp.server import MCPServer
         from frappe_assistant_core.mcp.tool_adapter import register_base_tool
         from frappe_assistant_core.plugins.core.tools.list_documents import DocumentList
+        from frappe_assistant_core.core.tool_registry import get_tool_registry
 
         mcp = MCPServer("my-server")
+        registry = get_tool_registry()
 
         @mcp.register()
         def handle_mcp():
             # Import and register BaseTool instances
-            register_base_tool(mcp, DocumentList())
+            register_base_tool(mcp, DocumentList(), registry.execute_tool)
         ```
 
     Note:
