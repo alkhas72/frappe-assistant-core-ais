@@ -21,9 +21,66 @@ Ensures that non-admin users cannot access admin endpoints.
 Ref: https://github.com/buildswithpaul/Frappe_Assistant_Core/issues/105
 """
 
+import hashlib
+import json
+
 import frappe
 
 from frappe_assistant_core.tests.base_test import BaseAssistantTest
+
+SNAPSHOT_TABLES = (
+    "tabFAC Tool Role Access",
+    "tabFAC Tool Configuration",
+    "tabFAC Plugin Configuration",
+)
+
+_module_security_snapshot = None
+
+
+def _snapshot_security_rows():
+    return {
+        table: frappe.db.sql(f"SELECT * FROM `{table}` ORDER BY name", as_dict=True)
+        for table in SNAPSHOT_TABLES
+    }
+
+
+def _security_snapshot_hash(snapshot):
+    serialized = json.dumps(snapshot, default=str, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _restore_security_rows(snapshot):
+    for table in SNAPSHOT_TABLES:
+        columns = [
+            column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)
+        ]
+        frappe.db.sql(f"DELETE FROM `{table}`")
+        if not snapshot[table]:
+            continue
+        placeholders = ", ".join(["%s"] * len(columns))
+        quoted_columns = ", ".join(f"`{column}`" for column in columns)
+        statement = f"INSERT INTO `{table}` ({quoted_columns}) VALUES ({placeholders})"
+        for row in snapshot[table]:
+            frappe.db.sql(statement, tuple(row.get(column) for column in columns))
+
+
+def setUpModule():
+    global _module_security_snapshot
+    _module_security_snapshot = _snapshot_security_rows()
+
+
+def tearDownModule():
+    after = _snapshot_security_rows()
+    before_hash = _security_snapshot_hash(_module_security_snapshot)
+    after_hash = _security_snapshot_hash(after)
+    try:
+        if after_hash != before_hash:
+            raise AssertionError(
+                f"FAC security snapshot changed: before={before_hash}, after={after_hash}"
+            )
+    finally:
+        _restore_security_rows(_module_security_snapshot)
+        frappe.db.commit()
 
 
 class TestAdminAPIPermissions(BaseAssistantTest):
@@ -33,8 +90,22 @@ class TestAdminAPIPermissions(BaseAssistantTest):
 
     @classmethod
     def setUpClass(cls):
+        # This cleanup is registered *before* BaseAssistantTest/FrappeTestCase
+        # registers its transaction rollback. Class cleanups run LIFO, so the
+        # Frappe rollback happens first and the exact full-table snapshot is
+        # then restored and committed after that transaction boundary.
+        cls._fac_security_snapshot = _snapshot_security_rows()
+        cls.addClassCleanup(cls._restore_fac_security_snapshot)
         super().setUpClass()
         cls._create_non_admin_user()
+
+    @classmethod
+    def _restore_fac_security_snapshot(cls):
+        _restore_security_rows(cls._fac_security_snapshot)
+        restored = _snapshot_security_rows()
+        if _security_snapshot_hash(restored) != _security_snapshot_hash(cls._fac_security_snapshot):
+            raise AssertionError("FAC security snapshot restoration failed")
+        frappe.db.commit()
 
     @classmethod
     def _create_non_admin_user(cls):
