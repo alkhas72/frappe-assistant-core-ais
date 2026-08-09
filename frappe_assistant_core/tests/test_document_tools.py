@@ -673,6 +673,53 @@ class TestFetchToolRedaction(BaseAssistantTest):
             self.assertFalse(is_doctype_accessible("Has Role", "System Manager"))
 
 
+class TestSecurityConfigLegacyCompat(BaseAssistantTest):
+    """FAC v2.1 (2026-08-09).
+
+    ``security_config`` keeps ``BASIC_CORE_TOOLS``, ``ROLE_TOOL_ACCESS`` and
+    the dict-form ``RESTRICTED_DOCTYPES`` for backwards-compatibility with
+    legacy imports. A naive empty dict for ``RESTRICTED_DOCTYPES`` is
+    fail-OPEN: a legacy caller doing
+    ``doctype in RESTRICTED_DOCTYPES.get(role, [])`` would get ``[]`` and
+    conclude "not restricted" for a DocType the canonical policy in fact
+    restricts. The export must remain fail-closed — every role key resolves
+    to the canonical restricted set, derived lazily from
+    ``SecurityPolicy.RESTRICTED_DOCTYPES``.
+    """
+
+    def test_legacy_restricted_doctypes_dict_proves_canonical(self):
+        """Every role key returns the canonical restricted set, not ``[]``."""
+        from frappe_assistant_core.core import security_config
+        from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES as canonical
+
+        for role in ("Assistant User", "Assistant Admin", "System Manager", "Default"):
+            legacy_list = security_config.RESTRICTED_DOCTYPES.get(role, [])
+            # Each known restricted DocType must appear in the legacy list.
+            self.assertIn("User", legacy_list, f"role={role}")
+            self.assertIn("DocType", legacy_list, f"role={role}")
+            self.assertIn("File", legacy_list, f"role={role}")
+            # And the legacy list must equal the canonical set (as a sorted
+            # list), proving there is no second hand-maintained table.
+            self.assertEqual(set(legacy_list), set(canonical))
+
+    def test_legacy_restricted_doctypes_unknown_role_fails_closed(self):
+        """An unknown role key still returns the canonical restricted set,
+        never the empty default."""
+        from frappe_assistant_core.core import security_config
+
+        legacy_list = security_config.RESTRICTED_DOCTYPES.get("Unknown Role XYZ", [])
+        self.assertIn("User", legacy_list)
+
+    def test_legacy_basic_core_tools_and_role_tool_access_inert(self):
+        """``BASIC_CORE_TOOLS`` and ``ROLE_TOOL_ACCESS`` cannot authorize
+        anything — they are empty and cannot form an alternative allow
+        system."""
+        from frappe_assistant_core.core import security_config
+
+        self.assertEqual(security_config.BASIC_CORE_TOOLS, [])
+        self.assertEqual(security_config.ROLE_TOOL_ACCESS, {})
+
+
 class TestFetchRestrictedTargetDirectCall(BaseAssistantTest):
     """FAC Task 7 rev. 2 (2026-08-09).
 

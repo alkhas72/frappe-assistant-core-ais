@@ -228,9 +228,15 @@ class MetadataTools:
                 # reader of the DocType — a privilege-escalation primitive.
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Get DocType Metadata Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            try:
+                frappe.logger("fac.metadata_tools").warning(
+                    "get doctype metadata failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Get DocType Metadata failed"}
 
     @staticmethod
     def list_doctypes(module: str = None, custom_only: bool = False) -> Dict[str, Any]:
@@ -262,9 +268,15 @@ class MetadataTools:
                 "filters_applied": {"module": module, "custom_only": custom_only},
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant List DocTypes Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            try:
+                frappe.logger("fac.metadata_tools").warning(
+                    "list doctypes failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "List DocTypes failed"}
 
     @staticmethod
     def get_permissions(doctype: str, user: str = None) -> Dict[str, Any]:
@@ -303,9 +315,15 @@ class MetadataTools:
                 "permission_rules": permission_rules,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Get Permissions Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            try:
+                frappe.logger("fac.metadata_tools").warning(
+                    "get permissions failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Get Permissions failed"}
 
     @staticmethod
     def get_workflow(doctype: str) -> Dict[str, Any]:
@@ -363,6 +381,12 @@ class MetadataTools:
                 "transitions": transitions,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Get Workflow Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            try:
+                frappe.logger("fac.metadata_tools").warning(
+                    "get workflow failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Get Workflow failed"}

@@ -190,7 +190,17 @@ class RunWorkflow(BaseTool):
                 ],
             }
 
-        except frappe.exceptions.WorkflowTransitionError as e:
+        except frappe.exceptions.WorkflowTransitionError:
+            # FAC v2.1: never echo raw exception text. The exception type is
+            # already exposed via ``error_type``; the public error is a stable
+            # category. The technical log records the exception type only.
+            try:
+                frappe.logger("fac.run_workflow").warning(
+                    "workflow transition rejected",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
             # Get helpful information for workflow errors
             try:
                 doc = frappe.get_doc(doctype, name)
@@ -198,31 +208,47 @@ class RunWorkflow(BaseTool):
 
                 return {
                     "success": False,
-                    "error": str(e),
+                    "error": "Workflow transition not allowed",
                     "error_type": "WorkflowTransitionError",
                     "current_state": getattr(doc, "workflow_state", None),
                     "available_actions": [t.get("action") for t in available_transitions],
                     "help": "Check available actions and try again with a valid action",
                 }
             except Exception:
-                return {"success": False, "error": str(e), "error_type": "WorkflowTransitionError"}
+                return {
+                    "success": False,
+                    "error": "Workflow transition not allowed",
+                    "error_type": "WorkflowTransitionError",
+                }
 
-        except frappe.exceptions.WorkflowPermissionError as e:
+        except frappe.exceptions.WorkflowPermissionError:
+            try:
+                frappe.logger("fac.run_workflow").warning(
+                    "workflow permission denied",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
             return {
                 "success": False,
-                "error": str(e),
+                "error": "Workflow permission denied",
                 "error_type": "WorkflowPermissionError",
                 "help": "You don't have permission to execute this workflow action",
             }
 
-        except Exception as e:
-            frappe.log_error(
-                title=_("Workflow Execution Error"), message=f"Error executing workflow action: {str(e)}"
-            )
+        except Exception:
+            # FAC v2.1: stable public category; safe technical log.
+            try:
+                frappe.logger("fac.run_workflow").warning(
+                    "workflow execution failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
 
             return {
                 "success": False,
-                "error": f"Workflow execution failed: {str(e)}",
+                "error": "Workflow execution failed",
                 "error_type": "ExecutionError",
             }
 

@@ -38,57 +38,88 @@ class ReportTools:
     """
 
     @staticmethod
+    def _resolve_visible_report(report_name: str):
+        """Resolve a Report document the caller is allowed to see.
+
+        Returns ``(report_doc, None)`` on success, or ``(None, error_dict)``
+        when the report is missing OR hidden from the caller. Both cases
+        produce the SAME external answer so the response cannot be used to
+        enumerate reports.
+
+        FAC v2.1: ``frappe.db.exists("Report", ...)`` is intentionally NOT
+        called before the permission check. ``frappe.has_permission`` with a
+        ``doc`` argument returns False both for missing records and for
+        records the caller cannot read, which is exactly the
+        hidden-vs-missing indistinguishability we need.
+        """
+        if not report_name:
+            return None, {"success": False, "error": "Report not available"}
+
+        # Step 1: DocType-level read permission (no doc lookup yet). Without
+        # this, do not even probe for the record's existence.
+        try:
+            if not frappe.has_permission("Report", "read"):
+                return None, {"success": False, "error": "Report not available"}
+        except Exception:
+            return None, {"success": False, "error": "Report not available"}
+
+        # Step 2: row-level read on the specific report. Missing records and
+        # hidden records both yield a non-truthy result here.
+        try:
+            visible = frappe.has_permission("Report", "read", doc=report_name)
+        except Exception:
+            visible = False
+        if not visible:
+            return None, {"success": False, "error": "Report not available"}
+
+        # Step 3: only now is it safe to load the report document.
+        try:
+            report_doc = frappe.get_doc("Report", report_name)
+        except Exception:
+            return None, {"success": False, "error": "Report not available"}
+
+        return report_doc, None
+
+    @staticmethod
     def execute_report(
         report_name: str, filters: Dict[str, Any] = None, format: str = "json"
     ) -> Dict[str, Any]:
         """Execute a Frappe report.
 
-        FAC security hardening Task 7 (2026-08-09): a report whose
-        ``ref_doctype`` resolves to a restricted DocType is refused before any
-        filter validation or execution runs. Central policy already gates the
-        ``Report`` DocType itself; this is the second lock that prevents a
-        report built on top of ``User`` / ``File`` / FAC config types from
-        leaking their data through the report surface.
+        FAC security hardening (Task 7, rev. 2.1):
+
+        * Missing and hidden reports produce the same external answer
+          ``"Report not available"`` so the response cannot be used to
+          enumerate reports.
+        * ``ref_doctype`` restricted-target + native read permission are both
+          enforced before any filter validation or execution. Restricted
+          ``ref_doctype`` also yields the same generic refusal as a missing
+          report — no "restricted DocType" leak.
+        * Raw exception text, traceback and ``str(e)`` never leave this
+          function. Public error category is stable; the technical log gets
+          only the exception type and safe context.
         """
         from frappe_assistant_core.core.security_policy import SecurityPolicy
 
+        report_doc, resolve_error = ReportTools._resolve_visible_report(report_name)
+        if resolve_error is not None:
+            return resolve_error
+
         try:
-            # Check if report exists
-            if not frappe.db.exists("Report", report_name):
-                return {"success": False, "error": f"Report '{report_name}' not found"}
-
-            # Check permissions
-            if not frappe.has_permission("Report", "read", report_name):
-                return {"success": False, "error": f"No permission to access report '{report_name}'"}
-
-            # Get report document
-            report_doc = frappe.get_doc("Report", report_name)
-
-            # Restricted-target gate on the report's reference DocType. Without
-            # this, a report authored against ``User`` or ``File`` would bypass
-            # the central policy because the tool target is ``Report``, not
-            # ``ref_doctype``.
+            # Restricted-target gate on the report's reference DocType. The
+            # external message intentionally matches the "not available"
+            # wording so the existence of a restricted-target report is not
+            # disclosed.
             ref_doctype = getattr(report_doc, "ref_doctype", None)
             if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
-                return {
-                    "success": False,
-                    "error": (
-                        f"Report '{report_name}' targets restricted DocType "
-                        f"'{ref_doctype}'"
-                    ),
-                }
+                return {"success": False, "error": "Report not available"}
 
-            # Native read permission on the report's reference DocType. Even
-            # for non-restricted DocTypes, an actor without ``read`` on
-            # ``ref_doctype`` has no business executing a report against it;
-            # we fail closed without distinguishing "no permission" from
-            # "report cannot run" to avoid leaking the existence of reports
-            # the user is not entitled to see.
+            # Native read permission on the report's reference DocType. Same
+            # hidden-vs-missing indistinguishability: a missing ref_doctype
+            # would already have been caught by Frappe at report save time;
+            # here we cover the "exists but not readable" case.
             if ref_doctype and not frappe.has_permission(ref_doctype, "read"):
-                return {
-                    "success": False,
-                    "error": f"No permission to run report '{report_name}'",
-                }
+                return {"success": False, "error": "Report not available"}
 
             # Validate filters before execution
             validation_result = ReportTools._validate_filters(filters or {}, report_doc)
@@ -116,7 +147,7 @@ class ReportTools:
                     "error": "Report Builder reports are not supported. Report Builder creates simple filtered views of DocTypes. For business intelligence and analytics, please use Script Reports, Query Reports, or Custom Reports instead.",
                 }
             else:
-                return {"success": False, "error": f"Unsupported report type: {report_doc.report_type}"}
+                return {"success": False, "error": "Unsupported report type"}
 
             # Handle different result structures
             if isinstance(result, dict):
@@ -148,7 +179,7 @@ class ReportTools:
                     "result_type": type(result).__name__ if result else "None",
                 }
             else:
-                return {"success": False, "error": f"Unexpected result type: {type(result).__name__}"}
+                return {"success": False, "error": "Unexpected report result"}
 
             # FAC Task 7 (rev. 2): redact report output against the report's
             # ``ref_doctype``, NOT against ``Report``. Report rows typically do
@@ -176,24 +207,38 @@ class ReportTools:
 
             return debug_info
 
-        except Exception as e:
-            frappe.log_error(f"assistant Execute Report Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            # FAC v2.1: never leak raw exception text. Public answer is a
+            # stable category; the technical log records only the exception
+            # type and safe context (no arguments, no result, no filters).
+            try:
+                frappe.logger("fac.report_tools").warning(
+                    "execute_report failed",
+                    exc_info=True,
+                )
+            except Exception:
+                # Logging must never propagate a second failure.
+                pass
+            return {"success": False, "error": "Report execution failed"}
 
     @staticmethod
     def _redact_report_output(debug_info: Dict[str, Any], ref_doctype: Optional[str]) -> Dict[str, Any]:
         """Apply ref_doctype-aware redaction to report rows and columns.
 
-        Two-layer fail-closed:
+        FAC v2.1 — three layers, all fail-closed:
 
         1. **Rows**: ``SecurityPolicy.redact_output`` with an explicit
-           ``ref_doctype`` context applies universal + DocType-specific
-           sensitive fields even when the row has no ``doctype`` key.
+           ``ref_doctype`` context. Dict rows are redacted in place; list and
+           tuple rows are positional — we map column index → fieldname and
+           redact or drop sensitive positions so columns and rows stay
+           consistent. A row's ``doctype`` key (if any) is ignored — it cannot
+           override the report's ``ref_doctype`` (proven by the malicious-row
+           test).
         2. **Columns**: any column whose ``fieldname`` is itself a sensitive
            name (e.g. ``password``, ``api_key``) is dropped from the column
-           list and its value is removed from every row. This is the verified
-           fail-closed mechanism for Query/Script Reports whose column
-           definitions can alias sensitive fields under a different label.
+           list and its value is removed from every row (dict, list, tuple).
+        3. **Filters**: universal redaction in case a sensitive value was
+           pasted into a filter.
         """
         from frappe_assistant_core.core.security_policy import (
             SecurityPolicy,
@@ -211,24 +256,23 @@ class ReportTools:
             required_permissions=frozenset({"read"}),
         )
 
-        data = debug_info.get("data")
-        if isinstance(data, list):
-            debug_info["data"] = [SecurityPolicy.redact_output(ctx, row) for row in data]
-        elif data is not None:
-            debug_info["data"] = SecurityPolicy.redact_output(ctx, data)
-
-        # Column-level fail-closed: identify sensitive column fieldnames and
-        # drop both the column entry and the per-row value.
+        # Step 1 — column pre-scan. Identifies sensitive column fieldnames and
+        # builds an index→fieldname map for positional rows. ``debug_info`` is
+        # mutated to drop sensitive columns immediately.
         columns = debug_info.get("columns")
         sensitive_column_fields: set = set()
-        if isinstance(columns, list) and columns:
+        positional_fieldname_by_index: Dict[int, str] = {}
+        if isinstance(columns, list):
             kept_columns = []
-            for col in columns:
-                # Columns may be dicts (``{"fieldname": ..., "label": ...}``)
-                # or strings. Only dict columns carry a fieldname to check.
+            for index, col in enumerate(columns):
+                fieldname: Optional[str] = None
                 if isinstance(col, dict):
                     fieldname = col.get("fieldname") or col.get("field_name")
-                    if isinstance(fieldname, str) and SecurityPolicy._contains_restricted_fields(
+                elif isinstance(col, str):
+                    fieldname = col
+                if isinstance(fieldname, str):
+                    positional_fieldname_by_index[index] = fieldname
+                    if SecurityPolicy._contains_restricted_fields(
                         ref_doctype, frozenset({fieldname})
                     ):
                         sensitive_column_fields.add(fieldname)
@@ -236,15 +280,60 @@ class ReportTools:
                 kept_columns.append(col)
             debug_info["columns"] = kept_columns
 
-        if sensitive_column_fields:
-            data = debug_info.get("data")
-            if isinstance(data, list):
-                debug_info["data"] = [
-                    {k: v for k, v in row.items() if k not in sensitive_column_fields}
-                    if isinstance(row, dict)
-                    else row
-                    for row in data
-                ]
+        def _redact_dict_row(row: Dict[str, Any]) -> Dict[str, Any]:
+            # Enforce ref_doctype by stripping any caller-supplied ``doctype``
+            # before central redaction runs. Otherwise a malicious row could
+            # claim ``doctype="Customer"`` to bypass User/File/Role-specific
+            # sensitive fields (FAC v2.1, malicious-row test).
+            if "doctype" in row:
+                row = {k: v for k, v in row.items() if k != "doctype"}
+            row = SecurityPolicy.redact_output(ctx, row)
+            if sensitive_column_fields:
+                row = {k: v for k, v in row.items() if k not in sensitive_column_fields}
+            return row
+
+        def _redact_positional_row(row):
+            row_type = type(row)
+            values = list(row)
+            redacted: list = []
+            for index, value in enumerate(values):
+                fieldname = positional_fieldname_by_index.get(index)
+                if fieldname and fieldname in sensitive_column_fields:
+                    # Sensitive position: drop the value entirely. Columns and
+                    # rows stay consistent because the column was dropped too.
+                    continue
+                if fieldname and SecurityPolicy._contains_restricted_fields(
+                    ref_doctype, frozenset({fieldname})
+                ):
+                    redacted.append("***REDACTED***")
+                    continue
+                redacted.append(SecurityPolicy.redact_output(ctx, value))
+            # Preserve list vs tuple shape. Other positional shapes (set, ...)
+            # are not produced by Frappe reports — fall back to list.
+            if row_type is tuple:
+                return tuple(redacted)
+            return redacted
+
+        data = debug_info.get("data")
+        if isinstance(data, list):
+            new_rows: list = []
+            for row in data:
+                if isinstance(row, dict):
+                    new_rows.append(_redact_dict_row(row))
+                elif isinstance(row, (list, tuple)):
+                    new_rows.append(_redact_positional_row(row))
+                else:
+                    # Scalar row — leave central sink to handle it.
+                    new_rows.append(SecurityPolicy.redact_output(ctx, row))
+            debug_info["data"] = new_rows
+        elif isinstance(data, dict):
+            debug_info["data"] = _redact_dict_row(data)
+        elif isinstance(data, (list, tuple)) and not isinstance(data, list):
+            # ``data`` itself is a tuple of rows — normalise to list.
+            debug_info["data"] = [_redact_positional_row(r) if isinstance(r, (list, tuple))
+                                  else _redact_dict_row(r) if isinstance(r, dict)
+                                  else r
+                                  for r in data]
 
         # Filters may carry a sensitive value (e.g. a token mistakenly pasted
         # into a filter). Apply universal redaction.
@@ -322,46 +411,38 @@ class ReportTools:
                 "filters_applied": {"module": module, "report_type": report_type},
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant List Reports Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            # FAC v2.1: stable public category; technical log records only the
+            # exception type and a safe context tag (no arguments, no rows).
+            try:
+                frappe.logger("fac.report_tools").warning(
+                    "list_reports failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Report listing failed"}
 
     @staticmethod
     def get_report_columns(report_name: str) -> Dict[str, Any]:
         """Get column information for a report.
 
-        FAC security hardening Task 7 (2026-08-09): a report whose
-        ``ref_doctype`` is restricted is refused before any column extraction
-        runs, mirroring ``execute_report``.
+        FAC v2.1: missing and hidden reports produce the same external answer
+        via ``_resolve_visible_report``; ``ref_doctype`` restricted/hidden
+        refusal uses the same generic wording. Raw exception text never leaks.
         """
         from frappe_assistant_core.core.security_policy import SecurityPolicy
 
+        report_doc, resolve_error = ReportTools._resolve_visible_report(report_name)
+        if resolve_error is not None:
+            return resolve_error
+
         try:
-            if not frappe.db.exists("Report", report_name):
-                return {"success": False, "error": f"Report '{report_name}' not found"}
-
-            if not frappe.has_permission("Report", "read", report_name):
-                return {"success": False, "error": f"No permission to access report '{report_name}'"}
-
-            report_doc = frappe.get_doc("Report", report_name)
-
             ref_doctype = getattr(report_doc, "ref_doctype", None)
             if ref_doctype and SecurityPolicy._is_restricted_target(ref_doctype):
-                return {
-                    "success": False,
-                    "error": (
-                        f"Report '{report_name}' targets restricted DocType "
-                        f"'{ref_doctype}'"
-                    ),
-                }
-            # Native read permission on the reference DocType. Same
-            # hidden-vs-missing indistinguishability contract as
-            # ``execute_report``.
+                return {"success": False, "error": "Report not available"}
             if ref_doctype and not frappe.has_permission(ref_doctype, "read"):
-                return {
-                    "success": False,
-                    "error": f"No permission to access report '{report_name}'",
-                }
+                return {"success": False, "error": "Report not available"}
 
             columns = []
 
@@ -381,7 +462,14 @@ class ReportTools:
                             )
                             columns = result.get("columns", [])
                     except Exception:
-                        frappe.log_error(f"Error getting columns from query report: {str(e)}")
+                        # FAC v2.1: log type + safe context only (no str(e)).
+                        try:
+                            frappe.logger("fac.report_tools").warning(
+                                "query-report column extraction failed",
+                                exc_info=True,
+                            )
+                        except Exception:
+                            pass
                         # Return basic info if column extraction fails
                         columns = [
                             {
@@ -415,9 +503,17 @@ class ReportTools:
 
             return result
 
-        except Exception as e:
-            frappe.log_error(f"assistant Get Report Columns Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            # FAC v2.1: never echo raw exception text. The internal log gets
+            # the exception type only; the caller sees a stable category.
+            try:
+                frappe.logger("fac.report_tools").warning(
+                    "get_report_columns failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Report not available"}
 
     @staticmethod
     def _handle_prepared_report_execution(report_doc, filters):
@@ -483,8 +579,16 @@ class ReportTools:
                             "status": "completed",
                         }
                 except Exception as e:
-                    # Quick execution failed, fall through to background job
-                    frappe.log_error(f"Quick execution failed for {report_doc.name}: {str(e)}")
+                    # Quick execution failed, fall through to background job.
+                    # FAC v2.1: safe logging only — exception type + safe
+                    # context tag, never the raw message.
+                    try:
+                        frappe.logger("fac.report_tools").warning(
+                            "quick prepared-report execution failed",
+                            exc_info=True,
+                        )
+                    except Exception:
+                        pass
 
             # ===== Queue and WAIT for completion with polling =====
 
@@ -552,9 +656,17 @@ class ReportTools:
                 "wait_time_seconds": int(elapsed_time),
             }
 
-        except Exception as e:
-            frappe.log_error(f"Prepared report handling error for {report_doc.name}: {str(e)}")
-            raise e
+        except Exception:
+            # FAC v2.1: safe logging only. Re-raise so the outer
+            # ``execute_report`` handler can convert to a stable public answer.
+            try:
+                frappe.logger("fac.report_tools").warning(
+                    "prepared-report handling failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            raise
 
     @staticmethod
     def _execute_query_report(report_doc, filters, get_columns_only=False):
@@ -657,15 +769,23 @@ class ReportTools:
                 result["_final_filters"] = filters
             return result
         except Exception as e:
-            # If execution fails, try to get just column info
-            if "company" in str(e).lower() and "required" in str(e).lower():
+            # FAC v2.1: detect the "company required" condition by exception
+            # type/message locally (no public leak), then return a stable
+            # message. ``str(e)`` is used only for branching here; it never
+            # reaches the public response.
+            lowered = ""
+            try:
+                lowered = str(e).lower()
+            except Exception:
+                lowered = ""
+            if "company" in lowered and "required" in lowered:
                 return {
                     "result": [],
                     "columns": [],
-                    "message": f"Report requires filters: {str(e)}",
+                    "message": "Report requires additional mandatory filters",
                     "error": "missing_required_filters",
                 }
-            raise e
+            raise
 
     @staticmethod
     def _execute_script_report(report_doc, filters):
@@ -778,23 +898,54 @@ class ReportTools:
             return result
 
         except Exception as e:
-            frappe.log_error(f"Script report execution error for {report_doc.name}: {str(e)}")
+            # FAC v2.1: never leak raw exception text in the public response or
+            # in the technical log. We use ``str(e)`` ONLY for local branching
+            # (matching known mandatory-filter messages) and emit a stable
+            # public message; the technical log records the type + safe tag.
+            try:
+                frappe.logger("fac.report_tools").warning(
+                    "script-report execution failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
 
-            # Provide helpful error messages for common issues
-            error_message = str(e)
-            if "'NoneType' object has no attribute 'startswith'" in error_message:
-                error_message = f"Missing required filters for {report_doc.name}. This report requires mandatory filters that were not provided. Use the report_requirements tool to discover required filters."
+            raw = ""
+            try:
+                raw = str(e)
+            except Exception:
+                raw = ""
+            lowered = raw.lower()
+
+            # Provide helpful, STABLE messages for common issues — without
+            # echoing the raw exception text.
+            if "'NoneType' object has no attribute 'startswith'" in raw:
+                error_message = (
+                    f"Missing required filters for {report_doc.name}. This "
+                    f"report requires mandatory filters that were not "
+                    f"provided. Use the report_requirements tool to discover "
+                    f"required filters."
+                )
                 if "sales_analytics" in report_doc.name.lower():
-                    error_message += " For Sales Analytics, you need: 'doc_type' (e.g., 'Sales Invoice') and 'tree_type' (e.g., 'Customer')."
-            elif "required" in error_message.lower() and any(
-                word in error_message.lower() for word in ["filter", "field", "parameter"]
+                    error_message += (
+                        " For Sales Analytics, you need: 'doc_type' (e.g., "
+                        "'Sales Invoice') and 'tree_type' (e.g., 'Customer')."
+                    )
+            elif "required" in lowered and any(
+                word in lowered for word in ["filter", "field", "parameter"]
             ):
-                error_message = f"Missing required filters for {report_doc.name}: {error_message}. Use the report_requirements tool to discover all required filters."
+                error_message = (
+                    f"Missing required filters for {report_doc.name}. Use "
+                    f"the report_requirements tool to discover all required "
+                    f"filters."
+                )
+            else:
+                error_message = "Script report execution failed"
 
             return {
                 "result": [],
                 "columns": [],
-                "message": f"Script report execution failed: {error_message}",
+                "message": error_message,
                 "error": error_message,
                 "suggestion": f"Use report_requirements tool with report_name='{report_doc.name}' to discover required filters, then retry with proper filters.",
             }
@@ -1038,8 +1189,16 @@ class ReportTools:
 
                     break  # Found and processed the JS file
 
-        except Exception as e:
-            # Log error but don't fail the report execution
-            frappe.log_error(f"Error applying filter defaults for {report_doc.name}: {str(e)}")
+        except Exception:
+            # FAC v2.1: safe logging only — never echo raw exception text.
+            # Filter-default application is best-effort; falling through to
+            # the caller-provided filters is the intended fallback.
+            try:
+                frappe.logger("fac.report_tools").warning(
+                    "filter-default application failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
 
         return filters

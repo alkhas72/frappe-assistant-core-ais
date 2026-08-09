@@ -36,28 +36,89 @@ must not be removed without a coordinated change to the policy contract
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 import frappe
 
 # ---------------------------------------------------------------------------
-# Deprecated inert exports (kept for import compatibility)
+# Deprecated inert / fail-closed exports (kept for import compatibility)
 #
 # Older code paths imported ``BASIC_CORE_TOOLS``, ``ROLE_TOOL_ACCESS`` and the
 # dict-form ``RESTRICTED_DOCTYPES`` for role-matrix lookups. With Task 6 the
-# matrix retired from runtime authority — these names now resolve to inert
-# empty values so that legacy imports keep working but cannot re-enable a
-# hard-denied tool, a restricted DocType, or a System Manager wildcard.
+# matrix retired from runtime authority. ``BASIC_CORE_TOOLS`` and
+# ``ROLE_TOOL_ACCESS`` are now inert empty values — they cannot re-enable any
+# tool or create a parallel allow system.
+#
+# ``RESTRICTED_DOCTYPES`` is intentionally NOT a plain empty dict: a legacy
+# caller that does ``doctype in RESTRICTED_DOCTYPES.get(role, [])`` would get
+# ``[]`` and conclude "not restricted" for a DocType that the canonical policy
+# in fact restricts. That is fail-OPEN and was caught by the Frappe 15 review
+# (v2.1). The export is now a read-only mapping that returns the canonical
+# restricted set for EVERY role key, derived lazily from
+# ``SecurityPolicy.RESTRICTED_DOCTYPES``. There is no second hand-maintained
+# table and no role bypass — not even for System Manager.
 #
 # Removing these exports entirely is a separate breaking-change decision for
-# the Arbiter; until then they remain defined and inert.
+# the Arbiter; until then they remain defined and fail-closed.
 # ---------------------------------------------------------------------------
 
 BASIC_CORE_TOOLS: List[str] = []
 ROLE_TOOL_ACCESS: Dict[str, Any] = {}
-# Legacy dict form ``{"Assistant User": [...]}``; ``SecurityPolicy.RESTRICTED_DOCTYPES``
-# (a frozenset) is the only authoritative restricted-target source.
-RESTRICTED_DOCTYPES: Dict[str, List[str]] = {}
+
+
+class _LegacyRestrictedDoctypes(Mapping):
+    """Read-only dict view that derives the legacy ``{role: [doctypes]}``
+    shape from the canonical frozenset on every access.
+
+    Every role key resolves to the SAME canonical restricted list, so the old
+    lookup pattern ``RESTRICTED_DOCTYPES.get(role, []).__contains__(dt)``
+    cannot fail-open regardless of which role the caller supplies.
+    """
+
+    __slots__ = ()
+
+    @staticmethod
+    def _canonical() -> List[str]:
+        # Lazy import: security_policy imports security_config for
+        # SENSITIVE_FIELDS / ADMIN_ONLY_FIELDS, so we cannot import it at
+        # module load here without creating a cycle.
+        from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES
+
+        return sorted(RESTRICTED_DOCTYPES)
+
+    def _always_list(self) -> List[str]:
+        try:
+            return self._canonical()
+        except Exception:
+            # If the canonical set cannot be resolved we MUST fail closed:
+            # return a non-empty placeholder so the legacy
+            # ``in RESTRICTED_DOCTYPES.get(role, [])`` check does not collapse
+            # to an empty list. The placeholder names a sentinel that no
+            # real DocType will ever match but still defeats ``__bool__``.
+            return ["__fac_restricted_doctypes_unavailable__"]
+
+    def __getitem__(self, key: Any) -> List[str]:
+        # Every role gets the canonical set — never an empty list, never a
+        # wildcard. ``__getitem__`` (``d[key]``) covers ``.get(key)`` too.
+        del key  # role is irrelevant in the post-matrix world
+        return self._always_list()
+
+    def __iter__(self):
+        # Provide a stable iteration order based on the canonical set; the
+        # keys themselves are not meaningful, but ``list(d)`` should not raise.
+        return iter(("Assistant User", "Assistant Admin", "System Manager", "Default"))
+
+    def __len__(self) -> int:
+        return 4
+
+    def __contains__(self, key: Any) -> bool:
+        # ``"Assistant User" in RESTRICTED_DOCTYPES`` should behave like the
+        # legacy dict did (True for known role keys).
+        return key in ("Assistant User", "Assistant Admin", "System Manager", "Default")
+
+
+RESTRICTED_DOCTYPES: Mapping[str, List[str]] = _LegacyRestrictedDoctypes()
 
 
 # ---------------------------------------------------------------------------

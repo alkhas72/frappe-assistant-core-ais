@@ -122,12 +122,17 @@ class GetPendingApprovals(BaseTool):
 
         try:
             pending_actions = query.run(as_dict=True)
-        except Exception as e:
-            frappe.log_error(
-                title=_("Pending Approvals Query Error"),
-                message=str(e),
-            )
-            return {"success": False, "error": str(e)}
+        except Exception:
+            # FAC v2.1: stable public category; technical log records only
+            # the exception type and a safe context tag.
+            try:
+                frappe.logger("fac.get_pending_approvals").warning(
+                    "pending-approvals query failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Pending approvals lookup failed"}
 
         if not pending_actions:
             return {

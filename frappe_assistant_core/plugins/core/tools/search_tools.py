@@ -160,9 +160,15 @@ class SearchTools:
                 "searched_doctypes": searched,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Global Search Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            try:
+                frappe.logger("fac.search_tools").warning(
+                    "global search failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Global Search failed"}
 
     @staticmethod
     def search_doctype(doctype: str, query: str, limit: int = 20) -> Dict[str, Any]:
@@ -230,9 +236,15 @@ class SearchTools:
                 "search_fields": search_fields,
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant DocType Search Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            try:
+                frappe.logger("fac.search_tools").warning(
+                    "doctype search failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "DocType Search failed"}
 
     @staticmethod
     def search_link(doctype: str, query: str, filters: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -269,6 +281,12 @@ class SearchTools:
                 "filters_applied": filters or {},
             }
 
-        except Exception as e:
-            frappe.log_error(f"assistant Link Search Error: {str(e)}")
-            return {"success": False, "error": str(e)}
+        except Exception:
+            try:
+                frappe.logger("fac.search_tools").warning(
+                    "link search failed",
+                    exc_info=True,
+                )
+            except Exception:
+                pass
+            return {"success": False, "error": "Link Search failed"}
