@@ -12,8 +12,10 @@ FrappeTestCase transaction rollback are secondary safeguards, not the only
 isolation mechanism.
 """
 
+import hashlib
 import importlib
 import inspect as pyinspect
+import json
 import os
 import re
 from types import SimpleNamespace
@@ -27,6 +29,60 @@ from frappe_assistant_core.patches.v2_5.harden_fac_tool_access_defaults import e
 TOOL_CONFIG_DOCTYPE = "FAC Tool Configuration"
 ROLE_ACCESS_DOCTYPE = "FAC Tool Role Access"
 PLUGIN_CONFIG_DOCTYPE = "FAC Plugin Configuration"
+
+SNAPSHOT_TABLES = (
+    "tabFAC Tool Role Access",
+    "tabFAC Tool Configuration",
+    "tabFAC Plugin Configuration",
+)
+
+_module_security_snapshot = None
+
+
+def _snapshot_security_rows():
+    return {
+        table: frappe.db.sql(f"SELECT * FROM `{table}` ORDER BY name", as_dict=True)
+        for table in SNAPSHOT_TABLES
+    }
+
+
+def _security_snapshot_hash(snapshot):
+    serialized = json.dumps(snapshot, default=str, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _restore_security_rows(snapshot):
+    for table in SNAPSHOT_TABLES:
+        columns = [
+            column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)
+        ]
+        frappe.db.sql(f"DELETE FROM `{table}`")
+        if not snapshot[table]:
+            continue
+        placeholders = ", ".join(["%s"] * len(columns))
+        quoted_columns = ", ".join(f"`{column}`" for column in columns)
+        statement = f"INSERT INTO `{table}` ({quoted_columns}) VALUES ({placeholders})"
+        for row in snapshot[table]:
+            frappe.db.sql(statement, tuple(row.get(column) for column in columns))
+
+
+def setUpModule():
+    global _module_security_snapshot
+    _module_security_snapshot = _snapshot_security_rows()
+
+
+def tearDownModule():
+    after = _snapshot_security_rows()
+    before_hash = _security_snapshot_hash(_module_security_snapshot)
+    after_hash = _security_snapshot_hash(after)
+    try:
+        if after_hash != before_hash:
+            raise AssertionError(
+                f"FAC security snapshot changed: before={before_hash}, after={after_hash}"
+            )
+    finally:
+        _restore_security_rows(_module_security_snapshot)
+        frappe.db.commit()
 
 PATCH_MODULE = "frappe_assistant_core.patches.v2_5.harden_fac_tool_access_defaults"
 
@@ -159,45 +215,24 @@ class FACSecuritySnapshotTestCase(FrappeTestCase):
     ``tearDown``.
     """
 
-    _snapshot_tables = (
-        "tabFAC Tool Role Access",
-        "tabFAC Tool Configuration",
-        "tabFAC Plugin Configuration",
-    )
+    _snapshot_tables = SNAPSHOT_TABLES
 
     def setUp(self):
         super().setUp()
-        self._fac_security_snapshot = {
-            table: frappe.db.sql(f"SELECT * FROM `{table}` ORDER BY name", as_dict=True)
-            for table in self._snapshot_tables
-        }
-
-    def _restore_table(self, table, rows):
-        columns = [
-            column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)
-        ]
-        frappe.db.sql(f"DELETE FROM `{table}`")
-        if not rows:
-            return
-        placeholders = ", ".join(["%s"] * len(columns))
-        quoted_columns = ", ".join(f"`{column}`" for column in columns)
-        statement = f"INSERT INTO `{table}` ({quoted_columns}) VALUES ({placeholders})"
-        for row in rows:
-            frappe.db.sql(statement, tuple(row.get(column) for column in columns))
+        self._fac_security_snapshot = _snapshot_security_rows()
 
     def _restore_fac_security_snapshot(self):
-        # Child rows must be removed first and restored after their parents.
-        for table in self._snapshot_tables:
-            self._restore_table(table, self._fac_security_snapshot[table])
+        _restore_security_rows(self._fac_security_snapshot)
 
     def tearDown(self):
         try:
             self._restore_fac_security_snapshot()
-            restored = {
-                table: frappe.db.sql(f"SELECT * FROM `{table}` ORDER BY name", as_dict=True)
-                for table in self._snapshot_tables
-            }
+            restored = _snapshot_security_rows()
             self.assertEqual(restored, self._fac_security_snapshot)
+            # FrappeTestCase rolls back its class transaction after individual
+            # tearDown calls. Commit the exact snapshot so that rollback cannot
+            # resurrect a prior mutation (including `modified` metadata).
+            frappe.db.commit()
         finally:
             super().tearDown()
 
