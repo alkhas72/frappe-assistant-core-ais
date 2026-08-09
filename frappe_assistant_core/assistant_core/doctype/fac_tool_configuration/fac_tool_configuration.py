@@ -12,6 +12,10 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 
+from frappe_assistant_core.core.security_policy import HARD_DENY_TOOLS
+
+VALID_ROLE_ACCESS_MODES = ("Deny All", "Restrict to Listed Roles")
+
 
 class FACToolConfiguration(Document):
     """
@@ -21,11 +25,11 @@ class FACToolConfiguration(Document):
         tool_name: Unique identifier for the tool
         plugin_name: Name of the plugin that provides this tool
         description: Tool description
-        enabled: Whether the tool is enabled (default: 1)
+        enabled: Whether the tool is enabled (default: 0, deny by default)
         tool_category: Category of the tool (read_only, write, read_write, privileged)
         auto_detected_category: Automatically detected category
         category_override: Whether the category has been manually overridden
-        role_access_mode: Access mode (Allow All, Restrict to Listed Roles)
+        role_access_mode: Access mode (Deny All, Restrict to Listed Roles)
         role_access: Child table of roles with access
         source_app: Source application providing the tool
         module_path: Python module path for the tool
@@ -46,9 +50,21 @@ class FACToolConfiguration(Document):
             self.tool_category = self.auto_detected_category
 
     def _validate_role_access(self):
-        """Validate role access configuration."""
-        if self.role_access_mode == "Restrict to Listed Roles" and not self.role_access:
-            frappe.throw(_("Please add at least one role when using 'Restrict to Listed Roles' mode"))
+        """Validate role access configuration (fail closed)."""
+        if self.role_access_mode not in VALID_ROLE_ACCESS_MODES:
+            frappe.throw(
+                _("Role Access Mode must be one of: {0}").format(", ".join(VALID_ROLE_ACCESS_MODES))
+            )
+
+        if self.role_access_mode == "Restrict to Listed Roles":
+            valid_rows = [row for row in (self.role_access or []) if row.role and row.allow_access]
+            if not valid_rows:
+                frappe.throw(
+                    _("Please add at least one role when using 'Restrict to Listed Roles' mode")
+                )
+            for row in valid_rows:
+                if not frappe.db.exists("Role", row.role):
+                    frappe.throw(_("Role '{0}' does not exist").format(row.role))
 
     def on_update(self):
         """Clear caches when tool configuration changes."""
@@ -69,6 +85,12 @@ class FACToolConfiguration(Document):
         """
         Check if a user has access to this tool based on role configuration.
 
+        Fail closed: access is granted only when the tool is enabled, the mode
+        is 'Restrict to Listed Roles' and one of the user's roles is listed
+        with allow_access set. Every other state — disabled tool, 'Deny All',
+        legacy or unknown modes, empty role list — denies access. There is no
+        System Manager or Administrator bypass.
+
         Args:
             user: User email (defaults to current session user)
 
@@ -81,16 +103,12 @@ class FACToolConfiguration(Document):
         if not self.enabled:
             return False
 
-        # Allow All mode - everyone has access
-        if self.role_access_mode == "Allow All":
-            return True
-
-        # System Manager always has access
-        user_roles = set(frappe.get_roles(user))
-        if "System Manager" in user_roles:
-            return True
+        # Only an explicit restricted allowlist can grant access
+        if self.role_access_mode != "Restrict to Listed Roles":
+            return False
 
         # Check if any of user's roles are in the allowed list
+        user_roles = set(frappe.get_roles(user))
         for role_access in self.role_access:
             if role_access.role in user_roles and role_access.allow_access:
                 return True
@@ -127,21 +145,24 @@ def get_tool_access_status(tool_name: str, user: str = None) -> dict:
             "tool_category": config.tool_category,
         }
     except frappe.DoesNotExistError:
-        # No config means tool is allowed by default
+        # No config means the tool is denied by default
         return {
             "tool_name": tool_name,
             "user": user,
-            "has_access": True,
-            "enabled": True,
-            "role_access_mode": "Allow All",
+            "has_access": False,
+            "enabled": False,
+            "role_access_mode": "Deny All",
             "tool_category": None,
-            "note": "No configuration exists - using defaults",
+            "note": "No configuration exists - access denied by default",
         }
 
 
 def toggle_tool(tool_name: str, enabled: bool) -> dict:
     """
     Enable or disable a tool.
+
+    Hard-denied tools (see ``core.security_policy.HARD_DENY_TOOLS``) can never
+    be enabled through this path.
 
     Args:
         tool_name: Name of the tool
@@ -150,6 +171,12 @@ def toggle_tool(tool_name: str, enabled: bool) -> dict:
     Returns:
         Dict with success status
     """
+    if enabled and tool_name in HARD_DENY_TOOLS:
+        return {
+            "success": False,
+            "message": _("Tool '{0}' is hard-denied and cannot be enabled").format(tool_name),
+        }
+
     try:
         config = frappe.get_doc("FAC Tool Configuration", tool_name)
         config.enabled = 1 if enabled else 0

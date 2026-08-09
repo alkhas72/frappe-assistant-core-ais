@@ -108,20 +108,20 @@ def after_install():
     try:
         frappe.logger("migration_hooks").info("Initializing tool discovery after app install")
 
-        from frappe_assistant_core.core.enhanced_tool_registry import get_tool_registry
+        from frappe_assistant_core.core.tool_registry import get_tool_registry
 
         # Discover and cache tools
         registry = get_tool_registry()
-        result = registry.refresh_tools(force=True)
+        refreshed = registry.refresh_tools()
 
-        if result.get("success"):
-            tools_discovered = result.get("tools_discovered", 0)
+        if refreshed:
+            stats = registry.get_stats()
+            tools_discovered = stats.get("total_tools", 0)
             frappe.logger("migration_hooks").info(
                 f"Tool discovery initialized: {tools_discovered} tools found"
             )
         else:
-            error = result.get("error", "Unknown error")
-            frappe.logger("migration_hooks").warning(f"Tool discovery initialization had issues: {error}")
+            frappe.logger("migration_hooks").warning("Tool discovery initialization had issues")
 
     except Exception as e:
         frappe.logger("migration_hooks").error(f"Failed to initialize tool discovery: {str(e)}")
@@ -280,7 +280,7 @@ def get_migration_status() -> Dict[str, Any]:
         Status dictionary with cache and discovery information
     """
     try:
-        from frappe_assistant_core.core.enhanced_tool_registry import get_tool_registry
+        from frappe_assistant_core.core.tool_registry import get_tool_registry
         from frappe_assistant_core.utils.tool_cache import get_tool_cache
 
         cache = get_tool_cache()
@@ -288,7 +288,7 @@ def get_migration_status() -> Dict[str, Any]:
 
         return {
             "cache_stats": cache.get_cache_stats(),
-            "registry_stats": registry.get_registry_stats(),
+            "registry_stats": registry.get_stats(),
             "migration_hooks_active": True,
         }
 
@@ -819,7 +819,10 @@ def _sync_plugin_configurations():
     This function:
     1. Discovers all available plugins
     2. Creates FAC Plugin Configuration records for new plugins
-    3. Removes orphan configurations for plugins that no longer exist
+       (deny by default: only the technically required "core" plugin starts
+       enabled; every other new plugin starts disabled)
+    3. Never deletes configurations for plugins that are absent from
+       discovery (absence cannot prove a config is obsolete)
     4. Preserves existing plugin enabled/disabled states
     5. Does NOT modify existing configurations (preserves user changes)
     """
@@ -835,23 +838,9 @@ def _sync_plugin_configurations():
 
         discovery = PluginDiscovery()
         discovered_plugins = discovery.discover_plugins()
-        discovered_plugin_names = set(discovered_plugins.keys())
-
-        # Load existing enabled state from legacy JSON (for migration)
-        legacy_enabled = set()
-        try:
-            settings = frappe.get_single("Assistant Core Settings")
-            enabled_list = getattr(settings, "enabled_plugins_list", None)
-            if enabled_list:
-                import json
-
-                legacy_enabled = set(json.loads(enabled_list))
-        except Exception:
-            pass
 
         created_count = 0
         skipped_count = 0
-        deleted_count = 0
 
         # Create new plugin configurations
         for plugin_name, plugin_info in discovered_plugins.items():
@@ -859,9 +848,9 @@ def _sync_plugin_configurations():
                 skipped_count += 1
                 continue
 
-            # Determine if plugin should be enabled
-            # Use legacy JSON state if available, otherwise default to enabled
-            is_enabled = 1 if plugin_name in legacy_enabled or not legacy_enabled else 0
+            # Deny by default: only the technically required core plugin may
+            # start enabled; every other new plugin starts disabled.
+            is_enabled = 1 if plugin_name == "core" else 0
 
             # Create configuration
             config = frappe.new_doc("FAC Plugin Configuration")
@@ -875,30 +864,10 @@ def _sync_plugin_configurations():
             config.insert()
             created_count += 1
 
-        # Cleanup orphan plugin configurations (plugins that no longer exist)
-        existing_configs = frappe.get_all("FAC Plugin Configuration", pluck="plugin_name")
-        for config_name in existing_configs:
-            if config_name not in discovered_plugin_names:
-                try:
-                    frappe.delete_doc(
-                        "FAC Plugin Configuration",
-                        config_name,
-                        force=True,
-                        ignore_permissions=True,
-                    )
-                    deleted_count += 1
-                    frappe.logger("migration_hooks").info(
-                        f"Removed orphan plugin configuration: {config_name}"
-                    )
-                except Exception as e:
-                    frappe.logger("migration_hooks").warning(
-                        f"Failed to delete orphan plugin config '{config_name}': {e}"
-                    )
-
         frappe.db.commit()
 
         frappe.logger("migration_hooks").info(
-            f"Plugin configurations synced: {created_count} created, {skipped_count} already exist, {deleted_count} removed"
+            f"Plugin configurations synced: {created_count} created, {skipped_count} already exist"
         )
 
     except Exception as e:
@@ -934,9 +903,13 @@ def _sync_tool_configurations():
 
     This function:
     1. Discovers all tools from enabled plugins
-    2. Creates FAC Tool Configuration records for new tools
+    2. Creates FAC Tool Configuration records for new tools, deny by default
+       (disabled + 'Deny All'), including external tools
     3. Auto-detects tool categories
-    4. Removes orphan configurations for tools that no longer exist
+    4. Never deletes configurations for tools that are absent from discovery:
+       a disabled plugin temporarily excludes its tools from discovery, so
+       absence cannot prove a config is obsolete, and re-enabling a plugin
+       must not recreate a permissive record
     5. Does NOT modify existing configurations (preserves user changes)
     """
     try:
@@ -953,18 +926,13 @@ def _sync_tool_configurations():
         plugin_manager = get_plugin_manager()
 
         # Get all tools from all discovered plugins (not just enabled)
-        discovered_plugins = plugin_manager.get_discovered_plugins()
         all_tools = plugin_manager.get_all_tools()
 
         # Also get external tools from hooks
         external_tools = _get_external_tools_for_sync()
 
-        # Build set of all discovered tool names
-        discovered_tool_names = set(all_tools.keys()) | set(external_tools.keys())
-
         created_count = 0
         skipped_count = 0
-        deleted_count = 0
 
         # Process plugin tools
         for tool_name, tool_info in all_tools.items():
@@ -978,16 +946,16 @@ def _sync_tool_configurations():
             except Exception:
                 category = "read_write"
 
-            # Create configuration
+            # Create configuration (deny by default)
             config = frappe.new_doc("FAC Tool Configuration")
             config.tool_name = tool_name
             config.plugin_name = tool_info.plugin_name
             config.description = tool_info.description or ""
-            config.enabled = 1  # Default to enabled
+            config.enabled = 0  # Disabled until explicitly configured
             config.tool_category = category
             config.auto_detected_category = category
             config.category_override = 0
-            config.role_access_mode = "Allow All"
+            config.role_access_mode = "Deny All"
             config.source_app = getattr(tool_info.instance, "source_app", "frappe_assistant_core")
             config.module_path = (
                 f"{tool_info.instance.__class__.__module__}.{tool_info.instance.__class__.__name__}"
@@ -1007,11 +975,11 @@ def _sync_tool_configurations():
             config.tool_name = tool_name
             config.plugin_name = "custom_tools"
             config.description = tool_data.get("description", "")
-            config.enabled = 1
+            config.enabled = 0  # Disabled until explicitly configured
             config.tool_category = "read_write"  # Default for external tools
             config.auto_detected_category = "read_write"
             config.category_override = 0
-            config.role_access_mode = "Allow All"
+            config.role_access_mode = "Deny All"
             config.source_app = tool_data.get("source_app", "external")
             config.module_path = tool_data.get("module_path", "")
 
@@ -1019,28 +987,10 @@ def _sync_tool_configurations():
             config.insert()
             created_count += 1
 
-        # Cleanup orphan tool configurations (tools that no longer exist)
-        existing_configs = frappe.get_all("FAC Tool Configuration", pluck="tool_name")
-        for config_name in existing_configs:
-            if config_name not in discovered_tool_names:
-                try:
-                    frappe.delete_doc(
-                        "FAC Tool Configuration",
-                        config_name,
-                        force=True,
-                        ignore_permissions=True,
-                    )
-                    deleted_count += 1
-                    frappe.logger("migration_hooks").info(f"Removed orphan tool configuration: {config_name}")
-                except Exception as e:
-                    frappe.logger("migration_hooks").warning(
-                        f"Failed to delete orphan tool config '{config_name}': {e}"
-                    )
-
         frappe.db.commit()
 
         frappe.logger("migration_hooks").info(
-            f"Tool configurations synced: {created_count} created, {skipped_count} already exist, {deleted_count} removed"
+            f"Tool configurations synced: {created_count} created, {skipped_count} already exist"
         )
 
     except Exception as e:

@@ -42,12 +42,12 @@
             "description": "The plugin that provides this tool"
         },
         {
-            "default": "1",
+            "default": "0",
             "fieldname": "enabled",
             "fieldtype": "Check",
             "in_list_view": 1,
             "label": "Enabled",
-            "description": "When disabled, this tool will be hidden from MCP tools/list"
+            "description": "When disabled, this tool will be hidden from MCP tools/list. New tools are disabled by default."
         },
         {
             "fieldname": "column_break_basic",
@@ -111,15 +111,15 @@
             "fieldname": "section_break_role_access",
             "fieldtype": "Section Break",
             "label": "Role-Based Access Control",
-            "description": "Configure which roles can access this tool. Leave empty to allow all roles."
+            "description": "Configure which roles can access this tool. Access is denied unless the tool is enabled and the user's roles are explicitly listed."
         },
         {
             "fieldname": "role_access_mode",
             "fieldtype": "Select",
             "label": "Role Access Mode",
-            "options": "Allow All\nRestrict to Listed Roles",
-            "default": "Allow All",
-            "description": "Allow All: Everyone can use this tool. Restrict to Listed Roles: Only listed roles can access."
+            "options": "Deny All\nRestrict to Listed Roles",
+            "default": "Deny All",
+            "description": "Deny All: No one can use this tool. Restrict to Listed Roles: Only listed roles can access."
         },
         {
             "fieldname": "role_access",
@@ -132,7 +132,7 @@
     ],
     "index_web_pages_for_search": 0,
     "links": [],
-    "modified": "2025-01-13 00:00:00.000000",
+    "modified": "2026-08-09 00:00:00.000000",
     "modified_by": "Administrator",
     "module": "Assistant Core",
     "name": "FAC Tool Configuration",
