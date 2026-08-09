@@ -27,11 +27,7 @@ ROLE_ACCESS_TABLE = "tabFAC Tool Role Access"
 def capture_tool_configs_snapshot(tool_names: Iterable[str]) -> dict:
     """Exact SQL snapshot of parent FAC Tool Configuration + child role rows."""
     names = tuple(dict.fromkeys(tool_names))
-    existing = [
-        tool_name
-        for tool_name in names
-        if frappe.db.exists("FAC Tool Configuration", tool_name)
-    ]
+    existing = [tool_name for tool_name in names if frappe.db.exists("FAC Tool Configuration", tool_name)]
     if not existing:
         return {"tool_names": (), "parents": [], "children": []}
 
@@ -42,8 +38,7 @@ def capture_tool_configs_snapshot(tool_names: Iterable[str]) -> dict:
         as_dict=True,
     )
     children = frappe.db.sql(
-        f"SELECT * FROM `{ROLE_ACCESS_TABLE}` WHERE parent IN ({placeholders}) "
-        "ORDER BY parent, idx, name",
+        f"SELECT * FROM `{ROLE_ACCESS_TABLE}` WHERE parent IN ({placeholders}) " "ORDER BY parent, idx, name",
         tuple(existing),
         as_dict=True,
     )
@@ -60,10 +55,7 @@ def tool_configs_snapshot_hash(snapshot: dict) -> str:
 
 
 def _table_columns(table: str) -> list[str]:
-    return [
-        column.Field
-        for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)
-    ]
+    return [column.Field for column in frappe.db.sql(f"SHOW COLUMNS FROM `{table}`", as_dict=True)]
 
 
 def _insert_rows(table: str, rows: list[dict]) -> None:

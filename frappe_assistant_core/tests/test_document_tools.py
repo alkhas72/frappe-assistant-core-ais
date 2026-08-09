@@ -71,7 +71,10 @@ class TestDocumentTools(BaseAssistantTest):
                 self.skipTest("create_document tool not available")
 
             # Test with minimal valid data
-            arguments = {"doctype": self.test_doctype, "data": {"description": "Test ToDo created by test suite"}}
+            arguments = {
+                "doctype": self.test_doctype,
+                "data": {"description": "Test ToDo created by test suite"},
+            }
 
             try:
                 result = self.registry.execute_tool("create_document", arguments)
