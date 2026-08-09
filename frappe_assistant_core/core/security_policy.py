@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -166,6 +167,7 @@ _TOOL_PLUGIN = MappingProxyType({
 })
 
 _FIELD_SEPARATOR = re.compile(r"[^a-z0-9]+")
+_JSON_STRING_REDACTION_MAX_BYTES = 65_536
 _UNIVERSAL_SENSITIVE_FIELDS = frozenset(
     {
         "token",
@@ -588,8 +590,6 @@ class SecurityPolicy:
 
         if actor == "Guest":
             return {GUEST_ROLE}
-        if actor == "Administrator":
-            return set(frappe.get_all("Role", filters={"disabled": 0}, pluck="name"))
 
         assigned_roles = set(
             frappe.get_all(
@@ -657,20 +657,55 @@ class SecurityPolicy:
     @classmethod
     def redact_output(cls, context: ToolContext, value: Any) -> Any:
         """Recursively redact universal and target-specific sensitive fields."""
+        return cls._redact_output(context, value, allow_row_doctype=True)
+
+    @classmethod
+    def _redact_output(
+        cls, context: ToolContext, value: Any, allow_row_doctype: bool
+    ) -> Any:
         if isinstance(value, Mapping):
-            row_doctype = value.get("doctype") if isinstance(value.get("doctype"), str) else None
+            row_doctype = (
+                value.get("doctype")
+                if allow_row_doctype and isinstance(value.get("doctype"), str)
+                else None
+            )
             effective_doctype = row_doctype or context.target_doctype
             result = {}
             for key, nested in value.items():
                 if cls._contains_restricted_fields(effective_doctype, frozenset({str(key)})):
                     result[key] = "***REDACTED***"
                 else:
-                    result[key] = cls.redact_output(context, nested)
+                    result[key] = cls._redact_output(
+                        context, nested, allow_row_doctype=allow_row_doctype
+                    )
             return result
         if isinstance(value, list):
-            return [cls.redact_output(context, nested) for nested in value]
+            return [
+                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype)
+                for nested in value
+            ]
         if isinstance(value, tuple):
-            return tuple(cls.redact_output(context, nested) for nested in value)
+            return tuple(
+                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype)
+                for nested in value
+            )
         if isinstance(value, set):
-            return {cls.redact_output(context, nested) for nested in value}
+            return {
+                cls._redact_output(context, nested, allow_row_doctype=allow_row_doctype)
+                for nested in value
+            }
+        if (
+            isinstance(value, str)
+            and value.startswith(("{", "["))
+            and len(value.encode("utf-8")) <= _JSON_STRING_REDACTION_MAX_BYTES
+        ):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return value
+            return json.dumps(
+                cls._redact_output(context, parsed, allow_row_doctype=False),
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         return value

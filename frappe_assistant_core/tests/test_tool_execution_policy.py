@@ -369,6 +369,75 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
             frappe.set_user("Administrator")
             frappe.delete_doc("User", actor, force=True)
 
+    def test_administrator_cannot_use_a_role_not_assigned_in_has_role(self):
+        actor = "fac-integration-policy-role@example.com"
+        role_name = "FAC Integration Policy Role"
+        self.assertFalse(frappe.db.exists("User", actor))
+        self.assertFalse(frappe.db.exists("Role", role_name))
+        frappe.get_doc(
+            {"doctype": "Role", "role_name": role_name, "disabled": 0}
+        ).insert(ignore_permissions=True)
+        frappe.get_doc(
+            {
+                "doctype": "User",
+                "email": actor,
+                "first_name": "FAC Integration Policy Role",
+                "enabled": 1,
+                "user_type": "System User",
+                "assistant_enabled": 1,
+                "roles": [{"role": role_name}],
+            }
+        ).insert(ignore_permissions=True)
+
+        config = frappe.get_doc("FAC Tool Configuration", self.tool_name)
+        config.set("role_access", [])
+        config.append("role_access", {"role": role_name, "allow_access": 1})
+        config.save(ignore_permissions=True)
+
+        try:
+            self.assertFalse(
+                frappe.db.exists(
+                    "Has Role",
+                    {
+                        "parent": "Administrator",
+                        "parenttype": "User",
+                        "role": role_name,
+                    },
+                )
+            )
+            with patch.object(
+                SecurityPolicy, "inventory", return_value=frozenset({self.tool_name})
+            ), patch.object(SecurityPolicy, "_has_native_permissions", return_value=True):
+                administrator = SecurityPolicy.authorize(
+                    actor="Administrator",
+                    tool_name=self.tool_name,
+                    arguments={"doctype": "ToDo", "name": "TD-DOES-NOT-MATTER"},
+                    phase="execute",
+                )
+                assigned_actor = SecurityPolicy.authorize(
+                    actor=actor,
+                    tool_name=self.tool_name,
+                    arguments={"doctype": "ToDo", "name": "TD-DOES-NOT-MATTER"},
+                    phase="execute",
+                )
+                frappe.db.set_value("Role", role_name, "disabled", 1, update_modified=False)
+                disabled_role = SecurityPolicy.authorize(
+                    actor=actor,
+                    tool_name=self.tool_name,
+                    arguments={"doctype": "ToDo", "name": "TD-DOES-NOT-MATTER"},
+                    phase="execute",
+                )
+
+            self.assertFalse(administrator.allowed)
+            self.assertEqual(administrator.reason_code, "ROLE_NOT_ALLOWED")
+            self.assertTrue(assigned_actor.allowed)
+            self.assertEqual(assigned_actor.reason_code, "ALLOWED")
+            self.assertFalse(disabled_role.allowed)
+            self.assertEqual(disabled_role.reason_code, "ROLE_NOT_ALLOWED")
+        finally:
+            frappe.delete_doc("User", actor, force=True)
+            frappe.db.delete("Role", role_name)
+
     def test_disabled_role_after_publication_is_denied_without_resaving_config(self):
         actor = "fac-task-role-disabled@example.com"
         role_name = "FAC Task Disabled Role"

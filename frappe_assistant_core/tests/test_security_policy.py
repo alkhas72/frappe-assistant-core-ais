@@ -275,6 +275,36 @@ class TestSecurityPolicy(FrappeTestCase):
         self.assertFalse(filter_list.allowed)
         self.assertEqual(filter_list.reason_code, "FIELD_RESTRICTED")
 
+    def test_redact_output_sanitizes_json_strings_with_authoritative_context(self):
+        universal = SecurityPolicy.redact_output(
+            ToolContext(operation="read", target_doctype="ToDo"),
+            '{"nested":[{"authorization":"Bearer never"}],"token":"never"}',
+        )
+        target_specific = SecurityPolicy.redact_output(
+            ToolContext(operation="read", target_doctype="User"),
+            '{"doctype":"ToDo","enabled":1,"user_type":"System User"}',
+        )
+
+        self.assertEqual(
+            universal,
+            '{"nested":[{"authorization":"***REDACTED***"}],"token":"***REDACTED***"}',
+        )
+        self.assertEqual(
+            target_specific,
+            '{"doctype":"ToDo","enabled":"***REDACTED***","user_type":"***REDACTED***"}',
+        )
+
+    def test_redact_output_leaves_non_json_and_oversized_json_strings_unchanged(self):
+        context = ToolContext(operation="read", target_doctype="User")
+        malformed = '{"token":'
+        oversized = '{"token":"' + ("x" * 65_536) + '"}'
+        plain = "plain text"
+
+        self.assertEqual(SecurityPolicy.redact_output(context, malformed), malformed)
+        self.assertGreater(len(oversized.encode("utf-8")), 65_536)
+        self.assertEqual(SecurityPolicy.redact_output(context, oversized), oversized)
+        self.assertEqual(SecurityPolicy.redact_output(context, plain), plain)
+
     def test_invalid_context_and_policy_exceptions_fail_closed(self):
         invalid = self._authorize("fetch", {"id": "missing-slash"})
         self.assertFalse(invalid.allowed)
