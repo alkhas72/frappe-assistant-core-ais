@@ -17,6 +17,18 @@
 from typing import Any, Dict, List
 
 import frappe
+
+
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.metadata_tools").warning(tag)
+        else:
+            frappe.logger("fac.metadata_tools").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
+
 from frappe import _
 
 
@@ -229,13 +241,7 @@ class MetadataTools:
             }
 
         except Exception:
-            try:
-                frappe.logger("fac.metadata_tools").warning(
-                    "get doctype metadata failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("get doctype metadata failed")
             return {"success": False, "error": "Get DocType Metadata failed"}
 
     @staticmethod
@@ -269,13 +275,7 @@ class MetadataTools:
             }
 
         except Exception:
-            try:
-                frappe.logger("fac.metadata_tools").warning(
-                    "list doctypes failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("list doctypes failed")
             return {"success": False, "error": "List DocTypes failed"}
 
     @staticmethod
@@ -316,13 +316,7 @@ class MetadataTools:
             }
 
         except Exception:
-            try:
-                frappe.logger("fac.metadata_tools").warning(
-                    "get permissions failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("get permissions failed")
             return {"success": False, "error": "Get Permissions failed"}
 
     @staticmethod
@@ -382,11 +376,5 @@ class MetadataTools:
             }
 
         except Exception:
-            try:
-                frappe.logger("fac.metadata_tools").warning(
-                    "get workflow failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("get workflow failed")
             return {"success": False, "error": "Get Workflow failed"}

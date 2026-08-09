@@ -22,6 +22,18 @@ Handles all workflow complexities: permissions, conditions, notifications, docum
 from typing import Any, Dict
 
 import frappe
+
+
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.run_workflow").warning(tag)
+        else:
+            frappe.logger("fac.run_workflow").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
+
 from frappe import _
 
 from frappe_assistant_core.core.base_tool import BaseTool
@@ -194,13 +206,7 @@ class RunWorkflow(BaseTool):
             # FAC v2.1: never echo raw exception text. The exception type is
             # already exposed via ``error_type``; the public error is a stable
             # category. The technical log records the exception type only.
-            try:
-                frappe.logger("fac.run_workflow").warning(
-                    "workflow transition rejected",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("workflow transition rejected")
             # Get helpful information for workflow errors
             try:
                 doc = frappe.get_doc(doctype, name)
@@ -222,13 +228,7 @@ class RunWorkflow(BaseTool):
                 }
 
         except frappe.exceptions.WorkflowPermissionError:
-            try:
-                frappe.logger("fac.run_workflow").warning(
-                    "workflow permission denied",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("workflow permission denied")
             return {
                 "success": False,
                 "error": "Workflow permission denied",
@@ -238,13 +238,7 @@ class RunWorkflow(BaseTool):
 
         except Exception:
             # FAC v2.1: stable public category; safe technical log.
-            try:
-                frappe.logger("fac.run_workflow").warning(
-                    "workflow execution failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("workflow execution failed")
 
             return {
                 "success": False,
@@ -275,7 +269,8 @@ class RunWorkflow(BaseTool):
             return enhanced_transitions
 
         except Exception as e:
-            frappe.log_error(f"Error getting workflow transitions: {e}")
+            # FAC v2.2: safe logging — tag + type only.
+            _log_safe("get_available_transitions failed", e)
             return []
 
     def _get_workflow_info(self, doc, workflow_name):
@@ -304,7 +299,8 @@ class RunWorkflow(BaseTool):
             }
 
         except Exception as e:
-            frappe.log_error(f"Error getting workflow info: {e}")
+            # FAC v2.2: safe logging — tag + type only.
+            _log_safe("get_workflow_info failed", e)
             return {"workflow_name": workflow_name}
 
 

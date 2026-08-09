@@ -37,6 +37,7 @@ must not be removed without a coordinated change to the policy contract
 from __future__ import annotations
 
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional
 
 import frappe
@@ -46,25 +47,69 @@ import frappe
 #
 # Older code paths imported ``BASIC_CORE_TOOLS``, ``ROLE_TOOL_ACCESS`` and the
 # dict-form ``RESTRICTED_DOCTYPES`` for role-matrix lookups. With Task 6 the
-# matrix retired from runtime authority. ``BASIC_CORE_TOOLS`` and
-# ``ROLE_TOOL_ACCESS`` are now inert empty values — they cannot re-enable any
-# tool or create a parallel allow system.
+# matrix retired from runtime authority.
+#
+# FAC v2.2: ``BASIC_CORE_TOOLS`` and ``ROLE_TOOL_ACCESS`` are now IMMUTABLE
+# empty containers (``tuple`` / ``MappingProxyType({})``) — legacy callers
+# cannot mutate them into an alternative allow system.
 #
 # ``RESTRICTED_DOCTYPES`` is intentionally NOT a plain empty dict: a legacy
-# caller that does ``doctype in RESTRICTED_DOCTYPES.get(role, [])`` would get
-# ``[]`` and conclude "not restricted" for a DocType that the canonical policy
-# in fact restricts. That is fail-OPEN and was caught by the Frappe 15 review
-# (v2.1). The export is now a read-only mapping that returns the canonical
-# restricted set for EVERY role key, derived lazily from
-# ``SecurityPolicy.RESTRICTED_DOCTYPES``. There is no second hand-maintained
-# table and no role bypass — not even for System Manager.
+# caller doing ``doctype in RESTRICTED_DOCTYPES.get(role, [])`` would get
+# ``[]`` and conclude "not restricted" — that was fail-OPEN (caught by the
+# Frappe 15 review, v2.1). The export is now a read-only mapping that returns
+# the canonical restricted set for EVERY role key, derived lazily from
+# ``SecurityPolicy.RESTRICTED_DOCTYPES``. If the canonical import itself
+# fails, we return a deny-all membership object so that
+# ``doctype in legacy_list`` is always True — fail-closed rather than the
+# sentinel-string approach that did not match any real DocType.
 #
 # Removing these exports entirely is a separate breaking-change decision for
 # the Arbiter; until then they remain defined and fail-closed.
 # ---------------------------------------------------------------------------
 
-BASIC_CORE_TOOLS: List[str] = []
-ROLE_TOOL_ACCESS: Dict[str, Any] = {}
+BASIC_CORE_TOOLS: tuple = ()
+ROLE_TOOL_ACCESS: Mapping = MappingProxyType({})
+
+
+class _DenyAll:
+    """Membership container that reports every DocType as restricted.
+
+    Used as the fail-closed fallback when the canonical restricted set
+    cannot be loaded. ``__contains__`` is True for any value so the legacy
+    pattern ``doctype in legacy_list`` cannot accidentally conclude "not
+    restricted"; ``__len__`` is non-zero so ``if not legacy_list`` also
+    fails closed.
+    """
+
+    __slots__ = ()
+
+    def __contains__(self, _item: Any) -> bool:
+        return True
+
+    def __iter__(self):
+        # Defensive: iteration yields nothing. Legacy code that iterates
+        # rather than tests membership is rare; failing closed at the
+        # membership-test level is the contract that matters.
+        return iter(())
+
+    def __len__(self) -> int:
+        return 1
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __eq__(self, other: Any) -> bool:
+        # Two deny-all instances are equal; not equal to anything else.
+        return isinstance(other, _DenyAll)
+
+    def __hash__(self) -> int:
+        return hash("__fac_deny_all__")
+
+    def __repr__(self) -> str:
+        return "<fac deny-all restricted-doctypes>"
+
+
+_DENY_ALL = _DenyAll()
 
 
 class _LegacyRestrictedDoctypes(Mapping):
@@ -73,13 +118,15 @@ class _LegacyRestrictedDoctypes(Mapping):
 
     Every role key resolves to the SAME canonical restricted list, so the old
     lookup pattern ``RESTRICTED_DOCTYPES.get(role, []).__contains__(dt)``
-    cannot fail-open regardless of which role the caller supplies.
+    cannot fail-open regardless of which role the caller supplies. If the
+    canonical policy import itself fails, the mapping returns ``_DenyAll``
+    so every membership test reports "restricted".
     """
 
     __slots__ = ()
 
     @staticmethod
-    def _canonical() -> List[str]:
+    def _canonical() -> Any:
         # Lazy import: security_policy imports security_config for
         # SENSITIVE_FIELDS / ADMIN_ONLY_FIELDS, so we cannot import it at
         # module load here without creating a cycle.
@@ -87,18 +134,16 @@ class _LegacyRestrictedDoctypes(Mapping):
 
         return sorted(RESTRICTED_DOCTYPES)
 
-    def _always_list(self) -> List[str]:
+    def _always_list(self) -> Any:
         try:
             return self._canonical()
         except Exception:
-            # If the canonical set cannot be resolved we MUST fail closed:
-            # return a non-empty placeholder so the legacy
-            # ``in RESTRICTED_DOCTYPES.get(role, [])`` check does not collapse
-            # to an empty list. The placeholder names a sentinel that no
-            # real DocType will ever match but still defeats ``__bool__``.
-            return ["__fac_restricted_doctypes_unavailable__"]
+            # Canonical import failed. Fail closed: every membership test
+            # must report "restricted". The previous sentinel-string
+            # approach did not match any real DocType and was fail-OPEN.
+            return _DENY_ALL
 
-    def __getitem__(self, key: Any) -> List[str]:
+    def __getitem__(self, key: Any) -> Any:
         # Every role gets the canonical set — never an empty list, never a
         # wildcard. ``__getitem__`` (``d[key]``) covers ``.get(key)`` too.
         del key  # role is irrelevant in the post-matrix world
@@ -118,7 +163,7 @@ class _LegacyRestrictedDoctypes(Mapping):
         return key in ("Assistant User", "Assistant Admin", "System Manager", "Default")
 
 
-RESTRICTED_DOCTYPES: Mapping[str, List[str]] = _LegacyRestrictedDoctypes()
+RESTRICTED_DOCTYPES: Mapping[str, Any] = _LegacyRestrictedDoctypes()
 
 
 # ---------------------------------------------------------------------------

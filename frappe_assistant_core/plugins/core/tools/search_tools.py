@@ -17,6 +17,18 @@
 from typing import Any, Dict, List
 
 import frappe
+
+
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.search_tools").warning(tag)
+        else:
+            frappe.logger("fac.search_tools").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
+
 from frappe import _
 from frappe.desk.search import search_widget
 
@@ -161,13 +173,7 @@ class SearchTools:
             }
 
         except Exception:
-            try:
-                frappe.logger("fac.search_tools").warning(
-                    "global search failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("global search failed")
             return {"success": False, "error": "Global Search failed"}
 
     @staticmethod
@@ -237,13 +243,7 @@ class SearchTools:
             }
 
         except Exception:
-            try:
-                frappe.logger("fac.search_tools").warning(
-                    "doctype search failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("doctype search failed")
             return {"success": False, "error": "DocType Search failed"}
 
     @staticmethod
@@ -282,11 +282,5 @@ class SearchTools:
             }
 
         except Exception:
-            try:
-                frappe.logger("fac.search_tools").warning(
-                    "link search failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("link search failed")
             return {"success": False, "error": "Link Search failed"}

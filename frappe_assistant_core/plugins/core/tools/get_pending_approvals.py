@@ -22,6 +22,18 @@ Queries Workflow Actions to find documents awaiting the current user's approval.
 from typing import Any, Dict
 
 import frappe
+
+
+def _log_safe(tag: str, exc=None) -> None:
+    """FAC v2.2: tag + type(exc).__name__ only. No exc_info/str/traceback."""
+    try:
+        if exc is None:
+            frappe.logger("fac.get_pending_approvals").warning(tag)
+        else:
+            frappe.logger("fac.get_pending_approvals").warning(f"{tag}: {type(exc).__name__}")
+    except Exception:
+        pass
+
 from frappe import _
 from frappe.query_builder import DocType
 
@@ -125,13 +137,7 @@ class GetPendingApprovals(BaseTool):
         except Exception:
             # FAC v2.1: stable public category; technical log records only
             # the exception type and a safe context tag.
-            try:
-                frappe.logger("fac.get_pending_approvals").warning(
-                    "pending-approvals query failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("pending-approvals query failed")
             return {"success": False, "error": "Pending approvals lookup failed"}
 
         if not pending_actions:

@@ -21,6 +21,48 @@ import frappe
 from frappe import _
 
 
+def _log_safe(tag: str, exc: Optional[BaseException] = None) -> None:
+    """FAC v2.2 safe logging: constant tag + ``type(exc).__name__`` only.
+
+    Never log ``exc_info=True``, ``str(exc)``, traceback, query, filters,
+    arguments, or result data. The technical log keeps one safe record per
+    failure; helper re-raise paths do NOT log again to avoid duplicate
+    writes.
+    """
+    try:
+        if exc is None:
+            frappe.logger("fac.report_tools").warning(tag)
+        else:
+            frappe.logger("fac.report_tools").warning(
+                f"{tag}: {type(exc).__name__}"
+            )
+    except Exception:
+        pass
+
+
+def _parse_column_fieldname(column: Any) -> Optional[str]:
+    """Normalise dict and string column descriptors to a fieldname.
+
+    Frappe reports use two column shapes:
+      * dict — ``{"fieldname": "password", "label": "Secret"}``
+      * string — canonical ``label:fieldtype:options`` (e.g.
+        ``"API Key:Data:120"``). When the label has no spaces it is also the
+        fieldname; otherwise the fieldname is the underscored label.
+
+    FAC v2.2: ``password:Data:120``, ``API Key:Data:120`` and
+    ``api_key:Data:120`` must all classify as sensitive regardless of shape.
+    """
+    if isinstance(column, dict):
+        return column.get("fieldname") or column.get("field_name")
+    if isinstance(column, str):
+        first = column.split(":", 1)[0].strip()
+        if not first:
+            return None
+        # ``"API Key"`` → ``"api_key"`` to match SENSITIVE_FIELDS keys.
+        return first.replace(" ", "_").lower()
+    return None
+
+
 class ReportTools:
     """
     Shared utility class for Frappe report operations.
@@ -220,18 +262,10 @@ class ReportTools:
 
             return debug_info
 
-        except Exception:
-            # FAC v2.1: never leak raw exception text. Public answer is a
-            # stable category; the technical log records only the exception
-            # type and safe context (no arguments, no result, no filters).
-            try:
-                frappe.logger("fac.report_tools").warning(
-                    "execute_report failed",
-                    exc_info=True,
-                )
-            except Exception:
-                # Logging must never propagate a second failure.
-                pass
+        except Exception as exc:
+            # FAC v2.2: never leak raw exception text, traceback, query or
+            # filters. Safe log + stable public category.
+            _log_safe("execute_report failed", exc)
             return {"success": False, "error": "Report execution failed"}
 
     @staticmethod
@@ -278,11 +312,10 @@ class ReportTools:
         if isinstance(columns, list):
             kept_columns = []
             for index, col in enumerate(columns):
-                fieldname: Optional[str] = None
-                if isinstance(col, dict):
-                    fieldname = col.get("fieldname") or col.get("field_name")
-                elif isinstance(col, str):
-                    fieldname = col
+                # FAC v2.2: use the canonical parser so both dict and string
+                # column descriptors (``"password:Data:120"``,
+                # ``"API Key:Data:120"``, ...) normalise to a fieldname.
+                fieldname = _parse_column_fieldname(col)
                 if isinstance(fieldname, str):
                     positional_fieldname_by_index[index] = fieldname
                     if SecurityPolicy._contains_restricted_fields(
@@ -293,13 +326,31 @@ class ReportTools:
                 kept_columns.append(col)
             debug_info["columns"] = kept_columns
 
+        def _strip_doctype_recursively(value: Any) -> Any:
+            """Remove ``doctype`` keys at every depth so a malicious nested
+            payload (``row.items[0].doctype="Customer"``) cannot downgrade
+            ref_doctype-driven redaction. The authoritative context remains
+            ``ref_doctype``."""
+            if isinstance(value, dict):
+                return {
+                    k: _strip_doctype_recursively(v)
+                    for k, v in value.items()
+                    if k != "doctype"
+                }
+            if isinstance(value, list):
+                return [_strip_doctype_recursively(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_strip_doctype_recursively(v) for v in value)
+            return value
+
         def _redact_dict_row(row: Dict[str, Any]) -> Dict[str, Any]:
             # Enforce ref_doctype by stripping any caller-supplied ``doctype``
             # before central redaction runs. Otherwise a malicious row could
             # claim ``doctype="Customer"`` to bypass User/File/Role-specific
-            # sensitive fields (FAC v2.1, malicious-row test).
-            if "doctype" in row:
-                row = {k: v for k, v in row.items() if k != "doctype"}
+            # sensitive fields (FAC v2.1, malicious-row test). v2.2 also
+            # strips nested ``doctype`` keys so a row's child payload cannot
+            # downgrade either.
+            row = _strip_doctype_recursively(row)
             row = SecurityPolicy.redact_output(ctx, row)
             if sensitive_column_fields:
                 row = {k: v for k, v in row.items() if k not in sensitive_column_fields}
@@ -441,13 +492,7 @@ class ReportTools:
         except Exception:
             # FAC v2.1: stable public category; technical log records only the
             # exception type and a safe context tag (no arguments, no rows).
-            try:
-                frappe.logger("fac.report_tools").warning(
-                    "list_reports failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("list_reports failed")
             return {"success": False, "error": "Report listing failed"}
 
     @staticmethod
@@ -490,13 +535,7 @@ class ReportTools:
                             columns = result.get("columns", [])
                     except Exception:
                         # FAC v2.1: log type + safe context only (no str(e)).
-                        try:
-                            frappe.logger("fac.report_tools").warning(
-                                "query-report column extraction failed",
-                                exc_info=True,
-                            )
-                        except Exception:
-                            pass
+                        _log_safe("query-report column extraction failed")
                         # Return basic info if column extraction fails
                         columns = [
                             {
@@ -533,13 +572,7 @@ class ReportTools:
         except Exception:
             # FAC v2.1: never echo raw exception text. The internal log gets
             # the exception type only; the caller sees a stable category.
-            try:
-                frappe.logger("fac.report_tools").warning(
-                    "get_report_columns failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("get_report_columns failed")
             return {"success": False, "error": "Report not available"}
 
     @staticmethod
@@ -633,13 +666,7 @@ class ReportTools:
                     # Quick execution failed, fall through to background job.
                     # FAC v2.1: safe logging only — exception type + safe
                     # context tag, never the raw message.
-                    try:
-                        frappe.logger("fac.report_tools").warning(
-                            "quick prepared-report execution failed",
-                            exc_info=True,
-                        )
-                    except Exception:
-                        pass
+                    _log_safe("quick prepared-report execution failed")
 
             # ===== Queue and WAIT for completion with polling =====
 
@@ -726,13 +753,7 @@ class ReportTools:
         except Exception:
             # FAC v2.1: safe logging only. Re-raise so the outer
             # ``execute_report`` handler can convert to a stable public answer.
-            try:
-                frappe.logger("fac.report_tools").warning(
-                    "prepared-report handling failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("prepared-report handling failed")
             raise
 
     @staticmethod
@@ -969,13 +990,7 @@ class ReportTools:
             # in the technical log. We use ``str(e)`` ONLY for local branching
             # (matching known mandatory-filter messages) and emit a stable
             # public message; the technical log records the type + safe tag.
-            try:
-                frappe.logger("fac.report_tools").warning(
-                    "script-report execution failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("script-report execution failed")
 
             raw = ""
             try:
@@ -1260,12 +1275,6 @@ class ReportTools:
             # FAC v2.1: safe logging only — never echo raw exception text.
             # Filter-default application is best-effort; falling through to
             # the caller-provided filters is the intended fallback.
-            try:
-                frappe.logger("fac.report_tools").warning(
-                    "filter-default application failed",
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+            _log_safe("filter-default application failed")
 
         return filters
