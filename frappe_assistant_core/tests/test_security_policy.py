@@ -312,6 +312,18 @@ class TestSecurityPolicy(FrappeTestCase):
         )
         self.assertEqual(SecurityPolicy.redact_output(context, plain), plain)
 
+    def test_redact_output_fails_closed_for_valid_json_processing_failures(self):
+        context = ToolContext(operation="read", target_doctype="ToDo")
+        oversized_integer = '{"token":' + ("7" * 5_000) + "}"
+        deeply_nested = ("[" * 1_000) + '{"token":"never"}' + ("]" * 1_000)
+
+        for value in (oversized_integer, deeply_nested):
+            with self.subTest(value_length=len(value)):
+                redacted = SecurityPolicy.redact_output(context, value)
+                self.assertEqual(redacted, "***REDACTED***")
+                self.assertNotIn("never", redacted)
+                self.assertNotIn("7777777777", redacted)
+
     def test_invalid_context_and_policy_exceptions_fail_closed(self):
         invalid = self._authorize("fetch", {"id": "missing-slash"})
         self.assertFalse(invalid.allowed)

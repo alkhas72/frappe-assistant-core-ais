@@ -408,7 +408,17 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
             with patch.object(
                 SecurityPolicy, "inventory", return_value=frozenset({self.tool_name})
             ), patch.object(SecurityPolicy, "_has_native_permissions", return_value=True):
-                administrator = SecurityPolicy.authorize(
+                administrator_publish = SecurityPolicy.authorize(
+                    actor="Administrator",
+                    tool_name=self.tool_name,
+                    arguments=None,
+                    phase="publish",
+                )
+                administrator_tools = self.registry.get_available_tools(
+                    user="Administrator"
+                )
+                assigned_actor_tools = self.registry.get_available_tools(user=actor)
+                administrator_execute = SecurityPolicy.authorize(
                     actor="Administrator",
                     tool_name=self.tool_name,
                     arguments={"doctype": "ToDo", "name": "TD-DOES-NOT-MATTER"},
@@ -428,8 +438,16 @@ class TestExecuteTimeConfigurationFreshness(BaseAssistantTest):
                     phase="execute",
                 )
 
-            self.assertFalse(administrator.allowed)
-            self.assertEqual(administrator.reason_code, "ROLE_NOT_ALLOWED")
+            self.assertFalse(administrator_publish.allowed)
+            self.assertEqual(administrator_publish.reason_code, "ROLE_NOT_ALLOWED")
+            self.assertNotIn(
+                self.tool_name, {tool["name"] for tool in administrator_tools}
+            )
+            self.assertIn(
+                self.tool_name, {tool["name"] for tool in assigned_actor_tools}
+            )
+            self.assertFalse(administrator_execute.allowed)
+            self.assertEqual(administrator_execute.reason_code, "ROLE_NOT_ALLOWED")
             self.assertTrue(assigned_actor.allowed)
             self.assertEqual(assigned_actor.reason_code, "ALLOWED")
             self.assertFalse(disabled_role.allowed)

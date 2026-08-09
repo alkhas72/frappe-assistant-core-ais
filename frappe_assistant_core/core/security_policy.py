@@ -578,8 +578,7 @@ class SecurityPolicy:
 
     @staticmethod
     def _get_actor_roles(actor: str, fresh: bool = False) -> set[str]:
-        if not fresh:
-            return set(frappe.get_roles(actor))
+        del fresh  # Both publication and execution use assigned active roles.
 
         from frappe.permissions import (
             ALL_USER_ROLE,
@@ -698,15 +697,18 @@ class SecurityPolicy:
             isinstance(value, str)
             and value.startswith(("{", "["))
             and len(value) <= _JSON_STRING_REDACTION_MAX_BYTES
-            and len(value.encode("utf-8")) <= _JSON_STRING_REDACTION_MAX_BYTES
         ):
             try:
+                if len(value.encode("utf-8")) > _JSON_STRING_REDACTION_MAX_BYTES:
+                    return value
                 parsed = json.loads(value)
-            except (TypeError, ValueError):
+                return json.dumps(
+                    cls._redact_output(context, parsed, allow_row_doctype=False),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            except json.JSONDecodeError:
                 return value
-            return json.dumps(
-                cls._redact_output(context, parsed, allow_row_doctype=False),
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+            except Exception:
+                return "***REDACTED***"
         return value
