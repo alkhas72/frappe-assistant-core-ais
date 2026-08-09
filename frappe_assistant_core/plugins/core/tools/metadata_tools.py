@@ -14,9 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import frappe
+from frappe import _
 
 
 def _log_safe(tag: str, exc=None) -> None:
@@ -28,9 +29,6 @@ def _log_safe(tag: str, exc=None) -> None:
             frappe.logger("fac.metadata_tools").warning(f"{tag}: {type(exc).__name__}")
     except Exception:
         pass
-
-from frappe import _
-
 
 class MetadataTools:
     """assistant tools for Frappe metadata operations"""

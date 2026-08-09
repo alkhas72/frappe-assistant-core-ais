@@ -79,6 +79,13 @@ class _DenyAll:
     pattern ``doctype in legacy_list`` cannot accidentally conclude "not
     restricted"; ``__len__`` is non-zero so ``if not legacy_list`` also
     fails closed.
+
+    FAC v2.3: ``__iter__`` RAISES instead of yielding nothing. A naive
+    ``for dt in legacy_list`` previously produced an empty iteration, which
+    looked like "no restrictions defined" — exactly the false sense of
+    safety that the v2.1/v2.2 rounds rejected at the membership-test level.
+    Iterating a deny-all container is a programming error during a
+    canonical-load failure; we surface it explicitly.
     """
 
     __slots__ = ()
@@ -87,10 +94,10 @@ class _DenyAll:
         return True
 
     def __iter__(self):
-        # Defensive: iteration yields nothing. Legacy code that iterates
-        # rather than tests membership is rare; failing closed at the
-        # membership-test level is the contract that matters.
-        return iter(())
+        raise RuntimeError(
+            "fac_deny_all: canonical restricted-Doctype set is unavailable; "
+            "iteration is not safe"
+        )
 
     def __len__(self) -> int:
         return 1

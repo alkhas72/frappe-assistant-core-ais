@@ -366,6 +366,13 @@ class ReportTools:
                     # Sensitive position: drop the value entirely. Columns and
                     # rows stay consistent because the column was dropped too.
                     continue
+                # FAC v2.3: strip ``doctype`` from nested positional cells
+                # before central redaction. A cell can itself be a dict/list/
+                # tuple carrying a malicious ``doctype`` override; without
+                # this, ``connected_user`` inside a positional cell of an
+                # ``Email Account``-scoped report would not be redacted when
+                # the cell claimed ``doctype="Customer"``.
+                value = _strip_doctype_recursively(value)
                 if fieldname and SecurityPolicy._contains_restricted_fields(
                     ref_doctype, frozenset({fieldname})
                 ):
@@ -599,16 +606,17 @@ class ReportTools:
             )
 
             if prepared_report_name:
-                # Found existing prepared report - retrieve cached data
-                result = get_prepared_report_result(report_doc, filters, dn=prepared_report_name)
-
-                # FAC v2.2: bind the cached result to the current caller AND
-                # the resolved report. ``get_completed_prepared_report`` is
-                # user-scoped in Frappe, but a tampered or stale row could
-                # surface another user's results; verify owner + report_name
-                # on the actual Prepared Report document before returning.
+                # FAC v2.3: BIND BEFORE RETRIEVE. Load the Prepared Report
+                # document and verify ``owner == frappe.session.user`` and
+                # ``report_name == report_doc.name`` BEFORE calling
+                # ``get_prepared_report_result``. Retrieval can decode and
+                # cache the full result JSON; doing it on a tampered or stale
+                # row would expose another user's data even if we discarded
+                # it afterwards.
                 try:
-                    prepared_doc_check = frappe.get_doc("Prepared Report", prepared_report_name)
+                    prepared_doc_check = frappe.get_doc(
+                        "Prepared Report", prepared_report_name
+                    )
                 except Exception:
                     prepared_doc_check = None
                 if (
@@ -616,8 +624,8 @@ class ReportTools:
                     or getattr(prepared_doc_check, "owner", None) != frappe.session.user
                     or getattr(prepared_doc_check, "report_name", None) != report_doc.name
                 ):
-                    # Owner/report mismatch: do NOT return another user's
-                    # prepared result. Stable public failure.
+                    # ``get_prepared_report_result`` MUST NOT be called on a
+                    # mismatched prepared report. Stable public failure.
                     return {
                         "success": False,
                         "result": [],
@@ -625,6 +633,9 @@ class ReportTools:
                         "error": "Prepared report not available",
                         "status": "error",
                     }
+
+                # Only now is it safe to retrieve the cached result.
+                result = get_prepared_report_result(report_doc, filters, dn=prepared_report_name)
 
                 if result and result.get("result"):
                     # Successfully retrieved cached data
@@ -635,7 +646,6 @@ class ReportTools:
                         "message": result.get("message"),
                         "prepared_report": True,
                         "source": "cached",
-                        "prepared_report_name": prepared_report_name,
                         "generated_at": str(prepared_doc.modified) if prepared_doc else None,
                         "status": "completed",
                     }
@@ -662,11 +672,11 @@ class ReportTools:
                             "source": "direct_execution",
                             "status": "completed",
                         }
-                except Exception as e:
-                    # Quick execution failed, fall through to background job.
-                    # FAC v2.1: safe logging only — exception type + safe
-                    # context tag, never the raw message.
-                    _log_safe("quick prepared-report execution failed")
+                except Exception:
+                    # FAC v2.3: helper MUST NOT log on its own — the outer
+                    # ``execute_report`` catch-all writes the single safe
+                    # record. Fall through to background job.
+                    pass
 
             # ===== Queue and WAIT for completion with polling =====
 
@@ -690,23 +700,24 @@ class ReportTools:
                 frappe.db.rollback()
                 prepared_doc = frappe.get_doc("Prepared Report", prepared_report_name)
 
+                # FAC v2.3: BIND BEFORE RETRIEVE on the polling path too.
+                # We already have ``prepared_doc`` from the status poll; use
+                # it to verify owner + report_name BEFORE the retrieval call.
+                if (
+                    getattr(prepared_doc, "owner", None) != frappe.session.user
+                    or getattr(prepared_doc, "report_name", None) != report_doc.name
+                ):
+                    return {
+                        "success": False,
+                        "result": [],
+                        "columns": [],
+                        "error": "Prepared report not available",
+                        "status": "error",
+                    }
+
                 if prepared_doc.status == "Completed":
                     # Report is ready! Retrieve and return data
                     result = get_prepared_report_result(report_doc, filters, dn=prepared_report_name)
-
-                    # FAC v2.2: re-bind owner + report_name before returning
-                    # the background-job result too.
-                    if (
-                        getattr(prepared_doc, "owner", None) != frappe.session.user
-                        or getattr(prepared_doc, "report_name", None) != report_doc.name
-                    ):
-                        return {
-                            "success": False,
-                            "result": [],
-                            "columns": [],
-                            "error": "Prepared report not available",
-                            "status": "error",
-                        }
 
                     if result and result.get("result"):
                         return {
@@ -715,7 +726,6 @@ class ReportTools:
                             "message": result.get("message"),
                             "prepared_report": True,
                             "source": "background_job_completed",
-                            "prepared_report_name": prepared_report_name,
                             "wait_time_seconds": int(elapsed_time),
                             "status": "completed",
                         }
@@ -751,9 +761,9 @@ class ReportTools:
             }
 
         except Exception:
-            # FAC v2.1: safe logging only. Re-raise so the outer
-            # ``execute_report`` handler can convert to a stable public answer.
-            _log_safe("prepared-report handling failed")
+            # The outer ``execute_report`` handler owns the single safe log
+            # record for this failure. Logging here as well would duplicate
+            # the event and can amplify sensitive failure traffic.
             raise
 
     @staticmethod

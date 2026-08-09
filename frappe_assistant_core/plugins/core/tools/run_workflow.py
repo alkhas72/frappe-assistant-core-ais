@@ -22,6 +22,9 @@ Handles all workflow complexities: permissions, conditions, notifications, docum
 from typing import Any, Dict
 
 import frappe
+from frappe import _
+
+from frappe_assistant_core.core.base_tool import BaseTool
 
 
 def _log_safe(tag: str, exc=None) -> None:
@@ -33,11 +36,6 @@ def _log_safe(tag: str, exc=None) -> None:
             frappe.logger("fac.run_workflow").warning(f"{tag}: {type(exc).__name__}")
     except Exception:
         pass
-
-from frappe import _
-
-from frappe_assistant_core.core.base_tool import BaseTool
-
 
 class RunWorkflow(BaseTool):
     """
@@ -117,14 +115,27 @@ class RunWorkflow(BaseTool):
             if SecurityPolicy._is_restricted_target(doctype):
                 return {
                     "success": False,
-                    "error": f"DocType '{doctype}' is restricted",
+                    "error": "Workflow action not available",
                 }
 
-            # Validate document exists
-            if not frappe.db.exists(doctype, name):
-                return {"success": False, "error": f"Document {doctype} '{name}' not found"}
+            # FAC v2.3: row-level permission BEFORE any ``db.exists`` or
+            # ``get_doc``. ``has_permission(..., doc=name)`` returns False
+            # both for hidden and for truly-missing records, which collapses
+            # those cases into a single stable refusal and prevents the
+            # workflow surface from being used to enumerate documents.
+            try:
+                row_visible = frappe.has_permission(doctype, "read", doc=name)
+            except Exception:
+                row_visible = False
+            if not row_visible:
+                return {
+                    "success": False,
+                    "error": "Workflow action not available",
+                }
 
-            # Get the document
+            # Get the document. Native Frappe ``get_doc`` is the second lock
+            # and re-checks row permission; we have already filtered hidden
+            # and missing records above.
             doc = frappe.get_doc(doctype, name)
             original_state = getattr(doc, "workflow_state", None)
 

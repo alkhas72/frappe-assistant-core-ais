@@ -156,9 +156,18 @@ class ChatGPTFetch(BaseTool):
             return {"id": doc_id, "title": title, "text": text_content, "url": url, "metadata": metadata}
 
         except frappe.DoesNotExistError:
-            error_msg = f"Document not found: {doc_id}"
-            frappe.log_error(title=_("ChatGPT Fetch Error"), message=error_msg)
-            raise ValueError(error_msg) from None
+            # FAC v2.3: missing record is INDISTINGUISHABLE from unreadable
+            # record. Both raise the same constant ``PermissionError`` with
+            # no doctype/name/doc_id in the message or in the log. The
+            # underlying exception text never reaches the public surface; the
+            # log keeps one safe record (constant tag + type only).
+            try:
+                frappe.logger("fac.chatgpt_fetch").warning(
+                    "fetch refused: DoesNotExistError"
+                )
+            except Exception:
+                pass
+            raise frappe.PermissionError("Permission denied") from None
 
         except frappe.PermissionError as e:
             # Do NOT echo the underlying exception text — it may include the
@@ -166,8 +175,14 @@ class ChatGPTFetch(BaseTool):
             # sanitized audit row in ``_safe_execute`` retains the stable
             # reason; we propagate a clean ``PermissionError`` with the SAME
             # constant message as the gates above so a downstream caller
-            # cannot distinguish restricted-target from unreadable-record
-            # by inspecting the exception text.
+            # cannot distinguish restricted-target from unreadable-record OR
+            # from a missing record by inspecting the exception text.
+            try:
+                frappe.logger("fac.chatgpt_fetch").warning(
+                    f"fetch refused: {type(e).__name__}"
+                )
+            except Exception:
+                pass
             raise frappe.PermissionError("Permission denied") from e
 
         except ValueError:
