@@ -95,7 +95,27 @@ class GetPendingApprovals(BaseTool):
         include_actions = arguments.get("include_actions", True)
 
         user = frappe.session.user
-        roles = frappe.get_roles(user)
+        # FAC v2.2: intersect the user's roles ONLY with active roles. A
+        # disabled role (``Role.disabled == 1``) must not match Workflow
+        # Action Permitted Role rows and disclose actions the caller is no
+        # longer entitled to. ``frappe.get_roles`` returns names only; we
+        # filter at the DB layer to avoid loading every role document.
+        all_roles = frappe.get_roles(user)
+        try:
+            active_roles = (
+                frappe.db.get_list(
+                    "Role",
+                    filters={"name": ["in", list(all_roles)], "disabled": 0},
+                    pluck="name",
+                    ignore_permissions=False,
+                )
+                or []
+            )
+        except Exception:
+            # If we cannot prove which roles are active, fail closed: drop
+            # to the empty set so the role-subquery below cannot match.
+            active_roles = []
+        roles = list(active_roles)
 
         WA = DocType("Workflow Action")
         WAPR = DocType("Workflow Action Permitted Role")

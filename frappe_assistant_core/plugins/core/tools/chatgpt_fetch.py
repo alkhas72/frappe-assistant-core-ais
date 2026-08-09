@@ -94,18 +94,22 @@ class ChatGPTFetch(BaseTool):
 
             doctype, name = doc_id.split("/", 1)
 
+            # FAC v2.2: stable, indistinguishable refusal message. The same
+            # constant string is used for restricted DocTypes and for
+            # unreadable business records — the message carries no doctype
+            # or name so it cannot be used to enumerate targets. (Direct
+            # Python callers receive this as ``frappe.PermissionError``;
+            # the MCP path sees the central-policy denial.)
+            _REFUSAL = "Permission denied"
+
             # FAC Task 7 (rev. 2): restricted-target gate MUST run before
             # ``frappe.has_permission`` and ``frappe.get_doc``. The central
             # policy closes the MCP path, but a direct call into
             # ``ChatGPTFetch.execute`` from a privileged internal caller could
             # otherwise pass ``has_permission`` (System Manager has read on
-            # restricted DocTypes) and reach ``get_doc``. We refuse here with
-            # the same "permission denied" answer for every restricted DocType
-            # (User, File, FAC configuration DocTypes, ...).
+            # restricted DocTypes) and reach ``get_doc``.
             if SecurityPolicy._is_restricted_target(doctype):
-                raise frappe.PermissionError(
-                    f"Permission denied for {doctype} {name}"
-                )
+                raise frappe.PermissionError(_REFUSAL)
 
             # Native Frappe row-level read permission. The central policy in
             # ``BaseTool._safe_execute`` already authorized the tool call
@@ -114,9 +118,7 @@ class ChatGPTFetch(BaseTool):
             # System Manager bypass — the legacy ``validate_document_access``
             # shim granted one and is no longer consulted here.
             if not frappe.has_permission(doctype, "read", doc=name):
-                raise frappe.PermissionError(
-                    f"Permission denied for {doctype} {name}"
-                )
+                raise frappe.PermissionError(_REFUSAL)
 
             doc = frappe.get_doc(doctype, name)
             # Central redaction removes universal sensitive keys (password,
@@ -162,11 +164,11 @@ class ChatGPTFetch(BaseTool):
             # Do NOT echo the underlying exception text — it may include the
             # sensitive value that triggered the permission failure. The
             # sanitized audit row in ``_safe_execute`` retains the stable
-            # reason; we propagate a clean ``PermissionError`` instead of
-            # converting to ``ValueError`` so callers see the real category.
-            raise frappe.PermissionError(
-                f"Permission denied for {doctype} {name}"
-            ) from e
+            # reason; we propagate a clean ``PermissionError`` with the SAME
+            # constant message as the gates above so a downstream caller
+            # cannot distinguish restricted-target from unreadable-record
+            # by inspecting the exception text.
+            raise frappe.PermissionError("Permission denied") from e
 
         except ValueError:
             # Input validation errors raised above ("Document ID is required",

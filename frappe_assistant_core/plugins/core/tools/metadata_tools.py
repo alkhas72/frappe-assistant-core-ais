@@ -101,25 +101,33 @@ class MetadataTools:
             raise Exception(f"Unknown metadata tool: {tool_name}")
 
     @staticmethod
-    def _serialize_field(field) -> Dict[str, Any]:
+    def _serialize_field(field, doctype: Optional[str] = None) -> Dict[str, Any]:
         """Serialize a DocField row into the shape returned by get_doctype_metadata.
 
-        FAC Task 7 (rev. 2): ``default`` is dropped when the field itself is a
+        FAC v2.2: ``default`` is dropped when the field itself is a
         sensitive/admin field name. The central redactor inspects mapping keys
         (it sees ``"default"``, not the original ``fieldname``), so a sensitive
-        default value (e.g. ``password="hunter2"`` on a Custom Field) would
-        otherwise leak straight through the sink.
+        default value (e.g. ``password="hunter2"`` on a Custom Field, or
+        ``auth_method="Bearer xxx"`` on ``Email Account``) would otherwise
+        leak straight through the sink.
+
+        Sensitive-field check now uses the REAL parent/child DocType (via the
+        ``doctype`` argument) instead of ``None``. The previous ``None`` could
+        miss target-specific fields: ``Email Account.auth_method`` /
+        ``Email Account.connected_user`` are sensitive specifically for
+        ``Email Account`` and were not caught.
         """
         from frappe_assistant_core.core.security_policy import RESTRICTED_DOCTYPES, SecurityPolicy
 
         fieldname = field.fieldname
         # Drop ``default`` for sensitive/admin field names so the value cannot
-        # leak via the ``default`` key (which the central sink treats as a
-        # plain scalar and does not redact by fieldname).
+        # leak via the ``default`` key. The DocType context is mandatory:
+        # without it target-specific fields (Email Account.auth_method, etc.)
+        # are missed.
         include_default = True
         try:
             if SecurityPolicy._contains_restricted_fields(
-                None, frozenset({fieldname})
+                doctype, frozenset({fieldname})
             ):
                 include_default = False
         except Exception:
@@ -179,7 +187,7 @@ class MetadataTools:
 
             meta = frappe.get_meta(doctype)
 
-            fields = [MetadataTools._serialize_field(field) for field in meta.fields]
+            fields = [MetadataTools._serialize_field(field, doctype) for field in meta.fields]
 
             link_fields = [
                 {"fieldname": field.fieldname, "label": field.label, "options": field.options}
@@ -212,7 +220,7 @@ class MetadataTools:
                 ):
                     child_meta = frappe.get_meta(child_doctype)
                     child_entry["fields"] = [
-                        MetadataTools._serialize_field(f) for f in child_meta.fields
+                        MetadataTools._serialize_field(f, child_doctype) for f in child_meta.fields
                     ]
                 else:
                     # Restricted child: keep the structural pointer so the
