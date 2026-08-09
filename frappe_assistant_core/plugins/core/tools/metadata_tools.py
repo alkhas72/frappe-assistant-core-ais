@@ -105,10 +105,32 @@ class MetadataTools:
 
     @staticmethod
     def get_doctype_metadata(doctype: str) -> Dict[str, Any]:
-        """Get DocType metadata and field information"""
+        """Get DocType metadata and field information.
+
+        Restricted DocTypes (parent target) are rejected by the central policy
+        before this helper runs — but defensively we re-check here too so a
+        direct call from a non-MCP code path cannot leak schema. Child tables
+        that resolve to a restricted DocType (``DocPerm``, ``DocShare``,
+        ``Custom Field``, ...) are omitted from ``child_tables`` so role→perm
+        metadata of restricted types is not disclosed (FAC security hardening
+        Task 6, 2026-08-09).
+
+        The ``permissions`` list (role→perm matrix) is intentionally NOT
+        returned: it used to disclose role names and their permission bits to
+        any caller with read on the DocType, which is a privilege-escalation
+        primitive.
+        """
+        from frappe_assistant_core.core.security_policy import SecurityPolicy
+
         try:
             if not frappe.db.exists("DocType", doctype):
                 return {"success": False, "error": f"DocType '{doctype}' not found"}
+
+            # Defensive restricted-target gate. Central policy already enforces
+            # this in ``BaseTool._safe_execute``; this guard covers direct
+            # calls from non-MCP code paths that did not go through the policy.
+            if SecurityPolicy._is_restricted_target(doctype):
+                return {"success": False, "error": f"DocType '{doctype}' is restricted"}
 
             if not frappe.has_permission(doctype, "read"):
                 return {"success": False, "error": f"No permission to access DocType '{doctype}'"}
@@ -124,6 +146,9 @@ class MetadataTools:
 
             # Child tables: include the child DocType's own field metadata so the
             # caller can build nested row objects without a second tool call (#192).
+            # Restricted child DocTypes (DocPerm, DocShare, Custom Field, ...) are
+            # skipped so their role→perm matrix and field schema are not disclosed
+            # (FAC Task 6).
             child_tables = []
             for table_field in meta.get_table_fields():
                 child_doctype = table_field.options
@@ -135,9 +160,21 @@ class MetadataTools:
                     "reqd": table_field.reqd,
                     "fields": [],
                 }
-                if child_doctype and frappe.db.exists("DocType", child_doctype):
+                if (
+                    child_doctype
+                    and not SecurityPolicy._is_restricted_target(child_doctype)
+                    and frappe.db.exists("DocType", child_doctype)
+                ):
                     child_meta = frappe.get_meta(child_doctype)
-                    child_entry["fields"] = [MetadataTools._serialize_field(f) for f in child_meta.fields]
+                    child_entry["fields"] = [
+                        MetadataTools._serialize_field(f) for f in child_meta.fields
+                    ]
+                else:
+                    # Restricted child: keep the structural pointer (fieldname,
+                    # fieldtype) so the caller knows a child row exists, but do
+                    # NOT serialise the restricted child's own field schema.
+                    child_entry["fields"] = []
+                    child_entry["restricted"] = True
                 child_tables.append(child_entry)
 
             return {
@@ -153,7 +190,9 @@ class MetadataTools:
                 "fields": fields,
                 "link_fields": link_fields,
                 "child_tables": child_tables,
-                "permissions": [p.as_dict() for p in meta.permissions],
+                # NOTE: ``permissions`` (role→perm matrix) intentionally omitted.
+                # It used to disclose role names and permission bits to any
+                # reader of the DocType — a privilege-escalation primitive.
             }
 
         except Exception as e:

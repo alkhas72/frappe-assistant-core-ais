@@ -158,6 +158,94 @@ class TestSearchTools(BaseAssistantTest):
     def test_search_empty_query(self):
         self.skipTest("Empty query test placeholder")
 
+    # --- FAC security hardening Task 6 (2026-08-09) ---
+    #
+    # Regression guards for restricted-target leaks in global / doctype / link
+    # search. The legacy ``SearchTools`` shipped ``User`` and ``DocType`` in
+    # ``common_doctypes`` and only checked ``frappe.has_permission``, which a
+    # System Manager passes for restricted DocTypes. The central policy in
+    # ``_safe_execute`` now blocks restricted targets at the publish/execute
+    # gate, but a direct call into the static helper must also refuse.
+
+    def test_global_search_excludes_restricted_doctypes(self):
+        """``User`` and ``DocType`` must NEVER appear in global_search output,
+        even when the actor has read permission (System Manager)."""
+        from frappe_assistant_core.plugins.core.tools import search_tools
+
+        with ExitStack() as stack:
+            # Pretend every doctype exists and is readable. Without the
+            # restricted-target gate, User and DocType would leak through.
+            stack.enter_context(
+                patch.object(search_tools.frappe.db, "exists", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(search_tools.frappe, "has_permission", return_value=True)
+            )
+            get_list = stack.enter_context(patch.object(search_tools.frappe, "get_list"))
+            get_list.return_value = [{"name": "LEAK"}]
+
+            result = search_tools.SearchTools.global_search(query="any", limit=20)
+
+        self.assertTrue(result.get("success"), result)
+        searched = result.get("searched_doctypes", [])
+        self.assertNotIn("User", searched, "Restricted DocType User leaked into global_search")
+        self.assertNotIn("DocType", searched, "Restricted DocType DocType leaked into global_search")
+        # The leaked rows we would have produced for User/DocType must not be
+        # present in the result set either.
+        for row in result.get("results", []):
+            self.assertNotEqual(row.get("doctype"), "User")
+            self.assertNotEqual(row.get("doctype"), "DocType")
+
+    def test_search_doctype_rejects_restricted_target(self):
+        """A direct call to ``search_doctype("User", ...)`` must refuse before
+        running any query, regardless of role."""
+        from frappe_assistant_core.plugins.core.tools import search_tools
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(search_tools.frappe.db, "exists", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(search_tools.frappe, "has_permission", return_value=True)
+            )
+            get_list = stack.enter_context(
+                patch.object(
+                    search_tools.frappe,
+                    "get_list",
+                    side_effect=AssertionError("restricted target must not be queried"),
+                )
+            )
+
+            result = search_tools.SearchTools.search_doctype(doctype="User", query="any", limit=20)
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("restricted", (result.get("error") or "").lower())
+        get_list.assert_not_called()
+
+    def test_search_link_rejects_restricted_target(self):
+        """``search_link`` must refuse restricted DocTypes before delegating to
+        Frappe's ``frappe.desk.search.search_link``."""
+        from frappe_assistant_core.plugins.core.tools import search_tools
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(search_tools.frappe.db, "exists", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(search_tools.frappe, "has_permission", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    "frappe.desk.search.search_link",
+                    side_effect=AssertionError("restricted target must not reach desk.search"),
+                )
+            )
+
+            result = search_tools.SearchTools.search_link(doctype="User", query="any", filters={})
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("restricted", (result.get("error") or "").lower())
+
 
 class TestSearchToolsIntegration(BaseAssistantTest):
     """Integration tests for search tools"""

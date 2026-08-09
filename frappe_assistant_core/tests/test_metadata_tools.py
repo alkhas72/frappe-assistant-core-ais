@@ -146,6 +146,78 @@ class TestMetadataTools(BaseAssistantTest):
         self.assertFalse(child_result["is_single"])
         self.assertTrue(child_result["is_child_table"])
 
+    # --- FAC security hardening Task 6 (2026-08-09) ---
+    #
+    # The role→perm matrix (``meta.permissions``) was previously disclosed to
+    # any reader of a DocType, leaking role names and their permission bits.
+    # ``permissions`` must not appear in the response. Restricted child tables
+    # (``DocPerm``, ``DocShare``, ``Custom Field``, ...) must surface as a
+    # structural pointer with ``restricted=True`` and an empty ``fields`` list
+    # rather than serialising the restricted child's own schema.
+
+    def test_get_doctype_metadata_omits_role_permission_matrix(self):
+        """``permissions`` (role→perm list) must not be disclosed to callers."""
+        from frappe_assistant_core.plugins.core.tools.metadata_tools import MetadataTools
+
+        # ``Customer`` is a normal business DocType, not restricted. Central
+        # policy lets it through; we assert the response shape only.
+        result = MetadataTools.get_doctype_metadata("Customer")
+        if not result.get("success"):
+            self.skipTest(f"Customer DocType not present in this site: {result.get('error')}")
+        self.assertNotIn(
+            "permissions",
+            result,
+            "get_doctype_metadata must not return the role→perm matrix",
+        )
+
+    def test_get_doctype_metadata_redacts_restricted_child_schema(self):
+        """A child table that resolves to a restricted DocType must be returned
+        as ``restricted=True`` with an empty ``fields`` list, not its full
+        schema. ``User`` is restricted, so we use ``Prepared Report`` (a
+        standard, non-restricted parent with restricted children when a
+        customization has been added)."""
+        from unittest.mock import MagicMock, patch
+
+        from frappe_assistant_core.plugins.core.tools.metadata_tools import MetadataTools
+
+        # Build a synthetic parent meta with a single Table field pointing at
+        # ``DocPerm`` (a restricted child). This isolates the redaction logic
+        # from whatever happens to be installed in the local site.
+        parent_meta = MagicMock()
+        parent_meta.fields = []
+        parent_meta.get_link_fields.return_value = []
+        table_field = MagicMock(
+            fieldname="permissions",
+            label="Permissions",
+            fieldtype="Table",
+            options="DocPerm",
+            reqd=0,
+        )
+        parent_meta.get_table_fields.return_value = [table_field]
+        parent_meta.module = "Core"
+        parent_meta.is_submittable = 0
+        parent_meta.is_tree = 0
+        parent_meta.issingle = 0
+        parent_meta.istable = 0
+        parent_meta.naming_rule = ""
+        parent_meta.title_field = None
+
+        with patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.db.exists", return_value=True), \
+             patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.has_permission", return_value=True), \
+             patch("frappe_assistant_core.plugins.core.tools.metadata_tools.frappe.get_meta", return_value=parent_meta):
+            result = MetadataTools.get_doctype_metadata("Synthetic Parent")
+
+        self.assertTrue(result.get("success"), result)
+        child_tables = result.get("child_tables", [])
+        self.assertEqual(len(child_tables), 1)
+        restricted_child = child_tables[0]
+        self.assertEqual(restricted_child["options"], "DocPerm")
+        self.assertEqual(restricted_child["fields"], [])
+        self.assertTrue(
+            restricted_child.get("restricted"),
+            "Restricted child DocType must be flagged restricted=True",
+        )
+
 
 class TestMetadataToolsIntegration(BaseAssistantTest):
     """Integration tests for metadata tools"""

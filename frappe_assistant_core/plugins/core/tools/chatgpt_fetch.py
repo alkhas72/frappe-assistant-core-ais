@@ -77,9 +77,9 @@ class ChatGPTFetch(BaseTool):
             - url: URL for citation
             - metadata: Additional document metadata
         """
-        from frappe_assistant_core.core.security_config import (
-            filter_sensitive_fields,
-            validate_document_access,
+        from frappe_assistant_core.core.security_policy import (
+            SecurityPolicy,
+            ToolContext,
         )
 
         try:
@@ -94,20 +94,31 @@ class ChatGPTFetch(BaseTool):
 
             doctype, name = doc_id.split("/", 1)
 
-            # Layered permission check: role-based doctype gating + Frappe perms.
-            # Mirrors the get_document tool so the ChatGPT fetch path doesn't
-            # bypass FAC's standard auth pipeline.
-            validation_result = validate_document_access(
-                user=frappe.session.user, doctype=doctype, name=name, perm_type="read"
-            )
-            if not validation_result["success"]:
+            # Native Frappe row-level read permission. The central policy in
+            # ``BaseTool._safe_execute`` already authorized the tool call
+            # (restricted DocType, hard-deny set, role config, DocType-level
+            # permission); this is the row-level second lock. There is no
+            # System Manager bypass — the legacy ``validate_document_access``
+            # shim granted one and is no longer consulted here.
+            if not frappe.has_permission(doctype, "read", doc=name):
                 raise frappe.PermissionError(
-                    validation_result.get("error", f"Access denied for {doctype} {name}")
+                    f"Permission denied for {doctype} {name}"
                 )
 
-            user_role = validation_result["role"]
             doc = frappe.get_doc(doctype, name)
-            doc_dict = filter_sensitive_fields(doc.as_dict(), doctype, user_role)
+            # Central redaction removes universal sensitive keys (password,
+            # token, ...) and DocType-specific sensitive/admin fields. Applied
+            # locally here because ``_format_document_as_text`` serializes the
+            # dict to a JSON string, which the central sink in
+            # ``_safe_execute`` treats as opaque. The sink still runs after as
+            # defence in depth. No role bypasses redaction.
+            read_context = ToolContext(
+                operation="read",
+                target_doctype=doctype,
+                target_name=name,
+                required_permissions=frozenset({"read"}),
+            )
+            doc_dict = SecurityPolicy.redact_output(read_context, doc.as_dict())
 
             # Create title from name field or document name
             title = doc_dict.get("title") or doc_dict.get("name") or name
@@ -135,9 +146,14 @@ class ChatGPTFetch(BaseTool):
             raise ValueError(error_msg) from None
 
         except frappe.PermissionError as e:
-            error_msg = f"Permission denied: {str(e)}"
-            frappe.log_error(title=_("ChatGPT Fetch Permission Error"), message=error_msg)
-            raise ValueError(error_msg) from e
+            # Do NOT echo the underlying exception text — it may include the
+            # sensitive value that triggered the permission failure. The
+            # sanitized audit row in ``_safe_execute`` retains the stable
+            # reason; we propagate a clean ``PermissionError`` instead of
+            # converting to ``ValueError`` so callers see the real category.
+            raise frappe.PermissionError(
+                f"Permission denied for {doctype} {name}"
+            ) from e
 
         except ValueError:
             # Input validation errors raised above ("Document ID is required",

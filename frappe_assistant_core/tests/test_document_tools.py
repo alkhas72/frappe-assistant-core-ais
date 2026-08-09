@@ -559,6 +559,120 @@ class TestDocumentTools(BaseAssistantTest):
             self.assertIn("suggestion", result)
 
 
+class TestFetchToolRedaction(BaseAssistantTest):
+    """FAC security hardening Task 6 (2026-08-09).
+
+    The ChatGPT-compatible ``fetch`` tool used to call
+    ``security_config.validate_document_access`` + ``filter_sensitive_fields``,
+    both of which granted a ``System Manager`` bypass and superseded the
+    central policy. It now relies on the central decision (already taken in
+    ``BaseTool._safe_execute``) plus a native row-level read check, and runs
+    ``SecurityPolicy.redact_output`` locally before serialising the document to
+    a JSON-string ``text`` (which the central sink treats as opaque).
+
+    These guards prove:
+      * Sensitive keys nested inside the returned document are redacted for
+        every actor, including System Manager.
+      * The legacy ``security_config`` shims no longer carry a System Manager
+        wildcard (matrix retirement).
+    """
+
+    def test_filter_sensitive_fields_redacts_for_system_manager(self):
+        """``filter_sensitive_fields`` used to return the dict unchanged for
+        ``System Manager``. After retirement it must apply universal sensitive
+        fields to every caller."""
+        from frappe_assistant_core.core.security_config import filter_sensitive_fields
+
+        doc = {
+            "name": "USR-001",
+            "password": "hunter2",
+            "api_key": "sk-leak",
+            "email": "user@example.com",
+        }
+
+        redacted = filter_sensitive_fields(doc, "User", "System Manager")
+
+        self.assertEqual(redacted["name"], "USR-001")
+        self.assertEqual(redacted["email"], "user@example.com")
+        self.assertEqual(redacted["password"], "***RESTRICTED***")
+        self.assertEqual(redacted["api_key"], "***RESTRICTED***")
+
+    def test_validate_document_access_denies_restricted_doctype_for_system_manager(self):
+        """A System Manager must NOT pass ``validate_document_access`` for a
+        restricted DocType (e.g. ``User``). Previously the matrix let SM
+        through; the retired shim must fail-closed."""
+        from contextlib import ExitStack
+        from unittest.mock import patch
+
+        from frappe_assistant_core.core.security_config import validate_document_access
+
+        with ExitStack() as stack:
+            # Pretend Frappe thinks the user has every permission. The
+            # restricted-target gate is what must deny, not the native check.
+            stack.enter_context(
+                patch(
+                    "frappe_assistant_core.core.security_config.frappe.has_permission",
+                    return_value=True,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "frappe_assistant_core.core.security_config.frappe.get_roles",
+                    return_value=["System Manager"],
+                )
+            )
+
+            result = validate_document_access(
+                user="admin@example.com",
+                doctype="User",
+                name="admin@example.com",
+                perm_type="read",
+            )
+
+        self.assertFalse(result.get("success"), result)
+        self.assertIn("restricted", (result.get("error") or "").lower())
+
+    def test_check_tool_access_is_fail_closed_for_system_manager(self):
+        """``check_tool_access`` must never authorize anything post-retirement.
+
+        The legacy matrix granted ``System Manager`` an ``*`` wildcard and
+        allowed lists that included hard-denied legacy aliases. The function is
+        now a backwards-compat shim that returns ``False`` unconditionally.
+        """
+        from frappe_assistant_core.core.security_config import check_tool_access
+
+        # Even the most permissive sounding combinations must fail closed.
+        self.assertFalse(check_tool_access("System Manager", "get_document"))
+        self.assertFalse(check_tool_access("System Manager", "delete_document"))
+        self.assertFalse(check_tool_access("System Manager", "run_python_code"))
+        # Legacy aliases that used to be in the allowed list.
+        self.assertFalse(check_tool_access("System Manager", "execute_python_code"))
+        self.assertFalse(check_tool_access("System Manager", "metadata_permissions"))
+
+    def test_is_doctype_accessible_has_no_system_manager_bypass(self):
+        """``is_doctype_accessible("User", "System Manager")`` must return False.
+
+        Restricted DocType set is authoritative; role cannot override it.
+        """
+        from unittest.mock import patch
+
+        from frappe_assistant_core.core.security_config import is_doctype_accessible
+
+        with patch(
+            "frappe_assistant_core.core.security_config.frappe.get_meta"
+        ) as get_meta:
+            # Restricted parent (User) is checked before meta is consulted, so
+            # the meta mock is just defensive.
+            get_meta.return_value.istable = False
+
+            self.assertFalse(is_doctype_accessible("User", "System Manager"))
+            self.assertFalse(is_doctype_accessible("DocType", "System Manager"))
+            self.assertFalse(is_doctype_accessible("File", "System Manager"))
+            # Child tables (any istable=1 DocType) are also not "accessible".
+            get_meta.return_value.istable = True
+            self.assertFalse(is_doctype_accessible("Has Role", "System Manager"))
+
+
 class TestDocumentToolsIntegration(BaseAssistantTest):
     """Integration tests for document tools"""
 
