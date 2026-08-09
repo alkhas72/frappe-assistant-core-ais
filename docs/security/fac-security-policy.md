@@ -106,7 +106,7 @@ Each requires a `FAC Tool Configuration` row and passes authorization only under
 
 Configuration changes via DocType `.save()` or `frappe.db.set_value()` take effect on the next publish/execute call (fresh read on execute phase).
 
-## Restricted DocTypes (56)
+## Restricted DocTypes (57)
 
 Direct reads/writes against these DocTypes are denied at execute time (`DOCTYPE_RESTRICTED`), including for System Manager when accessed through FAC tools:
 

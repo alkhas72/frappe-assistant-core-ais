@@ -21,6 +21,7 @@ These tests exercise BaseTool._safe_execute directly via a minimal in-memory
 tool subclass, so they do not depend on any specific plugin being loaded.
 """
 
+import unittest
 from typing import Any, Dict
 from unittest.mock import patch
 
@@ -33,6 +34,13 @@ from frappe_assistant_core.utils.audit_trail import sanitize_for_audit
 
 _TEST_TOOL_NAME = "test_audit_tool"
 _RECORDING_TOOL_NAME = "recording_test_tool"
+_BASE_CLEANUP_PROBE_TOOL_NAME = "base_assistant_cleanup_probe"
+_SINK_TEST_TOOL_NAMES = (
+    _RECORDING_TOOL_NAME,
+    "test_audit_sanitization",
+    "test_audit_all_payloads",
+    "test_audit_invalid_status",
+)
 _ALLOWED_DECISION = PolicyDecision(
     allowed=True,
     reason_code="ALLOWED",
@@ -98,6 +106,7 @@ def _fetch_latest_audit_row(tool_name: str) -> Dict[str, Any]:
 
 def _delete_test_rows(tool_name: str):
     frappe.db.delete("Assistant Audit Log", {"tool_name": tool_name})
+    frappe.db.commit()
 
 
 class TestAuditLogStatusClassification(BaseAssistantTest):
@@ -106,9 +115,40 @@ class TestAuditLogStatusClassification(BaseAssistantTest):
     def setUp(self):
         super().setUp()
         _delete_test_rows(_TEST_TOOL_NAME)
+        self.addCleanup(_delete_test_rows, _TEST_TOOL_NAME)
         policy = patch.object(SecurityPolicy, "authorize", return_value=_ALLOWED_DECISION)
         policy.start()
         self.addCleanup(policy.stop)
+
+    def test_base_assistant_test_removes_committed_audit_rows(self):
+        from frappe_assistant_core.utils.audit_trail import log_tool_execution
+
+        _delete_test_rows(_BASE_CLEANUP_PROBE_TOOL_NAME)
+        self.addCleanup(_delete_test_rows, _BASE_CLEANUP_PROBE_TOOL_NAME)
+
+        class CleanupProbe(BaseAssistantTest):
+            def runTest(self):
+                log_tool_execution(
+                    tool_name=_BASE_CLEANUP_PROBE_TOOL_NAME,
+                    user=frappe.session.user,
+                    arguments={},
+                    status="Success",
+                    execution_time=0.0,
+                )
+                frappe.db.commit()
+
+        probe = CleanupProbe()
+        result = unittest.TestResult()
+        probe.run(result)
+
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(
+            frappe.db.count(
+                "Assistant Audit Log",
+                {"tool_name": _BASE_CLEANUP_PROBE_TOOL_NAME},
+            ),
+            0,
+        )
 
     def test_successful_execution_logs_success(self):
         tool = _ToolBase(executor=lambda arguments: {"items": [1, 2, 3]})
@@ -204,6 +244,7 @@ class TestAuditLogFieldCapture(BaseAssistantTest):
     def setUp(self):
         super().setUp()
         _delete_test_rows(_TEST_TOOL_NAME)
+        self.addCleanup(_delete_test_rows, _TEST_TOOL_NAME)
         policy = patch.object(SecurityPolicy, "authorize", return_value=_ALLOWED_DECISION)
         policy.start()
         self.addCleanup(policy.stop)
@@ -286,6 +327,12 @@ class TestAuditLogFieldCapture(BaseAssistantTest):
 
 class TestAuditSinkSanitization(BaseAssistantTest):
     """The sink defensively redacts sensitive keys even if the caller forgot."""
+
+    def setUp(self):
+        super().setUp()
+        for tool_name in _SINK_TEST_TOOL_NAMES:
+            _delete_test_rows(tool_name)
+            self.addCleanup(_delete_test_rows, tool_name)
 
     def test_nested_secrets_and_json_strings_are_redacted(self):
         value = {

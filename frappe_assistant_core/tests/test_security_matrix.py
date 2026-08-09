@@ -892,12 +892,23 @@ class SecurityMatrixAcceptance(FrappeTestCase):
         from frappe_assistant_core.api import fac_endpoint
 
         cases = [
-            ("missing", SimpleNamespace(method="POST", headers={}, url="https://fac-test.local/api/method/fac"), "AUTH_MISSING"),
+            (
+                "missing",
+                SimpleNamespace(
+                    method="POST",
+                    headers={"X-Assistant-Session-Id": self.session_id},
+                    url="https://fac-test.local/api/method/fac",
+                ),
+                "AUTH_MISSING",
+            ),
             (
                 "invalid_bearer",
                 SimpleNamespace(
                     method="POST",
-                    headers={"Authorization": f"Bearer {self.secret_marker}"},
+                    headers={
+                        "Authorization": f"Bearer {self.secret_marker}",
+                        "X-Assistant-Session-Id": self.session_id,
+                    },
                     url="https://fac-test.local/api/method/fac",
                 ),
                 "AUTHENTICATION_ERROR",
@@ -950,7 +961,12 @@ class SecurityMatrixAcceptance(FrappeTestCase):
     def test_guest_session_never_builds_tool_registry(self):
         from frappe_assistant_core.api import fac_endpoint
 
-        request = SimpleNamespace(method="POST", headers={}, url="https://fac-test.local/api/method/fac")
+        frappe.local.assistant_session_id = self.session_id
+        request = SimpleNamespace(
+            method="POST",
+            headers={"X-Assistant-Session-Id": self.session_id},
+            url="https://fac-test.local/api/method/fac",
+        )
         with ExitStack() as stack:
             stack.enter_context(patch.object(fac_endpoint.frappe, "request", request))
             stack.enter_context(

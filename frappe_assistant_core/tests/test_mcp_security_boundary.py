@@ -29,6 +29,12 @@ def _tool(name, fn):
     }
 
 
+def _delete_boundary_audit_rows(tool_name):
+    """Remove only the real audit row created by this boundary test."""
+    frappe.db.delete("Assistant Audit Log", {"tool_name": tool_name})
+    frappe.db.commit()
+
+
 class _AdapterTool:
     name = "get_document"
     description = "Adapter boundary test tool"
@@ -77,6 +83,7 @@ class TestMCPToolCallBoundary(BaseAssistantTest):
     def test_hidden_name_writes_one_sanitized_real_audit_row(self):
         hidden_name = "task4-hidden-" + uuid.uuid4().hex
         secret = "task4-boundary-secret"
+        self.addCleanup(_delete_boundary_audit_rows, hidden_name)
 
         result = self.server._handle_tools_call(
             {
